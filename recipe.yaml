@@ -42,9 +42,11 @@ source:
   # flare source
   - path: .
   # json source (inlined).
-  - git: https://github.com/ehsanmok/json.git
+  # json_mlake rather than ehsanmok/json directly, so the package build and the
+  # local test environment resolve the same json source instead of drifting.
+  - git: https://github.com/magmalake/json_mlake.git
     target_directory: json-src
-    tag: v0.3.0
+    branch: main
 
 build:
   script:

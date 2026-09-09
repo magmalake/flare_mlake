@@ -179,7 +179,7 @@ environments:
       - conda: https://conda.modular.com/max/linux-64/mojo-compiler-1.0.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.5.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.0.0-release.conda
-      - conda_source: json[755b4abc] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[76c2a3bc] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_go_select-2.3.0-cgo.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
@@ -309,7 +309,7 @@ environments:
       - conda: https://conda.modular.com/max/linux-aarch64/mojo-compiler-1.0.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.5.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.0.0-release.conda
-      - conda_source: json[b63eb09f] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[fb586fd8] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.7.22-hbd8a1cb_0.conda
@@ -422,7 +422,7 @@ environments:
       - conda: https://conda.modular.com/max/osx-arm64/max-core-26.5.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-1.0.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.0.0-release.conda
-      - conda_source: json[8fd9006a] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[f49e72a4] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
   default:
     channels:
     - url: https://conda.modular.com/max/
@@ -515,7 +515,7 @@ environments:
       - conda: https://conda.modular.com/max/linux-64/mojo-compiler-1.0.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.5.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.0.0-release.conda
-      - conda_source: json[755b4abc] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[76c2a3bc] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/binutils_impl_linux-aarch64-2.46.1-default_h5f4c503_102.conda
@@ -601,7 +601,7 @@ environments:
       - conda: https://conda.modular.com/max/linux-aarch64/mojo-compiler-1.0.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.5.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.0.0-release.conda
-      - conda_source: json[b63eb09f] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[fb586fd8] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.7.22-hbd8a1cb_0.conda
@@ -672,7 +672,7 @@ environments:
       - conda: https://conda.modular.com/max/osx-arm64/max-core-26.5.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-1.0.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.0.0-release.conda
-      - conda_source: json[8fd9006a] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[f49e72a4] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
   dev:
     channels:
     - url: https://conda.modular.com/max/
@@ -809,7 +809,7 @@ environments:
       - conda: https://conda.modular.com/max/linux-64/mojo-compiler-1.0.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.5.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.0.0-release.conda
-      - conda_source: json[755b4abc] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[76c2a3bc] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/binutils_impl_linux-aarch64-2.46.1-default_h5f4c503_102.conda
@@ -909,7 +909,7 @@ environments:
       - conda: https://conda.modular.com/max/linux-aarch64/mojo-compiler-1.0.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.5.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.0.0-release.conda
-      - conda_source: json[b63eb09f] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[fb586fd8] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.7.22-hbd8a1cb_0.conda
@@ -994,7 +994,7 @@ environments:
       - conda: https://conda.modular.com/max/osx-arm64/max-core-26.5.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-1.0.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.0.0-release.conda
-      - conda_source: json[8fd9006a] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[f49e72a4] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
   fuzz:
     channels:
     - url: https://conda.modular.com/max/
@@ -1131,7 +1131,7 @@ environments:
       - conda: https://conda.modular.com/max/linux-64/mojo-compiler-1.0.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.5.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.0.0-release.conda
-      - conda_source: json[755b4abc] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[76c2a3bc] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       - conda_source: mozz_mlake[3e642f29] @ git+https://github.com/magmalake/mozz_mlake?branch=main#ace31f2e0006864c325c9386b0738e4131b282c5
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
@@ -1232,7 +1232,7 @@ environments:
       - conda: https://conda.modular.com/max/linux-aarch64/mojo-compiler-1.0.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.5.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.0.0-release.conda
-      - conda_source: json[b63eb09f] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[fb586fd8] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       - conda_source: mozz_mlake[790f6d7e] @ git+https://github.com/magmalake/mozz_mlake?branch=main#ace31f2e0006864c325c9386b0738e4131b282c5
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
@@ -1318,7 +1318,7 @@ environments:
       - conda: https://conda.modular.com/max/osx-arm64/max-core-26.5.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-1.0.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.0.0-release.conda
-      - conda_source: json[8fd9006a] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[f49e72a4] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       - conda_source: mozz_mlake[d2cb9c5a] @ git+https://github.com/magmalake/mozz_mlake?branch=main#ace31f2e0006864c325c9386b0738e4131b282c5
   metrics:
     channels:
@@ -1414,7 +1414,7 @@ environments:
       - conda: https://conda.modular.com/max/linux-64/mojo-compiler-1.0.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.5.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.0.0-release.conda
-      - conda_source: json[755b4abc] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[76c2a3bc] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       - pypi: https://files.pythonhosted.org/packages/3b/d9/25e62cbb9c4077a2dabc73e5f34dc947887f4fe1526f53d2c0489abfc186/lizard-1.23.0-py2.py3-none-any.whl
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
@@ -1501,7 +1501,7 @@ environments:
       - conda: https://conda.modular.com/max/linux-aarch64/mojo-compiler-1.0.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mblack-26.5.0-release.conda
       - conda: https://conda.modular.com/max/noarch/mojo-python-1.0.0-release.conda
-      - conda_source: json[b63eb09f] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[fb586fd8] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       - pypi: https://files.pythonhosted.org/packages/3b/d9/25e62cbb9c4077a2dabc73e5f34dc947887f4fe1526f53d2c0489abfc186/lizard-1.23.0-py2.py3-none-any.whl
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
@@ -1573,7 +1573,7 @@ environments:
       - conda: https://conda.modular.com/max/osx-arm64/max-core-26.5.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-1.0.0-release.conda
       - conda: https://conda.modular.com/max/osx-arm64/mojo-compiler-1.0.0-release.conda
-      - conda_source: json[8fd9006a] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
+      - conda_source: json_mlake[f49e72a4] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
       - pypi: https://files.pythonhosted.org/packages/3b/d9/25e62cbb9c4077a2dabc73e5f34dc947887f4fe1526f53d2c0489abfc186/lizard-1.23.0-py2.py3-none-any.whl
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_go_select-2.3.0-cgo.tar.bz2
@@ -7554,20 +7554,20 @@ packages:
   run_exports: {}
   size: 61221085
   timestamp: 1786294690001
-- conda_source: json[755b4abc] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
-  version: 0.2.0
+- conda_source: json_mlake[76c2a3bc] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
+  version: 0.3.0
   build: hb0f4dca_0
   subdir: linux-64
   variants:
     target_platform: linux-64
   depends:
-  - mojo ==1.0.0
-  - max ==26.5.0
+  - mojo >=1.0.0,<1.1.0
+  - max >=26.5.0
   - simdjson >=4.2.4,<5
   - simdjson >=4.6.11,<4.7.0a0
   - libstdcxx >=16
   - libgcc >=16
-  license: Apache-2.0
+  license: MIT
   build_packages:
   - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
   - conda: https://conda.anaconda.org/conda-forge/linux-64/binutils_impl_linux-64-2.46.1-default_hfdba357_102.conda
@@ -7594,19 +7594,19 @@ packages:
   - conda: https://conda.anaconda.org/conda-forge/linux-64/libgomp-16.2.0-he0feb66_4.conda
   - conda: https://conda.anaconda.org/conda-forge/linux-64/libstdcxx-16.2.0-h934c35e_4.conda
   - conda: https://conda.anaconda.org/conda-forge/linux-64/simdjson-4.6.11-h4dbf13b_0.conda
-- conda_source: json[8fd9006a] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
-  version: 0.2.0
+- conda_source: json_mlake[f49e72a4] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
+  version: 0.3.0
   build: h60d57d3_0
   subdir: osx-arm64
   variants:
     target_platform: osx-arm64
   depends:
-  - mojo ==1.0.0
-  - max ==26.5.0
+  - mojo >=1.0.0,<1.1.0
+  - max >=26.5.0
   - simdjson >=4.2.4,<5
   - simdjson >=4.6.11,<4.7.0a0
   - libcxx >=23
-  license: Apache-2.0
+  license: MIT
   build_packages:
   - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.7.22-hbd8a1cb_0.conda
   - conda: https://conda.anaconda.org/conda-forge/noarch/compiler-rt23_osx-arm64-23.1.0-hb8825d9_0.conda
@@ -7647,20 +7647,20 @@ packages:
   host_packages:
   - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcxx-23.1.1-h55c6f16_0.conda
   - conda: https://conda.anaconda.org/conda-forge/osx-arm64/simdjson-4.6.11-hfbe1efa_0.conda
-- conda_source: json[b63eb09f] @ git+https://github.com/millfolio/json?branch=main#f1c15cf6e089cc26705de2e3ea9d6baab355702a
-  version: 0.2.0
+- conda_source: json_mlake[fb586fd8] @ git+https://github.com/magmalake/json_mlake?branch=main#038c79ecfec0f511e029b82586e7c91708b83218
+  version: 0.3.0
   build: he8cfe8b_0
   subdir: linux-aarch64
   variants:
     target_platform: linux-aarch64
   depends:
-  - mojo ==1.0.0
-  - max ==26.5.0
+  - mojo >=1.0.0,<1.1.0
+  - max >=26.5.0
   - simdjson >=4.2.4,<5
   - simdjson >=4.6.11,<4.7.0a0
   - libstdcxx >=16
   - libgcc >=16
-  license: Apache-2.0
+  license: MIT
   build_packages:
   - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
   - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/binutils_impl_linux-aarch64-2.46.1-default_h5f4c503_102.conda
