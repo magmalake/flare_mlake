@@ -12,6 +12,8 @@ from std.memory import UnsafePointer, alloc
 
 from ..net import SocketAddr
 
+from threads.thread import pin_current_to_cpu
+
 from ._thread import ThreadHandle, num_cpus, _OpaquePtr
 from .frontend import Frontend
 from .scheduler_stats import load_stop_flag, store_worker_stat
@@ -120,10 +122,11 @@ def _worker_entry[F: Frontend & Copyable](arg: _OpaquePtr) -> _OpaquePtr:
     if ctx_ptr[].pin_cores:
         try:
             var cpu = ctx_ptr[].worker_idx % num_cpus()
-            var self_handle = ThreadHandle(
-                _thread_id=external_call["pthread_self", UInt64]()
-            )
-            self_handle.pin_to_cpu(cpu)
+            # threads.mojo owns the pthread binding now, so the worker
+            # pins itself through it rather than re-declaring pthread_self
+            # here — a second declaration of the same symbol is exactly what
+            # stopped flare and threads.mojo linking together.
+            pin_current_to_cpu(cpu)
         except:
             pass
 

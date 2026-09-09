@@ -1,288 +1,130 @@
-"""Low-level pthread FFI and CPU pinning for flare's scheduler.
+"""Threads for flare, on top of `threads.mojo`.
 
-Wraps just enough of libpthread (and, on Linux, ``pthread_setaffinity_np``)
-for the multicore ``Scheduler`` to spawn + join N worker threads, each
-pinned to a specific core. The API is intentionally small and unsafe:
+## Why this is no longer its own pthread binding
 
-- ``ThreadHandle.spawn(start, arg)`` wraps ``pthread_create``. The
-  start routine is a ``def(UnsafePointer[None]) thin abi("C") -> UnsafePointer[None]``
-  that never raises; the reactor loop inside the worker is responsible
-  for converting Mojo exceptions into a sentinel pointer.
-- ``ThreadHandle.join()`` wraps ``pthread_join``. Returns the worker's
-  return value (usually unused).
-- ``ThreadHandle.pin_to_cpu(cpu)`` pins the thread to a specific core
-  on Linux via ``pthread_setaffinity_np``. On macOS this is a no-op
-  placeholder (Mach's ``thread_policy_set`` with
-  ``THREAD_AFFINITY_POLICY`` is a hint rather than a hard pin, and
-  documenting that cleanly needs more surface area than deserves — the macOS scheduler's own topology picker is good
-  enough for our benchmark targets).
+Upstream flare binds `pthread_create`, `pthread_join`, `pthread_self` and
+`pthread_setaffinity_np` itself, and so does `threads.mojo`. The signatures are
+ABI-identical but spelled differently — `UnsafePointer` on one side, `Pointer`
+on the other, behind the same machine pointer — and Mojo declares an extern
+*per signature*. A binary that needs both therefore refuses to lower:
 
-Threads that outlive their ``ThreadHandle`` are undefined behaviour.
-Always join before dropping.
+    error: existing function with conflicting signature
+    error: failed to legalize operation 'pop.external_call' … "pthread_create"
 
-Platform notes:
-- Linux uses libpthread (``libpthread.so.0``); symbols are resolved via
-  ``external_call`` like the rest of ``flare/net/_libc.mojo``.
-- macOS bundles pthread into ``libSystem.dylib``; symbols there are
-  reachable from the default dynamic link namespace.
+That is not hypothetical. magmalake serves Arrow Flight from flare while
+reading Iceberg tables, and Iceberg's scan parallelism is `threads.mojo`; the
+two could not be linked into one program at all.
 
-This file is *internal* — it is used by
-``flare.runtime.scheduler`` and nothing else.
+Two libraries binding the same libc symbol is normal and will only become more
+common, so the fix is to stop having two. `threads.mojo` owns the binding and
+flare's threading is a thin adapter over it. The public surface is unchanged —
+`ThreadHandle` with `spawn` / `join` / `detach` / `pin_to_cpu`, plus
+`current_thread_id` and `num_cpus` — so flare's own call sites are untouched.
+
+`_OpaquePtr` is now `threads.ffi.OpaquePtr`, i.e. `Pointer[UInt8, …]` rather
+than `UnsafePointer[UInt8, …]`. The same pointer at runtime; keeping flare's
+own name means the call sites still read as they did.
+
+This is a delta the fork carries deliberately, and it is the kind worth
+sending upstream: it removes a duplicate binding rather than adding a feature.
+
+This file is *internal* — used by `flare.runtime.scheduler` and its neighbours.
 """
 
-from std.ffi import (
-    external_call,
-    c_int,
-    c_size_t,
-    OwnedDLHandle,
-    get_errno,
-)
-from std.memory import UnsafePointer, alloc, memcpy, unsafe_memset_zero
-from std.sys.info import CompilationTarget
+from threads.ffi import OpaquePtr
+from threads.thread import ThreadHandle as _ThreadsHandle
+from threads.thread import current_thread_id as _threads_current_id
+from threads.thread import num_cpus as _threads_num_cpus
+
+comptime _OpaquePtr = OpaquePtr
+"""The opaque `void *` a thread body receives and returns.
+
+Aliased to `threads.ffi.OpaquePtr` so exactly one declaration of the pthread
+entry-point shape exists in any linked binary.
+"""
+
+comptime _StartFn = def (_OpaquePtr) thin -> _OpaquePtr
+"""A thread body: thin (non-capturing) and non-raising.
+
+pthread has no exception channel, so a body that fails has to convert the
+failure into something the caller can read back out of its argument.
+"""
 
 
-# ── Start routine signature ──────────────────────────────────────────────────
-
-# C pthread_create expects `void *(*)(void *)`. On both Linux x86_64 and
-# macOS arm64 Mojo's plain ``fn`` type uses the platform C calling
-# convention, so a bare ``fn(UnsafePointer[UInt8, _]) -> UnsafePointer[UInt8, _]``
-# is ABI-compatible with what pthread expects. The function must not
-# raise (pthread has no exception channel); convert any error to a
-# sentinel pointer value before returning.
-comptime _OpaquePtr = UnsafePointer[UInt8, MutUntrackedOrigin]
-
-
-# Shortcut for making a NULL pointer of the flavour we use throughout.
-# UnsafePointer is non-nullable and rejects a comptime-literal address
-# of 0, but pthread genuinely needs a C NULL here (NULL attr arg, NULL
-# retval slot, NULL start-routine return). Build it from a runtime
-# zero so the non-null constraint doesn't fire. A cleaner fix would
-# model these as Optional[UnsafePointer], which marshals as NULL
-# across FFI with identical layout (the null address is the None niche).
-@always_inline
 def _null_ptr() -> _OpaquePtr:
+    """A NULL `void *`, for entry points that take no argument.
+
+    Built from a runtime zero: the pointer types reject a comptime-literal
+    address of 0, but pthread genuinely wants a C NULL here.
+    """
     var null_addr = 0
     return _OpaquePtr(unsafe_from_address=null_addr)
 
 
-# ── ThreadHandle ─────────────────────────────────────────────────────────────
-
-
-@fieldwise_init
 struct ThreadHandle(Movable):
-    """Owning handle to a live OS thread.
+    """One joinable OS thread.
 
-    Stores ``pthread_t`` as a ``UInt64`` — on Linux x86_64 it is
-    ``unsigned long`` and on macOS arm64 it is an opaque pointer;
-    both are 64 bits. Do not rely on the concrete bit pattern.
-
-    ``ThreadHandle`` is ``Movable`` but *not* ``Copyable`` on
-    purpose. A ``pthread_t`` identifies one OS thread and POSIX
-    forbids calling ``pthread_join`` more than once on the same
-    value — that is a property of the underlying resource, not of
-    one Mojo value pointing at it. Making the handle move-only
-    puts the "exactly one owner, exactly one join" invariant in
-    the type system.
-
-    As a defence in depth ``join()`` also zeroes ``_thread_id`` on
-    success, so if the compiler's move-checking is ever bypassed
-    (e.g. a ``memcpy``-style bitwise aliasing) a redundant call on
-    that specific handle short-circuits rather than double-joining.
-
-    Because ``List[T]`` requires ``T: Copyable``, ``Scheduler`` stores
-    its workers in an ``UnsafePointer[ThreadHandle]`` instead of a
-    ``List`` — see ``flare.runtime.scheduler``.
+    Move-only, like the handle it wraps: moving transfers the obligation to
+    `join` or `detach`. Copying would leave two owners each believing they
+    must join, and the second would be joining a thread id that is no longer
+    live.
     """
 
-    var _thread_id: UInt64
-    """Opaque pthread_t handle. Zeroed by ``join()`` on success so
-    a second call on *the same handle* is a no-op."""
+    var _inner: _ThreadsHandle
+
+    def __init__(out self, var inner: _ThreadsHandle):
+        self._inner = inner^
 
     @staticmethod
-    def spawn[
-        start: def(_OpaquePtr) thin -> _OpaquePtr
-    ](arg: _OpaquePtr,) raises -> ThreadHandle:
-        """Spawn a thread that runs ``start(arg)``.
+    def spawn[start: _StartFn](arg: _OpaquePtr) raises -> ThreadHandle:
+        """Spawn a thread running `start(arg)`.
 
         Parameters:
-            start: Entry function. Signature
-                ``fn(UnsafePointer[UInt8]) thin abi("C") -> UnsafePointer[UInt8]``.
-                Must not raise; convert errors into a sentinel return
-                value before returning.
+            start: Entry function; thin and non-raising.
 
         Args:
-            arg: Opaque pointer delivered to the start function.
+            arg: Passed straight through to `start`. It must outlive the
+                thread — nothing here keeps it alive.
 
         Returns:
-            A ``ThreadHandle`` the caller must ``join()``.
+            A joinable handle.
 
         Raises:
-            Error: If ``pthread_create`` returns non-zero (the return
-                value is the POSIX error, already interpreted as a
-                human-readable message).
+            Error: If the thread could not be created.
         """
-        var tid = UInt64(0)
-        var tid_addr = Int(UnsafePointer[UInt64, _](to=tid))
-        var tid_ptr = UnsafePointer[UInt64, MutUntrackedOrigin](
-            unsafe_from_address=tid_addr
-        )
-
-        # attr == NULL means default thread attributes (PTHREAD_CREATE_JOINABLE).
-        var null_attr = _null_ptr()
-
-        var rc = external_call[
-            "pthread_create",
-            c_int,
-            UnsafePointer[UInt64, MutUntrackedOrigin],  # thread*
-            _OpaquePtr,  # attr*
-            def(_OpaquePtr) thin -> _OpaquePtr,  # start routine
-            _OpaquePtr,  # arg
-        ](tid_ptr, null_attr, start, arg)
-
-        if rc != c_int(0):
-            raise Error("pthread_create failed with rc=" + String(Int(rc)))
-        return ThreadHandle(_thread_id=tid)
+        return ThreadHandle(_ThreadsHandle.spawn[start](arg))
 
     def join(mut self) raises:
         """Wait for the thread to finish.
 
-        Discards the thread's return value. Safe to call more than
-        once on the same handle: after the first successful join
-        ``_thread_id`` is zeroed, so subsequent calls short-circuit
-        and return without invoking ``pthread_join`` again (``pthread_join``
-        on a stale thread id is undefined behaviour).
-
-        Raises:
-            Error: If ``pthread_join`` returns non-zero. The handle
-                is left untouched so the caller can retry or
-                propagate.
+        Idempotent: joining an already-joined handle returns immediately
+        rather than failing against a dead thread id.
         """
-        if self._thread_id == 0:
-            # Already joined (successfully) — redundant call is a
-            # no-op rather than an undefined second pthread_join.
-            return
-        var rc = external_call[
-            "pthread_join",
-            c_int,
-            UInt64,  # thread
-            _OpaquePtr,  # retval** (NULL)
-        ](self._thread_id, _null_ptr())
-        if rc != c_int(0):
-            raise Error("pthread_join failed with rc=" + String(Int(rc)))
-        # Zero out so a second join() on this handle is a no-op.
-        # Without this, the handle is in a "joined" state but a
-        # further pthread_join on the stale id is UB per POSIX.
-        self._thread_id = UInt64(0)
+        self._inner.join()
 
     def detach(mut self) raises:
-        """Detach the thread so the OS reclaims it when it exits.
+        """Give up the right to join; the thread releases itself on exit."""
+        self._inner.detach()
 
-        Wraps ``pthread_detach``. A detached thread runs to completion
-        on its own and must NOT be ``join()``ed. This is what a
-        fire-and-forget worker that outlives the spawning call frame
-        needs -- one pthread per offloaded WebSocket connection, say;
-        a joinable thread nobody ever joins holds its kernel
-        bookkeeping until the process exits.
-
-        ``_thread_id`` is zeroed on success, so a later ``join()`` on
-        this handle short-circuits instead of joining a detached
-        thread (undefined per POSIX).
-
-        Raises:
-            Error: If ``pthread_detach`` returns non-zero. The handle
-                is left untouched so the caller can retry or
-                propagate.
-        """
-        if self._thread_id == 0:
-            return
-        var rc = external_call["pthread_detach", c_int, UInt64](self._thread_id)
-        if rc != c_int(0):
-            raise Error("pthread_detach failed with rc=" + String(Int(rc)))
-        self._thread_id = UInt64(0)
+    def is_joinable(self) -> Bool:
+        """Whether `join` would still wait on a live thread."""
+        return self._inner.is_joinable()
 
     def pin_to_cpu(self, cpu: Int) raises:
-        """Pin the thread to CPU ``cpu``.
+        """Pin this thread to one core.
 
-        On Linux, calls ``pthread_setaffinity_np`` with a ``cpu_set_t``
-        whose only set bit is ``cpu``. On macOS this function is a no-op
-        (the OS's scheduler already does a good job for our benchmark
-        shapes; a Mach ``thread_policy_set`` hint would not be a hard
-        pin anyway).
-
-        Args:
-            cpu: Zero-based CPU index.
-
-        Raises:
-            Error: If ``pthread_setaffinity_np`` returns non-zero on
-                Linux. Never raises on macOS.
+        A real pin on Linux via `pthread_setaffinity_np`; a no-op on macOS,
+        which has no hard equivalent — Mach's `THREAD_AFFINITY_POLICY` is a
+        hint, and the platform's own topology picker is good enough here.
         """
-        comptime if CompilationTarget.is_linux():
-            # cpu_set_t on glibc is 1024 bits = 128 bytes by default.
-            # Allocate and zero-fill a 128-byte buffer, then set the bit
-            # for the target CPU.
-            comptime _CPUSET_SIZE: Int = 128
-            # Native Mojo allocator (``std.memory.alloc`` / ``.free()``)
-            # instead of libc malloc/free via FFI:
-            # ``external_call["free", ...]`` conflicts with the stdlib's
-            # own ``free`` declaration at MLIR legalization time when
-            # this module is pulled into a fuzz-environment compile
-            # (mozz harness).
-            var cpuset_ptr = alloc[UInt8](_CPUSET_SIZE)
-            unsafe_memset_zero(cpuset_ptr, _CPUSET_SIZE)
-            var byte_idx = cpu // 8
-            var bit_idx = cpu % 8
-            if byte_idx < _CPUSET_SIZE:
-                cpuset_ptr[byte_idx] = cpuset_ptr[byte_idx] | UInt8(
-                    1 << bit_idx
-                )
-            var rc = external_call[
-                "pthread_setaffinity_np",
-                c_int,
-                UInt64,
-                c_size_t,
-                _OpaquePtr,  # cpu_set_t *
-            ](self._thread_id, c_size_t(_CPUSET_SIZE), cpuset_ptr)
-            cpuset_ptr.unsafe_free()
-            if rc != c_int(0):
-                raise Error(
-                    "pthread_setaffinity_np failed with rc=" + String(Int(rc))
-                )
-        else:
-            # macOS: no hard pin. Leave the scheduler alone.
-            pass
+        self._inner.pin_to_cpu(cpu)
 
 
-# ── pthread_self convenience ─────────────────────────────────────────────────
-
-
-@always_inline
 def current_thread_id() -> UInt64:
-    """Return the OS thread id of the calling thread (pthread_self)."""
-    return external_call["pthread_self", UInt64]()
-
-
-# ── Number of available CPUs ─────────────────────────────────────────────────
+    """An opaque id for the calling thread, for logging and assertions."""
+    return _threads_current_id()
 
 
 def num_cpus() -> Int:
-    """Return the number of available logical CPUs.
-
-    Uses ``sysconf(_SC_NPROCESSORS_ONLN)`` which is portable across
-    Linux and macOS.
-    """
-    comptime _SC_NPROCESSORS_ONLN_LINUX: c_int = 84
-    comptime _SC_NPROCESSORS_ONLN_MACOS: c_int = 58
-    comptime if CompilationTarget.is_linux():
-        var rc = external_call["sysconf", Int, c_int](
-            _SC_NPROCESSORS_ONLN_LINUX
-        )
-        if rc <= 0:
-            return 1
-        return rc
-    else:
-        var rc = external_call["sysconf", Int, c_int](
-            _SC_NPROCESSORS_ONLN_MACOS
-        )
-        if rc <= 0:
-            return 1
-        return rc
+    """Online cores, as a default worker count."""
+    return _threads_num_cpus()
