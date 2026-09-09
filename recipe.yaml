@@ -39,23 +39,22 @@ package:
   version: ${{ version }}
 
 source:
-  # flare source
+  # flare source only. json is NOT vendored here: it ships as its own package,
+  # json_mlake, and is a run dependency below. Upstream's recipe inlines json's
+  # source and builds its simdjson wrapper, which would make this package and
+  # json_mlake both install lib/mojo/json/* and lib/libsimdjson_wrapper.so —
+  # a file conflict the moment an environment wants both, which any consumer
+  # using JSON directly alongside flare would hit.
   - path: .
-  # json source (inlined).
-  # json_mlake rather than ehsanmok/json directly, so the package build and the
-  # local test environment resolve the same json source instead of drifting.
-  - git: https://github.com/magmalake/json_mlake.git
-    target_directory: json-src
-    branch: main
 
 build:
   script:
     - mkdir -p $PREFIX/lib/mojo
-    # ── Source trees (flare + json) staged under $PREFIX/lib/mojo/ ───────
-    # Mojo discovers these the same way it discovers .mojopkg files in
-    # that directory; no ``mojo package`` step required.
+    # ── flare source staged under $PREFIX/lib/mojo/ ──────────────────────
+    # Mojo discovers this the same way it discovers .mojopkg files in that
+    # directory; no ``mojo package`` step required. json arrives the same way
+    # from the json_mlake package.
     - cp -r flare $PREFIX/lib/mojo/
-    - cp -r json-src/json $PREFIX/lib/mojo/
     # ── flare: OpenSSL TLS FFI wrapper ───────────────────────────────────
     - $CXX -O2 -std=c++17 -fPIC -DNDEBUG -shared
         -o $PREFIX/lib/libflare_tls.so
@@ -64,27 +63,13 @@ build:
         -L$PREFIX/lib
         -lssl -lcrypto
         -Wl,-rpath,$PREFIX/lib
-    # ── json: simdjson FFI wrapper (loaded at runtime by json) ───────────
-    # ``-include iterator``: simdjson.h uses ``std::inserter`` without
-    # including <iterator>. Older libstdc++/libc++ pulled it in transitively;
-    # current libc++ (macOS) does not, so the header fails to compile on its
-    # own. Forcing the include ahead of it is the least invasive fix and is
-    # a no-op where the transitive include still happens.
-    - $CXX -O3 -std=c++17 -fPIC -DNDEBUG -shared -include iterator
-        -o $PREFIX/lib/libsimdjson_wrapper.so
-        json-src/json/cpu/simdjson_ffi/simdjson_wrapper.cpp
-        -I$PREFIX/include
-        -L$PREFIX/lib
-        -lsimdjson
 
 requirements:
   build:
     - ${{ compiler('cxx') }}
-    - git   # needed to clone json source
   host:
     - openssl >=3.0,<4
     - ca-certificates
-    - simdjson >=4.2.4,<5    # json's simdjson FFI wrapper
   run:
     # Widened from upstream's ``<1.1.0``. flare_mlake is consumed by magmalake
     # repos that build on both Mojo 1.0.0 and the 1.1.0.dev nightlies from one
@@ -96,7 +81,12 @@ requirements:
     - mojo >=1.0.0,<1.2.0
     - openssl >=3.0,<4
     - ca-certificates
-    - simdjson >=4.2.4,<5    # libsimdjson_wrapper.so is loaded at runtime
+    # `flare.http` imports `json`. Depending on the package rather than
+    # vendoring its source keeps `lib/mojo/json/*` owned by exactly one
+    # package, so an environment can hold both flare and json without a
+    # file conflict — and json security fixes arrive by upgrading json_mlake
+    # rather than by rebuilding flare.
+    - json_mlake >=0.3.0,<0.4
 
 about:
   homepage: https://github.com/ehsanmok/flare

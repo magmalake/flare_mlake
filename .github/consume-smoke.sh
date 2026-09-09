@@ -31,6 +31,11 @@ platforms = ["$PLATFORM"]
 [dependencies]
 mojo = "==1.0.0"
 flare_mlake = "*"
+# flare_mlake depends on json_mlake rather than vendoring json's source, so a
+# consumer needs it too. Declared here as a git source dependency, which is
+# exactly how mojoshelf tins are consumed (`pixi shelf add` writes the same
+# shape, pinned at the published revision).
+json_mlake = { git = "https://github.com/magmalake/json_mlake.git", branch = "main" }
 TOML
 
 cat > smoke.mojo <<'MOJO'
