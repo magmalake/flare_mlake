@@ -3,237 +3,130 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
   pull_request:
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-  workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
+# This repository is a *distribution* of an upstream project, not its
+# development home, so CI asks the question a distribution has to answer:
+# does the package build on every platform we ship, and can a consumer
+# actually resolve and import it? Upstream's own test suite is upstream's
+# to run — re-running it here would test their code, not our packaging.
 jobs:
-  test:
-    name: Tests (${{ matrix.os }})
+  package:
+    name: package / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Linux: ``ubuntu-latest`` (currently 24.04, glibc 2.39). The
-        # ``libKGENCompilerRTShared.so`` runtime crash that previously
-        # forced this matrix onto ``ubuntu-22.04`` is back —
-        # specifically, the Mojo runtime segfaults transiently on a
-        # fresh process before any user code runs (same per-frame
-        # offsets ``+0x6ec5b / +0x6be36 / +0x6f907`` documented for
-        # the macos-14 OwnedDLHandle FFI bug). It's heisenbuggy:
-        # CI on ``79dcd54`` (immediate predecessor of ``6b36981``)
-        # passed on the same image, then ``6b36981`` crashed; the
-        # fuzz workflow on the same image hit the same offsets at run
-        # 25351119595. Rather than repinning the matrix again, the
-        # ``Run tests`` step re-uses the retry-up-to-3x wrapper that
-        # was added in ``bcd107d2`` and inadvertently dropped in
-        # ``0a14f15`` — the same wrapper the workflow used to
-        # absorb the same crash family before. Toolchain side
-        # (``flare/tls/ffi`` C++ wrapper, every rust-built bench
-        # baseline) builds against the conda-forge sysroot pinned at
-        # glibc ``>=2.34`` (see
-        # ``[target.linux-64.dependencies] sysroot_linux-64 = ">=2.34"``
-        # in ``pixi.toml``), so the resulting binaries reference
-        # only GLIBC_2.34 and below and stay portable down to RHEL 9
-        # / Debian 12 / Ubuntu 22.04 hosts.
-        #
-        # macOS pinned to ``macos-15`` (Sequoia, arm64). The previous
-        # ``macos-14`` image hit a Mojo-runtime segfault inside
-        # ``libKGENCompilerRTShared.dylib`` whenever a function-local
-        # ``OwnedDLHandle`` was reclaimed before the ``get_function``
-        # pointer was invoked (see ``flare/http/middleware.mojo``
-        # ``_flare_fs_access`` for the lifetime fix). macos-15 matches
-        # the host SDK we develop against locally; revisit if Apple
-        # retires the runner.
-        os: [ubuntu-latest, macos-15]
-
+        # ubuntu-latest is linux-64, macos-latest is osx-arm64 — the two
+        # platforms magmalake ships. linux-64 matters because the taxibench
+        # containers are built there.
+        os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - name: Setup Pixi
-        uses: prefix-dev/setup-pixi@v0.9.4
+      - uses: prefix-dev/setup-pixi@v0.10.2
         with:
-          # Pin pixi: the default "latest" ships a build-api-version >=5
-          # that drops pixi-build-rattler-build 0.3.13 (the backend this
-          # repo pins in [package.build]), breaking source-package builds
-          # with "no candidates were found". 0.70.2 is the newest pixi
-          # compatible with the 0.3.13 backend (see pixi.toml [package.build]).
-          pixi-version: v0.70.2
-          # Only solve + install the lean runtime env. Without this,
-          # setup-pixi installs every environment declared in pixi.toml
-          # (dev, fuzz, bench), which would pull in mojodoc, mozz, go,
-          # nginx, wrk, … — hundreds of MB of contributor-only tooling
-          # that the CI test job doesn't touch.
-          environments: default
-          # Install straight from the committed pixi.lock; never re-solve
-          # conda-forge in CI (the network solve is flaky). Fails loudly
-          # if the lock has drifted from pixi.toml.
-          locked: true
-          cache: false
-          post-cleanup: false
+          # Pinned to match every other magmalake repo (mojoshelf tins.toml).
+          pixi-version: v0.78.0
+          run-install: false
 
-      - name: Check formatting
-        # Uses `mojo format`, which ships with the base mojo compiler —
-        # no feature.dev (pre-commit) required.
-        run: pixi run format-check
-
-      - name: Generate self-signed cert for TLS tests
-        # test_tls_acceptor.mojo loads a real cert/key pair to exercise
-        # ServerCtx.new + reload + mTLS callbacks end-to-end. The script
-        # only depends on conda-forge openssl (already in the default
-        # env's [dependencies]); running it through `pixi run` picks up
-        # that openssl on PATH.
-        run: pixi run bash benchmark/scripts/_make_self_signed.sh
-
-      - name: Run tests
-        if: matrix.os == 'ubuntu-latest'
-        # The Mojo nightly's ``libKGENCompilerRTShared.so`` segfaults
-        # transiently on a fresh process before any user code runs
-        # (same per-frame offsets the workflow header documents).
-        # ~1-in-3 invocation rate on the current ``ubuntu-latest``
-        # image; the next run always succeeds. Retry up to three
-        # times so the build only fails if the runtime crash is
-        # stable, not flaky. The shell ``set -e`` is intentionally
-        # not used inside the loop body so the retry can observe the
-        # non-zero exit.
+      # `rattler-build` rather than a pixi source build: the recipe is what
+      # produces the published artifact, and it is also the only path that
+      # sidesteps the dead `pixi-build-rattler-build ==0.3.13` pin upstream
+      # carries. `pixi exec` runs it from a throwaway environment.
+      - name: Build the package
         run: |
-          set +e
-          for attempt in 1 2 3; do
-            echo "── tests attempt $attempt/3 ──"
-            pixi run tests
-            rc=$?
-            if [ $rc -eq 0 ]; then
-              exit 0
-            fi
-            echo "── attempt $attempt failed (rc=$rc), retrying ──"
-            sleep 5
-          done
-          echo "── all 3 attempts failed (rc=$rc) ──"
-          exit $rc
+          pixi exec rattler-build build \
+            --recipe recipe.yaml \
+            --output-dir ./out \
+            -c https://conda.modular.com/max-nightly \
+            -c conda-forge
 
-      - name: Run tests (macOS)
-        if: matrix.os == 'macos-15'
-        # macos-15 has an intermittent full-suite hang (confirmed running
-        # to GitHub's 6h default job timeout instead of the normal
-        # 20-45 min baseline; root cause not yet identified). A plain
-        # bash watchdog (this image has no GNU coreutils ``timeout``)
-        # SIGTERMs the run at 90 min so a hang surfaces as an ordinary
-        # step failure instead of burning 6h. `continue-on-error` then
-        # keeps that failure from blocking the required CI signal --
-        # note a job-level `timeout-minutes` can't do this instead,
-        # because a job cancelled by its own timeout gets conclusion
-        # ``cancelled``, which `continue-on-error` does not rescue.
-        # ubuntu-latest Tests + ASan + Conformance remain the hard gate.
-        continue-on-error: true
-        run: |
-          set +e
-          pixi run tests &
-          pid=$!
-          ( sleep 5400; kill -TERM "$pid" 2>/dev/null ) &
-          watcher=$!
-          wait "$pid"
-          rc=$?
-          kill "$watcher" 2>/dev/null
-          exit $rc
+      - name: Show what was built
+        run: find ./out -name '*.conda' -exec ls -lh {} +
 
-  sanitizers:
-    name: ASan (ubuntu-latest)
-    runs-on: ubuntu-latest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conda-${{ matrix.os }}
+          path: out/**/*.conda
+          if-no-files-found: error
+
+  consume:
+    name: consume / ${{ matrix.os }}
+    needs: package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - name: Setup Pixi
-        uses: prefix-dev/setup-pixi@v0.9.4
+      - uses: actions/download-artifact@v4
         with:
-          pixi-version: v0.70.2
-          environments: default
-          locked: true
-          cache: false
-          post-cleanup: false
+          name: conda-${{ matrix.os }}
+          path: ./channel
 
-      - name: Generate self-signed cert for TLS tests
-        run: pixi run bash benchmark/scripts/_make_self_signed.sh
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.78.0
+          run-install: false
 
-      - name: Run ASan sanitizer suite
-        # AOT-builds the curated FFI / streaming / QUIC / TLS test
-        # inventory with ``mojo build --sanitize address`` and runs
-        # each (tools/run_sanitizer_tests.sh). The same
-        # runtime-crash retry wrapper the test job uses guards the
-        # transient libKGENCompilerRTShared fresh-process segfault.
-        run: |
-          set +e
-          for attempt in 1 2 3; do
-            echo "── asan attempt $attempt/3 ──"
-            pixi run tests-asan
-            rc=$?
-            if [ $rc -eq 0 ]; then
-              exit 0
-            fi
-            echo "── attempt $attempt failed (rc=$rc), retrying ──"
-            sleep 5
-          done
-          echo "── all 3 attempts failed (rc=$rc) ──"
-          exit $rc
+      # The test that matters: a project that has never seen this source tree
+      # installs the built package from a local channel and compiles against
+      # it with no `-I` flag. That is exactly what a consumer does, and it is
+      # what caught the module-resolution details during packaging.
+      - name: Consume the package from a clean project
+        shell: bash
+        run: bash .github/consume-smoke.sh
 
-  # No CI TSan leg: the Mojo runtime links tcmalloc, which aborts under
-  # ThreadSanitizer's allocator interception before user code runs --
-  # reproduces even on a trivial one-line program, on every ubuntu-latest
-  # runner and in the dev sandbox, regardless of ASLR settings. This is a
-  # Mojo-toolchain bug, not a flare one; `continue-on-error: true` still
-  # left a permanently-red job in every run for no signal. Run `pixi run
-  # tests-tsan` locally instead; re-add this leg once a TSan-compatible
-  # Mojo toolchain/allocator ships.
-
-  conformance:
-    name: Conformance (interop smoke + h2spec / autobahn / quic-interop)
-    runs-on: ubuntu-latest
-    # h2spec is provisioned below and runs for real. autobahn (wstest)
-    # and quic-interop are still not bundled; run_conformance.sh probes
-    # for each and skips the leg when absent, so they contribute no
-    # false signal either way (see tools/run_conformance.sh header).
+  # flare_mlake carries four features that are still open pull requests
+  # upstream, so unlike the other redistributions it does run tests: these are
+  # the parts no upstream CI covers yet, plus the modules Arrow Flight will be
+  # built on. Not the full ~300-invocation `tests` task — that includes
+  # io_uring (Linux-only) and a cargo build for the rustls QUIC FFI, and it is
+  # upstream's suite to keep green.
+  tests:
+    name: tests / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
-      - name: Setup Pixi
-        uses: prefix-dev/setup-pixi@v0.9.4
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
         with:
-          pixi-version: v0.70.2
+          pixi-version: v0.78.0
           environments: default
-          locked: true
-          cache: false
-          post-cleanup: false
-      # Runs first and is NOT skippable: curl is on every runner image,
-      # so unlike the three suites below this leg always has signal.
-      # It exists because flare's h2 server was once unable to answer
-      # curl, a browser or h2load while the entire in-tree h2 suite
-      # passed -- our own client emits HPACK H=0, so no test we ran had
-      # ever sent a Huffman-coded header. A server is not interoperable
-      # until something we did not write has talked to it.
-      - name: Interop smoke (curl / h2load on every wire)
-        run: pixi run interop-smoke
-      - name: Install h2spec (pinned release)
-        run: pixi run install-h2spec
-      # Gating. h2spec is at 146/147; the one exception is documented
-      # with its reasoning in tools/conformance/h2spec-known-fail.txt
-      # and the harness fails on any case outside that list, so a
-      # conformance regression goes red.
-      - name: Run provisioned conformance suites
-        run: pixi run conformance
-      - name: Upload h2spec report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: h2spec-report
-          path: target/conformance/h2spec.txt
-          if-no-files-found: warn
+
+      # The four carried pull requests (upstream #11, #14, #15, #16). If one
+      # of these breaks, the carried patch is what broke — that is the whole
+      # reason to run tests in a distribution repo at all.
+      - name: Carried upstream PRs
+        run: |
+          pixi run mojo -I . tests/http/test_client_read_timeout.mojo
+          pixi run mojo -I . tests/http/test_server_ws_upgrade.mojo
+          pixi run mojo -I . tests/http/test_server_ws_offload.mojo
+          pixi run mojo -I . tests/ws/test_ws.mojo
+
+      # gRPC is the reason magmalake wants flare: Arrow Flight is a gRPC
+      # service, so these are the paths a Flight server depends on.
+      - name: gRPC
+        run: |
+          pixi run mojo -I . tests/grpc/test_grpc.mojo
+          pixi run mojo -I . tests/grpc/test_metadata.mojo
+          pixi run mojo -I . tests/grpc/test_grpc_client.mojo
+          pixi run mojo -I . tests/grpc/test_grpc_server_stream.mojo
+          pixi run mojo -I . tests/grpc/test_grpc_compression.mojo
+
+      - name: HTTP, TLS, net, crypto
+        run: |
+          pixi run mojo -I . tests/http/test_http.mojo
+          pixi run mojo -I . tests/http2/test_h2_frame.mojo
+          pixi run mojo -I . tests/http2/test_h2_hpack.mojo
+          pixi run mojo -I . tests/tls/test_tls.mojo
+          pixi run mojo -I . tests/net/test_net.mojo
+          pixi run mojo -I . tests/crypto/test_base64.mojo
+          pixi run mojo -I . tests/crypto/test_hmac.mojo
