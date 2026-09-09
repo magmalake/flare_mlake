@@ -459,6 +459,18 @@ def emit_decode_field(f: Field, res: Resolver) -> list[tuple[str, list[str]]]:
     if f.repeated and k == "scalar":
         spec = SCALARS[f.type_token]
         wire, reader = spec[1], spec[3]
+        if wire == "WIRE_LEN":
+            # string and bytes are NEVER packed: packed encoding is defined
+            # only for primitive numeric types, so a `repeated string` is one
+            # LEN-delimited field per element. Decoding it as a packed block
+            # reads the first element's *content* as a length prefix, which
+            # fails as "truncated length-delimited field" on anything real.
+            return [
+                (
+                    f"field == {n} and wire == WIRE_LEN",
+                    [f"out.{f.name}.append(r.{reader}())"],
+                )
+            ]
         # packed: a LEN block of concatenated values
         packed_body = [
             "var packed = r.read_bytes()",
