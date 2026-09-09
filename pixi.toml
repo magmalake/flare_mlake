@@ -7,7 +7,10 @@ version = "0.10.0"
 preview = ["pixi-build"]
 
 [package]
-name = "flare"
+# Must match the package name the recipe produces (recipe.yaml `context.name`),
+# because that is the name consumers write in their dependencies. The module
+# this installs is still `flare`.
+name = "flare_mlake"
 version = "0.10.0"
 
 [package.build]

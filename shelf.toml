@@ -1,0 +1,6 @@
+name = "flare_mlake"
+version = "0.10.0"
+description = "Packaged build of flare by Ehsan M. Kermani (github.com/ehsanmok/flare) — TCP, UDP, TLS, HTTP/1.1, HTTP/2, HTTP/3, QUIC, WebSocket and gRPC for Mojo. Republished only because flare is not on a conda channel; imported as `flare`. Please send stars and issues upstream."
+tags = ["flare", "networking", "http", "http2", "grpc", "tls", "websocket", "quic", "redistribution", "magmalake"]
+# other tins this one depends on; omit if none
+tins = []
