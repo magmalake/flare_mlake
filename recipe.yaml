@@ -28,7 +28,10 @@
 # can be replaced with a ``host: [json]`` requirement.
 
 context:
-  name: flare
+  # The *package* is flare_mlake; the *module* it installs is still `flare`.
+  # Renaming only the package keeps every import unchanged, so switching to an
+  # official flare package later is a one-line dependency change.
+  name: flare_mlake
   version: "0.10.0"
 
 package:
@@ -60,7 +63,12 @@ build:
         -lssl -lcrypto
         -Wl,-rpath,$PREFIX/lib
     # ── json: simdjson FFI wrapper (loaded at runtime by json) ───────────
-    - $CXX -O3 -std=c++17 -fPIC -DNDEBUG -shared
+    # ``-include iterator``: simdjson.h uses ``std::inserter`` without
+    # including <iterator>. Older libstdc++/libc++ pulled it in transitively;
+    # current libc++ (macOS) does not, so the header fails to compile on its
+    # own. Forcing the include ahead of it is the least invasive fix and is
+    # a no-op where the transitive include still happens.
+    - $CXX -O3 -std=c++17 -fPIC -DNDEBUG -shared -include iterator
         -o $PREFIX/lib/libsimdjson_wrapper.so
         json-src/json/cpu/simdjson_ffi/simdjson_wrapper.cpp
         -I$PREFIX/include
@@ -90,9 +98,24 @@ requirements:
 
 about:
   homepage: https://github.com/ehsanmok/flare
+  repository: https://github.com/ehsanmok/flare
+  documentation: https://github.com/ehsanmok/flare
   license: MIT
-  summary: Async-ready networking library for Mojo — TCP, UDP, TLS, HTTP and WebSocket
+  license_file: LICENSE
+  summary: Packaged build of flare (ehsanmok/flare) — networking for Mojo, imported as `flare`
   description: |
+    THIS IS A REDISTRIBUTION. All of the code in this package is flare, by
+    Ehsan M. Kermani <https://github.com/ehsanmok/flare>, used under the MIT
+    licence. It is republished here only because flare is not currently
+    published to any conda channel, which prevents pixi from resolving it.
+    Please direct stars, issues and pull requests upstream, not to the
+    repackager. This package should be abandoned in favour of an official
+    flare package as soon as one exists.
+
+    Packaged by the magmalake project: https://github.com/magmalake/flare_mlake
+
+    The module is imported as `flare` (not `flare_mlake`).
+
     flare is a networking library for Mojo providing:
     - IP/socket address types (IPv4, IPv6, dual-stack)
     - DNS resolution (A/AAAA records via getaddrinfo)

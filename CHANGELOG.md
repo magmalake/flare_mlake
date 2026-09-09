@@ -39,8 +39,34 @@ branches' test steps.
   nightlies. `flare.net`, `flare.http`, `flare.http2`, `flare.tls`, `flare.ws`
   and `flare.grpc` were each verified to compile clean on 1.0.0 (`ed45d567`)
   and 1.1.0.dev2026090705 (`6930d976`).
+- **Package renamed to `flare_mlake`**; the installed module is still `flare`,
+  so no consumer import changes. Only `context.name` moved — the build script
+  stages the literal `flare/` directory as before.
+- **`-include iterator` added to the simdjson wrapper compile.** `simdjson.h`
+  uses `std::inserter` without including `<iterator>`; older standard libraries
+  pulled it in transitively and current libc++ does not, so the build failed on
+  macOS with `no member named 'inserter' in namespace 'std'`. A no-op where the
+  transitive include still happens.
+- **Attribution in the package metadata**: `license_file: LICENSE`, homepage,
+  repository and documentation all point at upstream, and the description opens
+  by stating this is a redistribution of Ehsan M. Kermani's work and that
+  issues and pull requests belong upstream.
 - Upstream's `README.md` preserved verbatim as `README.upstream.md`; the new
   `README.md` explains what this repository is and points at upstream.
+
+### Verified
+
+Built with `rattler-build` 0.76.0 for `osx-arm64` and installed into a clean
+consumer project from a local channel: `from flare.net import SocketAddr`,
+`flare.http` and `flare.grpc` all resolve **with no `-I` flag** and the binary
+runs. The package carries 243 flare source files, 40 json source files and both
+FFI shared libraries.
+
+Note that `pixi` cannot resolve flare's own *source* dependencies (`json`,
+`mozz`) on any current pixi, because those pin `pixi-build-rattler-build
+==0.3.13`, which requires a `pixi-build-api-version` no longer published. That
+blocks developing flare's test suite locally; it does not affect building or
+consuming this package, which goes through `rattler-build` and the recipe.
 
 ### Not changed
 
