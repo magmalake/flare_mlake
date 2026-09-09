@@ -8,4 +8,7 @@ tags = ["flare", "networking", "http", "http2", "grpc", "tls", "websocket", "qui
 # and conflict in any environment that wants json directly too.
 # mozz_mlake is deliberately absent: it is only used by the fuzz feature when
 # developing flare itself, never by the published package.
-tins = ["json_mlake"]
+# threads-mojo joined the list when flare's threading became an adapter over
+# it: flare no longer binds pthread itself, so the dependency is real at both
+# compile and run time.
+tins = ["json_mlake", "threads-mojo"]
