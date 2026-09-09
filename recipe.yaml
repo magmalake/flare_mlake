@@ -76,7 +76,14 @@ requirements:
     - ca-certificates
     - simdjson >=4.2.4,<5    # json's simdjson FFI wrapper
   run:
-    - mojo >=1.0.0,<1.1.0
+    # Widened from upstream's ``<1.1.0``. flare_mlake is consumed by magmalake
+    # repos that build on both Mojo 1.0.0 and the 1.1.0.dev nightlies from one
+    # source tree, and ``flare.net``, ``flare.http``, ``flare.http2``,
+    # ``flare.tls``, ``flare.ws`` and ``flare.grpc`` were each verified to
+    # compile clean on 1.0.0 (ed45d567) and 1.1.0.dev2026090705 (6930d976).
+    # An explicit upper bound at the next minor keeps that a claim about
+    # versions we tested rather than an open-ended promise.
+    - mojo >=1.0.0,<1.2.0
     - openssl >=3.0,<4
     - ca-certificates
     - simdjson >=4.2.4,<5    # libsimdjson_wrapper.so is loaded at runtime
