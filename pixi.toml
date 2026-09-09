@@ -14,13 +14,12 @@ name = "flare_mlake"
 version = "0.10.0"
 
 [package.build]
-# Pin below the 0.4 series: pixi-build-rattler-build 0.4.0 negotiates a
-# JSON-RPC layer that serializes compiler specs (e.g. the cxx compiler ->
-# gxx_linux-64 / clangxx_osx-arm64) as bare strings, which pixi <=0.70.2
-# rejects with "invalid type: string, expected struct MatchSpec" — a fresh
-# build then dies before it starts. 0.3.13 is the newest backend compatible
-# with this pixi. Floating with "*" silently breaks CI the moment 0.4.x ships.
-backend = { name = "pixi-build-rattler-build", version = "==0.3.13" }
+# Bumped from upstream's ``==0.3.13``. That pin requires a
+# ``pixi-build-api-version`` that is no longer published, so no current pixi
+# can solve it; upstream works around it by pinning CI to pixi 0.70.2. Every
+# magmalake repo runs pixi 0.78.0 (see mojoshelf tins.toml), so this tracks
+# the 0.4 series.
+backend = { name = "pixi-build-rattler-build", version = "0.4.*" }
 
 # Binary dependencies are specified in recipe.yaml for rattler-build backend
 
@@ -44,7 +43,9 @@ zlib             = ">=1.3.1,<2"    # HTTP: Content-Encoding gzip/deflate decompr
 libbrotlicommon  = ">=1,<2"        # HTTP: Content-Encoding br (shared brotli tables)
 libbrotlidec     = ">=1,<2"        # HTTP: brotli decoder
 libbrotlienc     = ">=1,<2"        # HTTP: brotli encoder
-json             = { git = "https://github.com/ehsanmok/json.git", tag = "v0.3.0" }
+# millfolio/json rather than ehsanmok/json v0.3.0: upstream json carries the
+# same unsolvable ``==0.3.13`` backend pin. Same code, floating backend.
+json             = { git = "https://github.com/millfolio/json.git", branch = "main" }
 
 # g++ is a BUILD-time dep on Linux: the activation scripts
 # (flare/tls/ffi/build.sh, flare/http/ffi/build.sh) invoke g++ to compile
@@ -63,7 +64,11 @@ gxx = ">=13"
 # feature.dev automatically).
 [feature.dev.dependencies]
 pre-commit = ">=4.2.0,<5"
-mojodoc    = { git = "https://github.com/ehsanmok/mojodoc.git", tag = "v0.1.0" }
+# mojodoc dropped: it carries the same unsolvable ``==0.3.13`` backend pin as
+# json and mozz did, and unlike those two it is a docs generator that nothing
+# in the test suite needs. The `docs` / `docs-build` tasks below are therefore
+# unavailable in this distribution; run them from upstream flare.
+# mojodoc = { git = "https://github.com/ehsanmok/mojodoc.git", tag = "v0.1.0" }
 
 # Linux-only: native debug + race-detection tooling for io_uring
 # root-causing and allocation profiling. gdb -- post-mortem on core
@@ -89,7 +94,11 @@ heaptrack  = ">=1.5"
 # raw wire bytes reflected into Error messages -- is fixed in
 # flare/http/_server/parse_util.mojo::_ascii_safe.)
 [feature.fuzz.dependencies]
-mozz = { git = "https://github.com/ehsanmok/mozz.git", tag = "v0.2.0" }
+# magmalake/mozz_mlake rather than ehsanmok/mozz v0.2.0, for the same reason as
+# json above: upstream's backend pin cannot be solved by a current pixi.
+# Keyed by the package name (mozz_mlake), which is what the source project
+# provides; the Mojo module it installs is still imported as `mozz`.
+mozz_mlake = { git = "https://github.com/magmalake/mozz_mlake.git", branch = "main" }
 
 # ── Code-metrics tooling (complexity + coverage proxy) ───────────────────────
 # Opt in with: pixi run -e metrics metrics
