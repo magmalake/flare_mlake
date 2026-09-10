@@ -25,6 +25,8 @@ cd "$WORK"
 cat > pixi.toml <<TOML
 [workspace]
 name = "consume-smoke"
+# Git dependencies are source dependencies, which pixi gates behind this.
+preview = ["pixi-build"]
 channels = ["file://$CHANNEL", "https://conda.modular.com/max-nightly", "conda-forge"]
 platforms = ["$PLATFORM"]
 
@@ -34,11 +36,11 @@ flare_mlake = "*"
 # flare imports `threads` since its threading became an adapter over
 # threads.mojo, and the recipe takes threads-mojo as a run requirement. It is
 # a pixi source tin rather than a package on any channel, so a consumer
-# declares it as a git dependency — which is also what `pixi shelf add` writes.
+# declares it as a git dependency — which is also what 'pixi shelf add' writes.
 threads-mojo = { git = "https://github.com/magmalake/threads.mojo.git", branch = "main" }
 # flare_mlake depends on json_mlake rather than vendoring json's source, so a
 # consumer needs it too. Declared here as a git source dependency, which is
-# exactly how mojoshelf tins are consumed (`pixi shelf add` writes the same
+# exactly how mojoshelf tins are consumed ('pixi shelf add' writes the same
 # shape, pinned at the published revision).
 json_mlake = { git = "https://github.com/magmalake/json_mlake.git", branch = "main" }
 TOML
