@@ -107,6 +107,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # flare's threading is an adapter over threads.mojo rather than its own
+      # pthread binding, so `threads` has to be on the include path to compile
+      # flare at all. Consumed as a source-path sibling, the way every other
+      # magmalake repo consumes it.
+      - uses: actions/checkout@v4
+        with:
+          repository: magmalake/threads.mojo
+          path: threads.mojo
+
+      # compat/stable and not compat/nightly: flare pins mojo <1.1.0, so this
+      # is Mojo 1.0.0, where `Atomic` takes a `DType`.
+      - name: Threads include path
+        run: |
+          echo "THREADS_I=-I $GITHUB_WORKSPACE/threads.mojo/src -I $GITHUB_WORKSPACE/threads.mojo/compat/stable" >> $GITHUB_ENV
+
       - uses: prefix-dev/setup-pixi@v0.10.2
         with:
           pixi-version: v0.78.0
@@ -117,27 +132,27 @@ jobs:
       # reason to run tests in a distribution repo at all.
       - name: Carried upstream PRs
         run: |
-          pixi run mojo -I . tests/http/test_client_read_timeout.mojo
-          pixi run mojo -I . tests/http/test_server_ws_upgrade.mojo
-          pixi run mojo -I . tests/http/test_server_ws_offload.mojo
-          pixi run mojo -I . tests/ws/test_ws.mojo
+          pixi run mojo -I . $THREADS_I tests/http/test_client_read_timeout.mojo
+          pixi run mojo -I . $THREADS_I tests/http/test_server_ws_upgrade.mojo
+          pixi run mojo -I . $THREADS_I tests/http/test_server_ws_offload.mojo
+          pixi run mojo -I . $THREADS_I tests/ws/test_ws.mojo
 
       # gRPC is the reason magmalake wants flare: Arrow Flight is a gRPC
       # service, so these are the paths a Flight server depends on.
       - name: gRPC
         run: |
-          pixi run mojo -I . tests/grpc/test_grpc.mojo
-          pixi run mojo -I . tests/grpc/test_metadata.mojo
-          pixi run mojo -I . tests/grpc/test_grpc_client.mojo
-          pixi run mojo -I . tests/grpc/test_grpc_server_stream.mojo
-          pixi run mojo -I . tests/grpc/test_grpc_compression.mojo
+          pixi run mojo -I . $THREADS_I tests/grpc/test_grpc.mojo
+          pixi run mojo -I . $THREADS_I tests/grpc/test_metadata.mojo
+          pixi run mojo -I . $THREADS_I tests/grpc/test_grpc_client.mojo
+          pixi run mojo -I . $THREADS_I tests/grpc/test_grpc_server_stream.mojo
+          pixi run mojo -I . $THREADS_I tests/grpc/test_grpc_compression.mojo
 
       - name: HTTP, TLS, net, crypto
         run: |
-          pixi run mojo -I . tests/http/test_http.mojo
-          pixi run mojo -I . tests/http2/test_h2_frame.mojo
-          pixi run mojo -I . tests/http2/test_h2_hpack.mojo
-          pixi run mojo -I . tests/tls/test_tls.mojo
-          pixi run mojo -I . tests/net/test_net.mojo
-          pixi run mojo -I . tests/crypto/test_base64.mojo
-          pixi run mojo -I . tests/crypto/test_hmac.mojo
+          pixi run mojo -I . $THREADS_I tests/http/test_http.mojo
+          pixi run mojo -I . $THREADS_I tests/http2/test_h2_frame.mojo
+          pixi run mojo -I . $THREADS_I tests/http2/test_h2_hpack.mojo
+          pixi run mojo -I . $THREADS_I tests/tls/test_tls.mojo
+          pixi run mojo -I . $THREADS_I tests/net/test_net.mojo
+          pixi run mojo -I . $THREADS_I tests/crypto/test_base64.mojo
+          pixi run mojo -I . $THREADS_I tests/crypto/test_hmac.mojo
