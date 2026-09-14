@@ -296,6 +296,16 @@ struct Http2Connection(Defaultable, Movable):
     is re-pumped when a WINDOW_UPDATE arrives."""
     var pending_pos: Dict[Int, Int]
     """Offset already flushed out of the matching ``pending_body``."""
+    var pending_tk: Dict[Int, List[String]]
+    """Trailer field names owed to a stream whose body is still draining.
+
+    A gRPC response ends in trailing HEADERS (``grpc-status``), and a body
+    parked by a closed window has not reached them yet. Holding them here is
+    what lets the window-aware path serve a trailered response: the trailers
+    are emitted by :meth:`pump_pending` when the last body byte goes out, not
+    dropped because the response could not be framed in one shot."""
+    var pending_tv: Dict[Int, List[String]]
+    """Trailer field values paired with :attr:`pending_tk`."""
 
     def __init__(out self):
         """Default-construct with :class:`Http2Config` defaults.
@@ -312,6 +322,8 @@ struct Http2Connection(Defaultable, Movable):
         self.config = Http2Config()
         self.pending_body = Dict[Int, List[UInt8]]()
         self.pending_pos = Dict[Int, Int]()
+        self.pending_tk = Dict[Int, List[String]]()
+        self.pending_tv = Dict[Int, List[String]]()
 
     @staticmethod
     def with_config(var config: Http2Config) raises -> Http2Connection:
@@ -651,7 +663,17 @@ struct Http2Connection(Defaultable, Movable):
         # Only taken when the body does not fit; the common case keeps
         # the one-shot framing below, END_STREAM riding the single DATA
         # frame, so the wire shape is unchanged for ordinary responses.
-        if len(resp.trailers._keys) == 0 and len(resp.body) > 0:
+        #
+        # Trailered responses take it too. They used to be excluded, which
+        # meant every gRPC response -- they all carry ``grpc-status`` --
+        # skipped the window and the frame-size split and went out as one
+        # unsplit DATA frame. That is fine while a body is small and a
+        # connection error once it is not: a 8 MB reply is both an oversized
+        # frame (RFC 9113 sec 4.2) and a flow-control violation (sec 6.9), and
+        # the peer answers by killing the connection. The symptom is a client
+        # reporting "Stream removed (Socket closed)" against a server that
+        # logs nothing, because from the server's side the write succeeded.
+        if len(resp.body) > 0:
             var st = self.conn.streams[sid].copy()
             var budget = (
                 self.conn.send_window if self.conn.send_window
@@ -663,13 +685,23 @@ struct Http2Connection(Defaultable, Movable):
             )
             if too_big:
                 var body = resp.body.copy()
+                # Captured before the move: ``begin_stream_response`` takes
+                # ``resp`` and emits only the leading block, so the trailers
+                # have to be held until the body has drained.
+                var tk = List[String]()
+                var tv = List[String]()
+                for i in range(len(resp.trailers._keys)):
+                    tk.append(resp.trailers._keys[i])
+                    tv.append(resp.trailers._values[i])
                 self.begin_stream_response(sid, resp^)
                 var n = self.queue_stream_data(sid, Span[UInt8, _](body))
                 if n < len(body):
                     self.pending_body[sid] = body^
                     self.pending_pos[sid] = n
+                    self.pending_tk[sid] = tk^
+                    self.pending_tv[sid] = tv^
                     return  # open until the remainder drains
-                self.end_stream_response(sid, List[String](), List[String]())
+                self.end_stream_response(sid, tk, tv)
                 return
         # Build HpackHeader list from the response's HeaderMap.
         # HTTP/2 forbids ``Connection`` / ``Transfer-Encoding`` / ``Keep-Alive``
@@ -748,7 +780,16 @@ struct Http2Connection(Defaultable, Movable):
             if pos + n >= len(body):
                 _ = self.pending_body.pop(sid)
                 _ = self.pending_pos.pop(sid)
-                self.end_stream_response(sid, List[String](), List[String]())
+                # Whatever trailers the response owed, emitted now that its
+                # last body byte is out. An empty list here would close a
+                # gRPC stream with no ``grpc-status``, which a client reads
+                # as a broken call rather than a completed one.
+                var tk = List[String]()
+                var tv = List[String]()
+                if sid in self.pending_tk:
+                    tk = self.pending_tk.pop(sid)
+                    tv = self.pending_tv.pop(sid)
+                self.end_stream_response(sid, tk, tv)
             else:
                 self.pending_pos[sid] = pos + n
 

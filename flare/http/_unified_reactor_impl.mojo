@@ -343,13 +343,29 @@ def _cleanup_conn_unified(
     mut conns: Dict[Int, Int],
     mut timers: Dict[Int, UInt64],
     mut reactor: Reactor,
+    mut wheel: TimerWheel,
 ):
     """Unregister, cancel timers, and free whichever per-conn handle
     owns ``fd``. Single-dict variant -- dispatches by the kind tag
-    packed into ``conns[fd]``."""
+    packed into ``conns[fd]``.
+
+    The wheel entry is cancelled, not merely forgotten. Dropping the
+    ``timers`` entry alone leaves the timer armed, and a fired timer
+    carries nothing but an fd number: the kernel hands that number to
+    the next connection, so the dead connection's timeout reaps a live
+    one. It presents as every other request dying mid-response with a
+    healthy server and nothing in its log -- the timeout closes the
+    socket without anybody raising."""
     if fd in timers:
+        # Two blocks, because the Dict lookup and the wheel raise
+        # different error types and one `except` cannot cover both.
+        var tid = UInt64(0)
         try:
-            _ = timers.pop(fd)
+            tid = timers.pop(fd)
+        except:
+            pass
+        try:
+            _ = wheel.cancel(tid)
         except:
             pass
     try:
@@ -735,7 +751,7 @@ def _advance_timer_wheel_unified(
     wheel.advance(now_ms, fired)
     for i in range(len(fired)):
         var fd_tok = Int(fired[i])
-        _cleanup_conn_unified(fd_tok, conns, timers, reactor)
+        _cleanup_conn_unified(fd_tok, conns, timers, reactor, wheel)
 
 
 def _unified_handle_conn_event[
@@ -804,7 +820,7 @@ def _unified_handle_conn_event[
                 timers,
             )
         if done3:
-            _cleanup_conn_unified(fd, conns, timers, reactor)
+            _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
         return
 
     if k == KIND_H2:
@@ -819,7 +835,7 @@ def _unified_handle_conn_event[
             timers,
         )
         if done4:
-            _cleanup_conn_unified(fd, conns, timers, reactor)
+            _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
         return
 
     if k == KIND_TLS:
@@ -828,10 +844,10 @@ def _unified_handle_conn_event[
         try:
             hs = tls_ptr[].drive_handshake()
         except:
-            _cleanup_conn_unified(fd, conns, timers, reactor)
+            _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
             return
         if hs.done:
-            _cleanup_conn_unified(fd, conns, timers, reactor)
+            _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
             return
         if not tls_ptr[].handshake_done():
             # Still negotiating: re-arm whichever direction OpenSSL
@@ -842,7 +858,7 @@ def _unified_handle_conn_event[
                     reactor.modify(c_int(fd), want)
                     tls_ptr[].last_interest = want
                 except:
-                    _cleanup_conn_unified(fd, conns, timers, reactor)
+                    _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
                     return
             # Bound a stalled handshake on the same idle timer that
             # bounds a stalled request: a peer that opens a connection,
@@ -855,7 +871,7 @@ def _unified_handle_conn_event[
             return
         # Handshake complete: ALPN decides the protocol handle.
         if not _migrate_tls(fd, h2_config, conns, ws_hooks.copy()):
-            _cleanup_conn_unified(fd, conns, timers, reactor)
+            _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
             return
         # Drive once so the first application record (which OpenSSL may
         # already hold buffered) is consumed without another wakeup.
@@ -873,7 +889,7 @@ def _unified_handle_conn_event[
                 wheel,
                 timers,
             ):
-                _cleanup_conn_unified(fd, conns, timers, reactor)
+                _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
         else:
             if _drive_h1(
                 fd,
@@ -887,7 +903,7 @@ def _unified_handle_conn_event[
                 timers,
                 ws_hooks.copy(),
             ):
-                _cleanup_conn_unified(fd, conns, timers, reactor)
+                _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
         return
 
     # Cold path: protocol-undecided (PendingConnHandle). Runs at
@@ -905,7 +921,7 @@ def _unified_handle_conn_event[
         return
     var ok = _migrate_pending(fd, decision, h2_config, conns, ws_hooks.copy())
     if not ok:
-        _cleanup_conn_unified(fd, conns, timers, reactor)
+        _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
         return
     # After migration, drive the chosen handle once to consume
     # any prefetched bytes (e.g. the bytes that arrived after
@@ -926,7 +942,7 @@ def _unified_handle_conn_event[
             timers,
         )
         if done:
-            _cleanup_conn_unified(fd, conns, timers, reactor)
+            _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
     elif k2 == KIND_H1:
         var done2 = _drive_h1(
             fd,
@@ -941,7 +957,7 @@ def _unified_handle_conn_event[
             ws_hooks.copy(),
         )
         if done2:
-            _cleanup_conn_unified(fd, conns, timers, reactor)
+            _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
 
 
 @always_inline
@@ -949,6 +965,7 @@ def _drain_remaining_conns_unified(
     mut conns: Dict[Int, Int],
     mut timers: Dict[Int, UInt64],
     mut reactor: Reactor,
+    mut wheel: TimerWheel,
 ) raises -> Int:
     """Flip ``Cancel.SHUTDOWN`` on every live connection, then close it.
 
@@ -989,7 +1006,7 @@ def _drain_remaining_conns_unified(
                     _h2_conn_ptr_from_int(_addr(packed))[].signal_drain()
                 except:
                     pass
-        _cleanup_conn_unified(fd, conns, timers, reactor)
+        _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
     return len(leftover)
 
 
@@ -1104,7 +1121,7 @@ def _run_unified_loop_for_fd[
     # Publish what was actually still in flight when the loop stopped,
     # so Scheduler.drain reports a measured number rather than the
     # count from whichever iteration happened to run last.
-    var still_live = _drain_remaining_conns_unified(conns, timers, reactor)
+    var still_live = _drain_remaining_conns_unified(conns, timers, reactor, wheel)
     store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, still_live)
 
 
@@ -1265,7 +1282,7 @@ def run_unified_reactor_loop_multi[
     # Graceful shutdown: flip Cancel.SHUTDOWN, then close all live
     # conns. Listener fds are closed by ``HttpServer.__deinit__`` -- the
     # loop only borrows.
-    _ = _drain_remaining_conns_unified(conns, timers, reactor)
+    _ = _drain_remaining_conns_unified(conns, timers, reactor, wheel)
 
 
 # ── Unified reactor loop -- shared listener (multi-worker) ──────────────────
