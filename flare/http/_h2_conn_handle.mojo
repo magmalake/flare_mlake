@@ -576,7 +576,7 @@ struct Http2ConnHandle(Movable):
         return StepResult(
             want_read=True,
             want_write=False,
-            idle_timeout_ms=config.idle_timeout_ms,
+            idle_timeout_ms=self._read_wait_timeout_ms(config),
         )
 
     # ── WebSocket-over-HTTP/2 sidecar dispatch (RFC 8441) ────────────────────
@@ -722,6 +722,26 @@ struct Http2ConnHandle(Movable):
                 st[].pending = tail^
                 st[].ppos = 0
                 return
+
+    def _read_wait_timeout_ms(self, config: ServerConfig) -> Int:
+        """How long this connection may sit unreadable before it is reaped.
+
+        ``idle_timeout_ms`` is the budget for a connection with nothing in
+        flight -- half a second by default, which is the right answer for a
+        keep-alive socket nobody is using. A connection with active streams is
+        not that: its send window is exhausted and it is waiting for the
+        peer's WINDOW_UPDATE, which is a readable event that arrives when the
+        peer gets round to it. Charging that wait to the idle budget reaps a
+        response mid-flight, and the peer sees its stream vanish with no error
+        from a server that is working correctly.
+
+        A stalled peer still has to be bounded, so the wait is charged to
+        ``write_timeout_ms`` -- the budget that already covers "we owe bytes
+        and cannot send them".
+        """
+        if len(self._stream_out) > 0:
+            return config.write_timeout_ms
+        return config.idle_timeout_ms
 
     def _clear_stream(mut self, sid: Int) raises:
         """Free + remove the boxed streaming state for ``sid`` once its
@@ -973,7 +993,7 @@ struct Http2ConnHandle(Movable):
         return StepResult(
             want_read=True,
             want_write=False,
-            idle_timeout_ms=config.idle_timeout_ms,
+            idle_timeout_ms=self._read_wait_timeout_ms(config),
         )
 
     def signal_drain(mut self) raises -> None:
@@ -1082,7 +1102,7 @@ struct Http2ConnHandle(Movable):
         return StepResult(
             want_read=True,
             want_write=False,
-            idle_timeout_ms=config.idle_timeout_ms,
+            idle_timeout_ms=self._read_wait_timeout_ms(config),
         )
 
 
