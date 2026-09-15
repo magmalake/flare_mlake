@@ -393,9 +393,26 @@ struct Scheduler[F: Frontend & Copyable](Movable):
         # currently waiting in ``epoll_wait``, so idle workers
         # absorb spikes). See ``docs/benchmark.md`` for the
         # head-to-head numbers in both modes.
+        # ...on Linux. macOS is the exception, and it is not a tuning
+        # difference: BSD's SO_REUSEPORT does not load-balance. Linux hashes
+        # each new 4-tuple to one of the N listeners; the BSD semantics hand
+        # new connections to a single socket, so N-1 workers accept nothing
+        # and a multi-worker server runs on one core while looking healthy.
+        # Measured on an M4: 16 Flight DoGets over per-worker listeners took
+        # 11.3 s at every client concurrency with the process pegged at 100 %
+        # CPU; the shared listener took 12.2 s at one client thread and 3.3 s
+        # at four, with CPU climbing past 190 %.
+        #
+        # So the shared listener is the default where SO_REUSEPORT would not
+        # spread. FLARE_REUSEPORT_WORKERS=1 forces the per-worker shape back
+        # on for anyone measuring the difference.
         var use_reuseport_workers = True
+        comptime if CompilationTarget.is_macos():
+            use_reuseport_workers = False
         if getenv("FLARE_REUSEPORT_WORKERS") == "0":
             use_reuseport_workers = False
+        elif getenv("FLARE_REUSEPORT_WORKERS") == "1":
+            use_reuseport_workers = True
 
         var listener_fd: Int = -1
         # UnsafePointer is non-nullable; build C NULL from a runtime 0.

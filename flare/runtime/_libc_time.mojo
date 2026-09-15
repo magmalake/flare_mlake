@@ -32,6 +32,7 @@ POSIX semantics:
 """
 
 from std.ffi import external_call
+from std.time import sleep
 from std.memory import UnsafePointer, stack_allocation
 from std.sys.info import CompilationTarget
 
@@ -113,25 +114,16 @@ def libc_nanosleep_ms(ms: Int) -> Int:
     """
     if ms <= 0:
         return 0
-    var ts = stack_allocation[2, Int64]()
-    ts[0] = Int64(ms // 1000)
-    ts[1] = Int64((ms % 1000) * 1_000_000)
-    # ``rem`` argument is NULL — we discard interrupt remainders.
-    # Use the same MutUntrackedOrigin we already use elsewhere for
-    # libc-facing pointers; this keeps the optimiser from reordering
-    # loads through the ``ts`` page across the syscall boundary.
-    # UnsafePointer is non-nullable; build C NULL from a runtime 0.
-    var null_addr = 0
-    var null_rem = UnsafePointer[Int64, MutUntrackedOrigin](
-        unsafe_from_address=null_addr
-    )
-    var ts_ext = UnsafePointer[Int64, MutUntrackedOrigin](
-        unsafe_from_address=Int(ts)
-    )
-    var rc = external_call[
-        "nanosleep",
-        Int32,
-        UnsafePointer[Int64, MutUntrackedOrigin],
-        UnsafePointer[Int64, MutUntrackedOrigin],
-    ](ts_ext, null_rem)
-    return Int(rc)
+    # `std.time.sleep`, not our own `nanosleep` extern. Mojo declares an
+    # extern per signature, and the stdlib already declares `nanosleep` with
+    # a different one -- so a binary that reaches both (any multi-worker
+    # server, which pulls in the scheduler's watchdog) refused to lower with
+    # "existing function with conflicting signature". Same shape as the
+    # pthread clash between flare and threads.mojo: one declaration per
+    # symbol, owned by whoever already has it.
+    #
+    # Interrupt remainders were already discarded here, and the stdlib's
+    # sleep is the same nanosleep underneath, so nothing about the behaviour
+    # changes except that it now links.
+    sleep(Float64(ms) / 1000.0)
+    return 0
