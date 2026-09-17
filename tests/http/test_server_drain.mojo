@@ -28,7 +28,8 @@ from flare.http._reactor.tagged_dispatch import KIND_H1, _pack
 from flare.http._server_reactor_epoll import _conn_alloc_addr
 from flare.http._unified_reactor_impl import _drain_remaining_conns_unified
 from flare.net import SocketAddr
-from flare.runtime import Reactor
+from flare.runtime import Reactor, TimerWheel
+from flare.http._reactor.keepalive_scan import _monotonic_ms
 from flare.tcp import TcpListener, TcpStream
 
 
@@ -139,7 +140,14 @@ def test_unified_drain_reports_in_flight_and_empties_table() raises:
     var fd = Int(accepted._socket.fd)
     conns[fd] = _pack(KIND_H1, _conn_alloc_addr(accepted^))
 
-    var still_live = _drain_remaining_conns_unified(conns, timers, reactor)
+    # The wheel argument arrived with the closed-connection timer-cancel
+    # fix (#1): drain now cancels each connection's timer rather than
+    # leaving it to fire against a closed fd. This call site was missed
+    # then, so the test stopped compiling.
+    var wheel = TimerWheel(now_ms=UInt64(_monotonic_ms()))
+    var still_live = _drain_remaining_conns_unified(
+        conns, timers, reactor, wheel
+    )
 
     assert_equal(still_live, 1, "drain must report the live connection")
     assert_equal(len(conns), 0, "drain must empty the conn table")
