@@ -3,7 +3,7 @@ authors = ["ehsanmok <ehsanmok@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "flare"
 platforms = ["osx-arm64", "linux-aarch64", "linux-64"]
-version = "0.10.0"
+version = "0.10.1"
 preview = ["pixi-build"]
 
 [package]
@@ -11,7 +11,7 @@ preview = ["pixi-build"]
 # because that is the name consumers write in their dependencies. The module
 # this installs is still `flare`.
 name = "flare_mlake"
-version = "0.10.0"
+version = "0.10.1"
 
 [package.build]
 # Bumped from upstream's ``==0.3.13``. That pin requires a
@@ -53,7 +53,7 @@ json_mlake       = { git = "https://github.com/magmalake/json_mlake.git", branch
 # since the port, but this environment never did -- so every test that reaches
 # threading failed here with "unable to locate module 'threads'" while the
 # published package was fine.
-threads-mojo     = { git = "https://github.com/magmalake/threads.mojo.git", rev = "aaf2c1c9b551" }
+threads-mojo     = { git = "https://github.com/magmalake/threads.mojo.git", rev = "2914cd2c2db5" }
 
 # g++ is a BUILD-time dep on Linux: the activation scripts
 # (flare/tls/ffi/build.sh, flare/http/ffi/build.sh) invoke g++ to compile

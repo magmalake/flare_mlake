@@ -8,6 +8,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-16
+
+Tracks upstream **flare main** at `1e92aa3`, which is past the `v0.10.0` tag
+but not yet tagged itself.
+
+### Removed
+
+The four pull requests 0.10.0 carried ahead of review have all merged
+upstream, so this distribution stops carrying them — as 0.10.0 said it
+should, the moment they landed. Upstream's reviewed versions replace the
+copies here, and they differ in substance, not only in wording:
+
+- [#14](https://github.com/ehsanmok/flare/pull/14) also bounds the TLS
+  handshake and raises `Timeout` on a stalled TLS read. Two new wrapper
+  exports carry it: `flare_ssl_connect_ex` classifies a handshake that
+  expires, and `flare_ssl_read_blocking` splits the retryable case out of
+  `SSL_read` without changing what end of stream means.
+- [#15](https://github.com/ehsanmok/flare/pull/15) makes `_prebuf` a
+  persistent carry-over. The version here delivered the first pipelined
+  frame and dropped the rest, and the next `recv()` then blocked forever.
+- [#16](https://github.com/ehsanmok/flare/pull/16) frees the offload context
+  when `pthread_create` fails. The version here leaked a live socket per
+  failed handshake, with nothing left to close it.
+- [#11](https://github.com/ehsanmok/flare/pull/11) landed as-is, plus an
+  upstream follow-up documenting the `Origin` cases an allow-list has to
+  handle.
+
+### Changed
+
+- Upstream's 843-site deprecated-API migration and its generated per-area
+  test aggregates come with the merge. `pixi run tests` is now
+  `tools/run_test_aggregates.sh`; `pixi run tests-gen` regenerates
+  `tests/_agg` after adding a test file.
+- `threads-mojo` is pinned `>=0.5.2` rather than `>=0.5.1`. `_worker.mojo`
+  calls `pin_current_to_cpu`, which no published version had until 0.5.2.
+
+### Fixed
+
+- `threads-mojo` is declared in `[dependencies]`, not only in `recipe.yaml`.
+  The published package always had it; this environment never did, so every
+  test that reached threading failed locally with "unable to locate module
+  'threads'".
+- `tests/http/test_server_drain.mojo` passes the `wheel` argument that the
+  closed-connection timer-cancel fix added. That call site was missed, so the
+  file had not compiled since.
+
+### Still carried on top of upstream
+
+- `flare/runtime/_thread.mojo` is an adapter over `threads.mojo` rather than
+  its own pthread binding, so only one library binds each libc symbol and
+  flare can be linked alongside the rest of the magmalake stack.
+- `flare/runtime/_libc_time.mojo` calls `std.time.sleep` instead of binding
+  `nanosleep`, for the same reason.
+- The macOS shared-listener default, `json_mlake` / `mozz_mlake`, the dropped
+  `mojodoc` dependency, and the packaging.
+
 ## [0.10.0] - 2026-09-08
 
 First published build. Tracks upstream **flare 0.10.0** (`c6f0084`).

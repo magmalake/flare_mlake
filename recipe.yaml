@@ -32,7 +32,7 @@ context:
   # Renaming only the package keeps every import unchanged, so switching to an
   # official flare package later is a one-line dependency change.
   name: flare_mlake
-  version: "0.10.0"
+  version: "0.10.1"
 
 package:
   name: ${{ name }}
@@ -91,7 +91,9 @@ requirements:
     # pthread binding, so `threads` has to be importable wherever flare is.
     # Having exactly one library bind a given libc symbol is what lets flare
     # be linked alongside the rest of the magmalake stack at all.
-    - threads-mojo >=0.5.1,<0.6
+    # 0.5.2 is the first published version carrying `pin_current_to_cpu`,
+    # which `_worker.mojo` calls.
+    - threads-mojo >=0.5.2,<0.6
 
 about:
   homepage: https://github.com/ehsanmok/flare
