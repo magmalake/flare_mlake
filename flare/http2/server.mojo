@@ -29,6 +29,7 @@ shoves bytes through it directly *and* in the reactor's per-fd
 callback.
 """
 
+from std.memory import unsafe_memcpy
 from std.collections import Dict, Optional
 
 from flare.http.wire import HeaderMap, Method, Request, Response
@@ -909,13 +910,26 @@ struct Http2Connection(Defaultable, Movable):
             df.header.type = FrameType.DATA()
             df.header.stream_id = sid
             df.header.flags = FrameFlags()
-            var pl = List[UInt8](capacity=take)
-            for i in range(take):
-                pl.append(data[sent + i])
+            # Two copies of the payload, both in one go: `data` into the
+            # frame, and the encoded frame into the outbox. A byte at a time
+            # they were the whole cost of a large response — every byte of a
+            # 28 MiB gRPC message appended twice, individually.
+            var pl = List[UInt8]()
+            pl.resize(unsafe_uninit_length=take)
+            unsafe_memcpy(
+                dest=pl.unsafe_ptr(),
+                src=data.unsafe_ptr().unsafe_offset(sent),
+                count=take,
+            )
             df.payload = pl^
             var bytes = encode_frame(df)
-            for j in range(len(bytes)):
-                self.outbox.append(bytes[j])
+            var base = len(self.outbox)
+            self.outbox.resize(unsafe_uninit_length=base + len(bytes))
+            unsafe_memcpy(
+                dest=self.outbox.unsafe_ptr().unsafe_offset(base),
+                src=bytes.unsafe_ptr(),
+                count=len(bytes),
+            )
             sent += take
             budget -= take
         self.conn.send_window -= sent
