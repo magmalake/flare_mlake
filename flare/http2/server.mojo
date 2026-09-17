@@ -565,8 +565,13 @@ struct Http2Connection(Defaultable, Movable):
             self.pump_pending()
 
     def drain(mut self) -> List[UInt8]:
-        """Return all queued outbound bytes and clear the buffer."""
-        var out = self.outbox.copy()
+        """Return all queued outbound bytes and clear the buffer.
+
+        The buffer is handed over rather than copied: it holds whatever was
+        framed since the last drain, which for a streaming response is a
+        window's worth of body.
+        """
+        var out = self.outbox^
         self.outbox = List[UInt8]()
         return out^
 
@@ -772,13 +777,37 @@ struct Http2Connection(Defaultable, Movable):
             sids.append(entry.key)
         for i in range(len(sids)):
             var sid = sids[i]
-            var body = self.pending_body[sid].copy()
             var pos = self.pending_pos[sid]
-            var rest = List[UInt8](capacity=len(body) - pos)
-            for k in range(pos, len(body)):
-                rest.append(body[k])
+            var total = len(self.pending_body[sid])
+
+            # Only what the window will actually take. This used to copy the
+            # whole parked body and then the whole remainder of it, on every
+            # inbound frame -- and a WINDOW_UPDATE is an inbound frame, so a
+            # body large enough to park was copied twice per window's worth
+            # of progress. That is quadratic in the body: a 28 MiB gRPC
+            # message advancing 64 KiB at a time copied gigabytes to send
+            # megabytes, and it was the whole cost of a large response once
+            # the framing itself stopped going a byte at a time.
+            var budget = self._send_budget(sid)
+            if budget <= 0:
+                continue
+            var take = total - pos
+            if take > budget:
+                take = budget
+            var rest = List[UInt8]()
+            if take > 0:
+                # A copy rather than a span of the parked body, because the
+                # body lives in `self` and `queue_stream_data` takes `self`
+                # mutably. It is bounded by the window now, which is what
+                # makes it cheap.
+                rest.resize(unsafe_uninit_length=take)
+                unsafe_memcpy(
+                    dest=rest.unsafe_ptr(),
+                    src=self.pending_body[sid].unsafe_ptr().unsafe_offset(pos),
+                    count=take,
+                )
             var n = self.queue_stream_data(sid, Span[UInt8, _](rest))
-            if pos + n >= len(body):
+            if pos + n >= total:
                 _ = self.pending_body.pop(sid)
                 _ = self.pending_pos.pop(sid)
                 # Whatever trailers the response owed, emitted now that its
@@ -876,6 +905,22 @@ struct Http2Connection(Defaultable, Movable):
         var bytes = encode_frame(hf)
         for j in range(len(bytes)):
             self.outbox.append(bytes[j])
+
+    def _send_budget(self, sid: Int) raises -> Int:
+        """How many body bytes may go out on `sid` right now.
+
+        The min of the connection and stream send windows — the same bound
+        `queue_stream_data` applies, exposed so a caller can size what it
+        hands over rather than handing over everything and being told how
+        much fitted.
+        """
+        if sid not in self.conn.streams:
+            return 0
+        var s = self.conn.streams[sid].copy()
+        return (
+            self.conn.send_window if self.conn.send_window
+            < s.send_window else s.send_window
+        )
 
     def queue_stream_data(
         mut self, sid: Int, data: Span[UInt8, _]
