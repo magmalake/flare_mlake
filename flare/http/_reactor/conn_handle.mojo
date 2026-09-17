@@ -341,7 +341,7 @@ struct ConnHandle(Movable):
                 var old_len = len(self.read_buf)
                 var got_int = Int(got)
                 self.read_buf.resize(old_len + got_int, UInt8(0))
-                var dst = self.read_buf.unsafe_ptr() + old_len
+                var dst = self.read_buf.unsafe_ptr().unsafe_offset(old_len)
                 unsafe_memcpy(dest=dst, src=chunk, count=got_int)
                 if (
                     len(self.read_buf)
@@ -418,7 +418,7 @@ struct ConnHandle(Movable):
             var old_len = len(self.read_buf)
             var add = len(bytes)
             self.read_buf.resize(old_len + add, UInt8(0))
-            var dst = self.read_buf.unsafe_ptr() + old_len
+            var dst = self.read_buf.unsafe_ptr().unsafe_offset(old_len)
             unsafe_memcpy(dest=dst, src=bytes.unsafe_ptr(), count=add)
             if (
                 len(self.read_buf)
@@ -637,9 +637,10 @@ struct ConnHandle(Movable):
             # WebSocket upgrade (RFC 6455), opt-in via
             # ``config.ws_handler``. Checked inside the same guard the
             # h2c path already pays for, so non-upgrade traffic is
-            # unaffected. On success the handler has run to completion
-            # and the fd now belongs to the WsConnection, so the
-            # reactor is told to drop this connection.
+            # unaffected. On success the fd belongs to the
+            # WsConnection, so the reactor is told to drop this
+            # connection -- with `ws_offload` set that happens while
+            # the handler is still running on its own thread.
             if config.ws_handler:
                 var upgraded: Bool
                 try:
@@ -1025,7 +1026,9 @@ struct ConnHandle(Movable):
             else:
                 while self.write_pos < len(self.write_buf):
                     var remaining = len(self.write_buf) - self.write_pos
-                    var ptr = self.write_buf.unsafe_ptr() + self.write_pos
+                    var ptr = self.write_buf.unsafe_ptr().unsafe_offset(
+                        self.write_pos
+                    )
                     var n = _send(
                         self.fd(), ptr, c_size_t(remaining), c_int(MSG_NOSIGNAL)
                     )
@@ -1214,9 +1217,8 @@ struct ConnHandle(Movable):
         the request is not a WebSocket handshake, so the caller falls
         through to the ordinary unary handler path.
 
-        Returns ``True`` once the handshake has been answered and the
-        user's ``ws_handler`` has run to completion. By then this
-        method has:
+        Returns ``True`` once the handshake has been answered. By then
+        this method has:
 
         1. Computed ``Sec-WebSocket-Accept`` and written ``101
            Switching Protocols`` straight to the socket.
@@ -1228,8 +1230,10 @@ struct ConnHandle(Movable):
         3. Put the socket back into blocking mode, because the WS
            handler uses blocking ``recv`` exactly as
            :class:`flare.ws.WsServer` does.
-        4. Run ``ws_handler(conn)``, which owns that connection for as
-           long as it lives.
+        4. With ``config.ws_offload`` unset, run ``ws_handler(conn)``
+           to completion on this thread. With it set, moved the
+           connection onto a detached thread and returned while the
+           handler is still running.
 
         The caller then returns ``done=True`` so the reactor
         unregisters the fd; closing it is the ``WsConnection``'s job.
@@ -1241,6 +1245,8 @@ struct ConnHandle(Movable):
         from flare.http.server import _ascii_lower
 
         # RFC 6455 4.2.1 qualification.
+        if req.method != "GET" or req.version == "HTTP/1.0":
+            return False
         var upg = _ascii_lower(req.headers.get("upgrade"))
         if upg != "websocket":
             return False
@@ -1255,7 +1261,7 @@ struct ConnHandle(Movable):
             WsConnection,
             _compute_accept_srv,
             _send_upgrade_response,
-            spawn_ws_offload,
+            _spawn_ws_offload,
         )
         from flare.net.socket import RawSocket
         from flare.net._libc import AF_INET, SOCK_STREAM
@@ -1290,7 +1296,7 @@ struct ConnHandle(Movable):
             # instead of parking for the WebSocket's whole lifetime. The
             # fd is already detached from the reactor and back in
             # blocking mode, so that thread owns it end to end.
-            spawn_ws_offload(conn^, config.ws_handler.value())
+            _spawn_ws_offload(conn^, config.ws_handler.value())
             return True
         config.ws_handler.value()(conn)
         return True

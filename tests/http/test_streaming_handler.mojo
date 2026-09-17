@@ -71,7 +71,7 @@ def _read_until_terminator(mut s: TcpStream, max_ms: Int) raises -> String:
 def _hex_to_int(s: String) -> Int:
     var acc = 0
     for i in range(s.byte_length()):
-        var c = Int(s.unsafe_ptr()[i])
+        var c = Int(s.unsafe_ptr()[unsafe_offset=i])
         var d = -1
         if c >= 48 and c <= 57:
             d = c - 48
@@ -105,7 +105,7 @@ def _dechunk(body: String) -> String:
     return acc^
 
 
-def main() raises:
+def test_streaming_handler() raises:
     var srv = HttpServer.bind(SocketAddr.localhost(0))
     var port = srv.local_addr().port
 
@@ -146,3 +146,7 @@ def main() raises:
     var decoded = _dechunk(body)
     assert_equal(decoded, "chunk0chunk1chunk2")
     print("test_streaming_handler: passed (chunked stream via Handler)")
+
+
+def main() raises:
+    test_streaming_handler()

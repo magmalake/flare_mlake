@@ -12,6 +12,12 @@ Topology mirrors tests/http/test_unified_http_server.mojo: fork a child
 running ``HttpServer.serve_ws_upgrade(http_handler, ws_handler)``, drive both an
 HTTP/1.1 client and a ``flare.ws.WsClient`` from the parent over the
 same port, SIGKILL on test-end.
+
+``WsClient.connect`` cannot exercise the interesting half of the seam:
+it writes the handshake, waits for the 101, and only then sends a frame,
+so on loopback those are two segments and the prebuf is empty. The third
+test writes the handshake and two frames in one ``send`` on a raw socket
+instead, which is the only way to reach the prebuf with real data.
 """
 
 from std.ffi import c_int, c_size_t
@@ -25,17 +31,21 @@ from flare.net import SocketAddr
 from flare.net._libc import (
     AF_INET,
     MSG_NOSIGNAL,
+    SO_RCVTIMEO,
     SOCK_STREAM,
+    SOL_SOCKET,
+    TIMEVAL_SIZE,
     _close,
     _connect,
     _fill_sockaddr_in,
     _recv,
     _send,
+    _setsockopt,
     _socket,
     _strerror,
     get_errno,
 )
-from flare.ws import WsClient, WsConnection, WsOpcode
+from flare.ws import WsClient, WsConnection, WsFrame, WsOpcode
 
 
 # ── HTTP handler: ordinary unary route ───────────────────────────────────────
@@ -248,7 +258,127 @@ def test_upgrade_request_is_ordinary_traffic_without_a_ws_handler() raises:
     )
 
 
+def _set_recv_timeout(fd: c_int, ms: Int) raises:
+    """Bound ``_recv`` on a raw loopback fd.
+
+    Without it, a server that stops answering mid-test deadlocks the
+    parent instead of failing it, and a CI job hangs until its own
+    timeout kills it with nothing to read.
+    """
+    var tv = stack_allocation[16, UInt8]()
+    for i in range(16):
+        tv.unsafe_offset(i).unsafe_write(UInt8(0))
+    tv.unsafe_bitcast[Int64]().unsafe_write(Int64(ms // 1000))
+    (tv + 8).unsafe_bitcast[Int64]().unsafe_write(Int64((ms % 1000) * 1000))
+    if _setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tv, TIMEVAL_SIZE) < c_int(0):
+        raise Error("setsockopt SO_RCVTIMEO: " + _strerror(get_errno().value))
+
+
+def _send_all(fd: c_int, data: Span[UInt8, _]) raises:
+    var sent = 0
+    while sent < len(data):
+        var n = Int(
+            _send(
+                fd,
+                data.unsafe_ptr() + sent,
+                c_size_t(len(data) - sent),
+                c_int(MSG_NOSIGNAL),
+            )
+        )
+        if n <= 0:
+            raise Error("send failed: " + _strerror(get_errno().value))
+        sent += n
+
+
+def test_frames_pipelined_with_the_handshake_are_all_delivered() raises:
+    """The handshake and two frames in a single ``send``: both frames
+    must come back.
+
+    This is the one path with genuinely new wire behaviour, and nothing
+    else reaches it. TCP is free to coalesce, so the reactor's ``recv``
+    that delivers the upgrade request can carry frame bytes behind it;
+    those are handed to the ``WsConnection`` as its prebuf because the
+    reactor is about to stop reading the fd.
+
+    Two frames rather than one on purpose. One frame passed before the
+    prebuf became a persistent carry-over: ``_recv_one`` drained the
+    prebuf into a local buffer, decoded the first frame and dropped the
+    rest with that buffer. The second echo never arrived and the next
+    ``recv()`` blocked on a socket with nothing more coming -- a hang,
+    not an error, which is why this asserts on both replies.
+    """
+    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var port = UInt16(srv.local_addr().port)
+
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve_ws_upgrade(_http_handler, _ws_handler)
+        except:
+            pass
+        exit()
+    usleep(300000)
+
+    var got = String("")
+    var raised = False
+    try:
+        var fd = _connect_loopback(port)
+        # The pre-fix failure here is a hang, not a wrong reply: the
+        # server blocks in recv() on a frame it already dropped while
+        # this side waits for an echo that will never come.
+        _set_recv_timeout(fd, 3000)
+
+        var wire = List[UInt8]()
+        var handshake = String(
+            "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade:"
+            " websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key:"
+            " dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        for b in handshake.as_bytes():
+            wire.append(b)
+        # Client frames must be masked (RFC 6455 5.1); _recv_one
+        # rejects an unmasked one outright.
+        for b in WsFrame.text("one").encode(mask=True):
+            wire.append(b)
+        for b in WsFrame.text("two").encode(mask=True):
+            wire.append(b)
+        _send_all(fd, Span[UInt8, _](wire))
+
+        var buf = stack_allocation[4096, UInt8]()
+        var attempts = 0
+        while attempts < 20 and (
+            "echo: one" not in got or "echo: two" not in got
+        ):
+            attempts += 1
+            var n = _recv(fd, buf, c_size_t(4096), c_int(0))
+            if Int(n) <= 0:
+                break
+            for i in range(Int(n)):
+                got += chr(Int(buf[i]))
+        _ = _close(fd)
+    except:
+        raised = True
+
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+
+    assert_true(not raised, "pipelined handshake round-trip raised")
+    assert_true(
+        "101" in got,
+        "server did not switch protocols; got: " + got,
+    )
+    assert_true(
+        "echo: one" in got,
+        "first pipelined frame was not echoed; got: " + got,
+    )
+    assert_true(
+        "echo: two" in got,
+        "second pipelined frame was dropped; got: " + got,
+    )
+
+
 def main() raises:
     test_http_and_ws_on_one_port()
     test_upgrade_request_is_ordinary_traffic_without_a_ws_handler()
-    print("test_server_ws_upgrade: 2 passed")
+    test_frames_pipelined_with_the_handshake_are_all_delivered()
+    print("test_server_ws_upgrade: 3 passed")

@@ -156,7 +156,7 @@ def _race_connect_leg(
     module needs no HttpClient import. Only the h3 leg mutates client
     state (the QUIC pool), so the two concurrent legs have a single
     writer. Returns ``True`` when the connection established."""
-    var client = UnsafePointer[HttpClient, MutUntrackedOrigin](
+    var client = Pointer[HttpClient, MutUntrackedOrigin](
         unsafe_from_address=client_addr
     )
     var u = Url.parse(url)
@@ -306,12 +306,14 @@ struct HttpClient(Movable):
     captures ``Set-Cookie`` response headers and replays them as a
     ``Cookie`` request header. Freed in :meth:`__deinit__`."""
     var _read_timeout_ms: Int
-    """Opt-in read timeout applied to every connection this client
-    dials, via ``SO_RCVTIMEO`` on the underlying socket. ``0``
-    (the default) leaves body reads unbounded, preserving the
-    historical behaviour; :meth:`with_read_timeout` opts in.
-    Distinct from :attr:`_timeout_ms`, which bounds ``connect(2)``
-    only."""
+    """Opt-in read timeout applied to every TCP and TLS connection
+    this client dials, via ``SO_RCVTIMEO`` on the underlying socket.
+    HTTP/3 is excluded: QUIC does its own UDP-side timing (see
+    :meth:`flare.quic.QuicClient` ). ``0`` (the default) leaves body
+    reads unbounded, preserving the historical behaviour;
+    :meth:`with_read_timeout` opts in. Distinct from
+    :attr:`_timeout_ms`, which bounds ``connect(2)`` and the TLS
+    handshake."""
 
     def __init__(
         out self,
@@ -624,13 +626,14 @@ struct HttpClient(Movable):
 
         The bound is per-read inactivity, not a deadline on the whole
         response: a large body that keeps arriving never trips it, and
-        a stalled one trips it after ``ms`` of silence. Use
-        ``PostHocDeadline`` for a whole-request deadline.
+        a stalled one trips it after ``ms`` of silence. The client has
+        no whole-request deadline.
 
-        Set it before the first request. The timeout is armed when a
-        connection is dialled and rides on the socket, so it covers
-        pooled connections for their whole lifetime -- but connections
-        already pooled keep whatever was armed when they were dialled.
+        Set it before the first request. The timeout rides on the
+        socket, so a connection keeps it for its whole lifetime.
+        Cleartext pooled fds are re-armed on checkout; pooled TLS
+        connections keep whatever was armed when they were dialled,
+        and lowering ``ms`` to ``0`` clears neither.
 
         Args:
             ms: Read timeout in milliseconds. ``0`` (the default)
@@ -649,14 +652,19 @@ struct HttpClient(Movable):
         return self^
 
     def _arm_read_timeout(self, stream: TcpStream) raises:
-        """Apply :attr:`_read_timeout_ms` to a freshly dialled TCP
-        connection. A no-op when no read timeout is configured."""
+        """Apply :attr:`_read_timeout_ms` to a TCP connection about to
+        carry a request -- a fresh dial, or a pooled fd rewrapped on
+        checkout. A no-op when no read timeout is configured, so it
+        never clears one already on the socket."""
         if self._read_timeout_ms > 0:
             stream.set_recv_timeout(self._read_timeout_ms)
 
     def _arm_read_timeout(self, stream: TlsStream) raises:
         """Apply :attr:`_read_timeout_ms` to a freshly dialled TLS
-        connection (it delegates to the underlying TCP socket)."""
+        connection (it delegates to the underlying TCP socket). A
+        no-op when no read timeout is configured. Pooled TLS
+        connections are not re-armed on checkout -- they still carry
+        what was armed at dial time."""
         if self._read_timeout_ms > 0:
             stream.set_recv_timeout(self._read_timeout_ms)
 
@@ -2019,7 +2027,7 @@ struct HttpClient(Movable):
                     # duplicated on the wire.
                     var winner = race_http3_h2_connect(
                         _race_connect_leg,
-                        Int(UnsafePointer(to=self)),
+                        Int(Pointer(to=self)),
                         url,
                     )
                     if winner == RACE_H3:

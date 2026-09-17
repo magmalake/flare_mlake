@@ -21,7 +21,7 @@ from ..crypto.base64 import base64_encode as _b64_encode_srv
 from ..http.response import Status
 from ..tcp import TcpListener, TcpStream
 from ..net import SocketAddr, NetworkError, _find_flare_lib
-from ..runtime._thread import ThreadHandle, _OpaquePtr
+from ..runtime._thread import ThreadHandle, _OpaquePtr, _null_ptr
 from ..runtime.reuseport import bind_reuseport
 from ..utils.dylib import dl_sym
 
@@ -34,7 +34,7 @@ comptime _SHA1_LEN: Int = 20
 
 
 def _do_sha1_srv(
-    read lib: OwnedDLHandle, data_bytes: Span[UInt8, _]
+    imm lib: OwnedDLHandle, data_bytes: Span[UInt8, _]
 ) raises -> List[UInt8]:
     """Invoke the SHA-1 C function with ``lib`` borrowed.
 
@@ -134,7 +134,7 @@ def _lower_srv(s: String) -> String:
     """Return ASCII-lowercase of ``s``."""
     var out = String(capacity=s.byte_length())
     for i in range(s.byte_length()):
-        var c = s.unsafe_ptr()[i]
+        var c = s.unsafe_ptr()[unsafe_offset=i]
         if c >= 65 and c <= 90:
             out += chr(Int(c) + 32)
         else:
@@ -151,7 +151,10 @@ def _str_find_srv(s: String, sub: String) -> Int:
     for i in range(n - m + 1):
         var ok = True
         for j in range(m):
-            if s.unsafe_ptr()[i + j] != sub.unsafe_ptr()[j]:
+            if (
+                s.unsafe_ptr()[unsafe_offset=i + j]
+                != sub.unsafe_ptr()[unsafe_offset=j]
+            ):
                 ok = False
                 break
         if ok:
@@ -232,9 +235,6 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> _WsUpgradeRequest:
         if k == "sec-websocket-key":
             ws_key = v
         elif k == "origin":
-            # Retained verbatim, not validated: the library has no way to
-            # know which origins a given deployment trusts. Handlers get
-            # it via ``WsConnection.origin`` and apply their own policy.
             ws_origin = v
         elif k == "upgrade" and _lower_srv(v) == "websocket":
             found_upgrade = True
@@ -254,7 +254,7 @@ def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> _WsUpgradeRequest:
 
 
 def _read_upgrade_request(mut stream: TcpStream) raises -> _WsUpgradeRequest:
-    """Read an HTTP upgrade request and return the ``Sec-WebSocket-Key``.
+    """Read an HTTP upgrade request and return the retained fields.
 
     Reads until the blank line terminating HTTP headers.
 
@@ -295,9 +295,6 @@ def _read_upgrade_request(mut stream: TcpStream) raises -> _WsUpgradeRequest:
         if k == "sec-websocket-key":
             ws_key = v
         elif k == "origin":
-            # Retained verbatim, not validated: the library has no way to
-            # know which origins a given deployment trusts. Handlers get
-            # it via ``WsConnection.origin`` and apply their own policy.
             ws_origin = v
         elif k == "upgrade" and _lower_srv(v) == "websocket":
             found_upgrade = True
@@ -381,6 +378,17 @@ struct WsConnection(Movable):
     whatever it likes (or nothing at all). It authenticates the *page*,
     never the user.
 
+    Three cases an allow-list check has to handle: an absent header and
+    a present-but-empty ``Origin:`` both yield ``""``; a repeated
+    ``Origin`` header keeps the last value seen; and a browser sends the
+    literal ``"null"`` for an opaque origin (sandboxed iframe, ``data:``
+    URL, some redirect chains), which matches no real origin and is not
+    the same as absent.
+
+    Both accept paths send the ``101`` before the handler runs, so a
+    ``close`` here is a policy close on a live WebSocket, not a refused
+    handshake:
+
     Example:
         ```mojo
         def on_connect(mut conn: WsConnection) raises:
@@ -391,17 +399,18 @@ struct WsConnection(Movable):
     """
 
     var _prebuf: List[UInt8]
-    """Bytes already drained from the socket before this
-    ``WsConnection`` took ownership of the fd. Non-empty only on the
-    shared-listener upgrade path (``HttpServer.serve(handler,
-    ws_handler)``), where the HTTP/1.1 reactor may have buffered
-    post-handshake WebSocket frame bytes in the same ``recv`` that
-    delivered the upgrade request (TCP coalescing). ``_recv_one``
-    consumes this prefix before issuing any socket ``read``, so a
-    client that pipelines its first frame immediately after the
-    handshake is never dropped. Empty (the common case) for the
-    standalone ``WsServer`` path, which reads the handshake
-    byte-at-a-time and leaves nothing buffered."""
+    """Bytes already read off the socket before this ``WsConnection``
+    took ownership of the fd, plus whatever a decode leaves behind.
+
+    It starts non-empty only on the shared-listener upgrade path
+    (``HttpServer.serve_ws_upgrade``), where the HTTP/1.1 reactor may
+    have buffered post-handshake WebSocket frame bytes in the same
+    ``recv`` that delivered the upgrade request (TCP coalescing).
+    ``_recv_one`` drains it before issuing any socket ``read`` and puts
+    back whatever the decoded frame did not consume, so a client that
+    pipelines several frames behind the handshake loses none of them.
+    Empty throughout for the standalone ``WsServer`` path, which reads
+    the handshake byte-at-a-time and leaves nothing buffered."""
 
     def __init__(
         out self,
@@ -419,7 +428,6 @@ struct WsConnection(Movable):
         var stream: TcpStream,
         peer: SocketAddr,
         var prebuf: List[UInt8],
-        var origin: String = String(""),
     ):
         """Construct a ``WsConnection`` seeded with already-buffered
         post-handshake bytes.
@@ -428,10 +436,19 @@ struct WsConnection(Movable):
         any frame bytes the HTTP reactor had already read past the
         upgrade request. ``prebuf`` is consumed by the first
         ``recv``/``_recv_one`` before any socket read.
+
+        :attr:`origin` is left empty on this path -- populating it needs
+        the same decision :class:`WsServer` already made, so it is not
+        made here.
+
+        Args:
+            stream: The upgraded connection, already in blocking mode.
+            peer: Remote address, for :attr:`peer`.
+            prebuf: Bytes the reactor read past the upgrade request.
         """
         self._stream = stream^
         self._peer = peer
-        self.origin = origin^
+        self.origin = String("")
         self._prebuf = prebuf^
 
     def __deinit__(deinit self):
@@ -506,9 +523,11 @@ struct WsConnection(Movable):
     def _recv_one(mut self) raises -> WsFrame:
         """Read bytes from stream and decode one complete frame."""
         var buf = List[UInt8](capacity=4096)
-        # Drain any bytes the HTTP reactor pre-buffered past the
-        # handshake (shared-listener upgrade path) before touching the
-        # socket. Empty for the standalone WsServer path.
+        # Drain the carry-over before touching the socket: bytes the
+        # HTTP reactor pre-buffered past the handshake on the
+        # shared-listener path, and, on every later call, whatever the
+        # previous decode left behind. Empty throughout for the
+        # standalone WsServer path.
         if len(self._prebuf) > 0:
             for i in range(len(self._prebuf)):
                 buf.append(self._prebuf[i])
@@ -524,6 +543,15 @@ struct WsConnection(Movable):
                     raise WsProtocolError(
                         "client sent unmasked frame (RFC 6455 §5.1)"
                     )
+                # `buf` dies with this call, so anything past the frame
+                # has to be handed back to the connection or it is lost.
+                # Two frames in one segment used to mean the second was
+                # dropped and the next recv() blocked on a socket with
+                # nothing left to send -- a hang, with no error. Reached
+                # by a client that pipelines frames behind the
+                # handshake, and by recv()'s own PING loop.
+                for i in range(result.consumed, len(buf)):
+                    self._prebuf.append(buf[i])
                 return result^.take_frame()
             except e:
                 var msg = String(e)
@@ -824,10 +852,10 @@ def _ws_offload_entry(arg: _OpaquePtr) -> _OpaquePtr:
         ctx.handler(ctx.conn)
     except e:
         print("[ws] offloaded connection error: " + String(e))
-    return UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(0))
+    return _null_ptr()
 
 
-def spawn_ws_offload(
+def _spawn_ws_offload(
     var conn: WsConnection,
     handler: def(mut WsConnection) raises thin -> None,
 ) raises:
@@ -837,19 +865,38 @@ def spawn_ws_offload(
     ownership of it, and detaches so the OS reclaims the thread when it
     exits -- it outlives this call frame and is never joined. Returns as
     soon as the thread is spawned, which is what lets the reactor move on.
+
+    Raises:
+        Error: If ``pthread_create`` fails. The context is destroyed and
+            freed first, which closes the socket: by this point the
+            reactor has already zeroed its own copy of the fd, so this
+            function is the only owner left and dropping it on the floor
+            would leak a live socket per failed handshake. ``EAGAIN`` at
+            the process thread limit is the reachable case, and it is
+            reachable on demand while there is no cap on offloaded
+            threads.
     """
     from std.memory import alloc
 
     var ctx_ptr = alloc[_WsOffloadCtx](1)
     debug_assert[assert_mode="safe"](
         Int(ctx_ptr) != 0,
-        "spawn_ws_offload: alloc[_WsOffloadCtx] returned NULL",
+        "_spawn_ws_offload: alloc[_WsOffloadCtx] returned NULL",
     )
     ctx_ptr.init_pointee_move(_WsOffloadCtx(conn^, handler))
     var arg = UnsafePointer[UInt8, MutUntrackedOrigin](
         unsafe_from_address=Int(ctx_ptr)
     )
-    var th = ThreadHandle.spawn[_ws_offload_entry](arg)
+    var th: ThreadHandle
+    try:
+        th = ThreadHandle.spawn[_ws_offload_entry](arg)
+    except e:
+        ctx_ptr.unsafe_deinit_pointee()
+        ctx_ptr.free()
+        raise e
+    # No free on this path even if it raises: the thread is already
+    # running and owns the context, so a free here would be a double
+    # free once `_ws_offload_entry` takes the pointee.
     th.detach()
 
 

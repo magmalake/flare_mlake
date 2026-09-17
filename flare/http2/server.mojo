@@ -43,7 +43,7 @@ from .frame import (
     parse_frame,
 )
 from .hpack import HpackHeader
-from .state import Connection, Stream, StreamState
+from .state import Connection, Http2ErrorCode, Stream, StreamState
 
 
 def _lower_ascii(k: String) -> String:
@@ -52,7 +52,7 @@ def _lower_ascii(k: String) -> String:
     var out = String(capacity=k.byte_length() + 1)
     var kp = k.unsafe_ptr()
     for j in range(k.byte_length()):
-        var c = Int(kp[j])
+        var c = Int(kp[unsafe_offset=j])
         if c >= 65 and c <= 90:
             out += chr(c + 32)
         else:
@@ -477,7 +477,7 @@ struct Http2Connection(Defaultable, Movable):
             var k = req.headers._keys[j]
             var lk = String("")
             for c in range(k.byte_length()):
-                var ch = Int(k.unsafe_ptr()[c])
+                var ch = Int(k.unsafe_ptr()[unsafe_offset=c])
                 if ch >= 65 and ch <= 90:
                     lk += chr(ch + 32)
                 else:
@@ -519,7 +519,7 @@ struct Http2Connection(Defaultable, Movable):
             var preface = String(H2_PREFACE)
             var pp = preface.unsafe_ptr()
             for i in range(24):
-                if self.inbox[i] != pp[i]:
+                if self.inbox[i] != pp[unsafe_offset=i]:
                     # RFC 9113 sec 3.4: answer a bad preface with
                     # GOAWAY(PROTOCOL_ERROR) and close. Raising instead
                     # dropped the connection with no frame, leaving the
@@ -713,7 +713,7 @@ struct Http2Connection(Defaultable, Movable):
             var lk = String(capacity=k.byte_length() + 1)
             var kp = k.unsafe_ptr()
             for j in range(k.byte_length()):
-                var c = Int(kp[j])
+                var c = Int(kp[unsafe_offset=j])
                 if c >= 65 and c <= 90:
                     lk += chr(c + 32)
                 else:
@@ -738,7 +738,7 @@ struct Http2Connection(Defaultable, Movable):
             var ltk = String(capacity=tk.byte_length() + 1)
             var tkp = tk.unsafe_ptr()
             for j in range(tk.byte_length()):
-                var tc = Int(tkp[j])
+                var tc = Int(tkp[unsafe_offset=j])
                 if tc >= 65 and tc <= 90:
                     ltk += chr(tc + 32)
                 else:

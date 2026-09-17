@@ -174,7 +174,7 @@ struct ServerConfig(Copyable, Movable):
     included.
 
     ``True`` hands the (already-detached, blocking-mode) fd to a fresh
-    detached thread via :func:`flare.ws.server.spawn_ws_offload` and
+    detached thread via :func:`flare.ws.server._spawn_ws_offload` and
     returns, so the worker keeps serving other connections while the
     WebSocket runs to completion off-reactor. The connection stays on
     that one thread start to finish, so ``WsConnection``'s
@@ -183,6 +183,13 @@ struct ServerConfig(Copyable, Movable):
     The costs: one thread per concurrent WebSocket, with no built-in
     cap, and handlers that used to be serialised per worker now run
     concurrently -- any state they share is theirs to protect.
+
+    An offloaded connection leaves the reactor's live-connection table
+    as soon as the handshake completes, so
+    :attr:`ServerConfig.max_connections` does not bound it. Until a cap
+    exists, leave this off on a listener reachable by untrusted peers:
+    N concurrent handshakes means N pthreads, each with a
+    platform-default stack.
 
     A trivially-copyable ``Bool``, so it propagates through
     :meth:`ServerConfig.copy` to every per-worker clone."""

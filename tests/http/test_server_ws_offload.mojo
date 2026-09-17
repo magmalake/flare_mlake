@@ -13,6 +13,11 @@ WebSocket to finish. Offloaded, it comes back immediately.
 The thresholds are far apart on purpose (the handler sleeps 2500 ms, the
 split is at 1200 ms) so neither direction turns into a timing flake on a
 loaded machine.
+
+A third test covers the other half of what ``ws_offload`` changes: two
+offloaded handlers run at the same time. The reactor staying free says
+nothing about that, and concurrency is the part of the contract that
+changes what handler authors have to do about shared state.
 """
 
 from std.ffi import c_int, c_size_t
@@ -45,6 +50,10 @@ comptime _WS_HOLD_MS = 2500
 
 comptime _SPLIT_MS = 1200
 """Below this the HTTP GET overtook the WebSocket; above it, it waited."""
+
+comptime _OVERLAP_SPLIT_MS = 4000
+"""Two 2500 ms handlers: ~2500 ms overlapped, ~5000 ms serialised. The
+split sits between them with 1500 ms of slack either way."""
 
 
 def _http_handler(req: Request) raises -> Response:
@@ -183,7 +192,73 @@ def test_inline_websocket_blocks_http_on_one_worker() raises:
     assert_equal(ws_echo, "echo: hold")
 
 
+def test_two_offloaded_websockets_run_concurrently() raises:
+    """Two offloaded handlers overlap rather than queue behind each
+    other.
+
+    The other two tests prove the reactor worker is free, which is not
+    the same claim: a single shared handler thread would satisfy them
+    both and still serialise every WebSocket. Each handler holds for
+    2500 ms, so two of them finish in about 2500 ms concurrently and
+    about 5000 ms one after the other.
+
+    This is also the assertion behind the docstring's warning that
+    handlers which used to be serialised per worker now run at the same
+    time, and that shared state is theirs to protect.
+    """
+    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var port = UInt16(srv.local_addr().port)
+
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve_ws_upgrade(
+                _http_handler, _slow_ws_handler, ws_offload=True
+            )
+        except:
+            pass
+        exit()
+    usleep(300000)
+
+    var url = String("ws://127.0.0.1:") + String(Int(port)) + String("/ws")
+    var first = String("")
+    var second = String("")
+    var elapsed = -1
+    try:
+        var a = WsClient.connect(url)
+        var b = WsClient.connect(url)
+        # Both handlers are sitting in recv(); start their holds back to
+        # back so the two sleeps overlap if anything lets them.
+        var started = _monotonic_ms()
+        a.send_text("hold")
+        b.send_text("hold")
+        var ra = a.recv()
+        var rb = b.recv()
+        elapsed = _monotonic_ms() - started
+        if ra.opcode == WsOpcode.TEXT:
+            first = ra.text_payload()
+        if rb.opcode == WsOpcode.TEXT:
+            second = rb.text_payload()
+        a.close()
+        b.close()
+    except:
+        pass
+
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+
+    assert_equal(first, "echo: hold")
+    assert_equal(second, "echo: hold")
+    assert_true(
+        elapsed >= 0 and elapsed < _OVERLAP_SPLIT_MS,
+        String("two offloaded handlers should overlap; took ")
+        + String(elapsed)
+        + "ms",
+    )
+
+
 def main() raises:
     test_offloaded_websocket_does_not_block_http()
     test_inline_websocket_blocks_http_on_one_worker()
-    print("test_server_ws_offload: 2 passed")
+    test_two_offloaded_websockets_run_concurrently()
+    print("test_server_ws_offload: 3 passed")
