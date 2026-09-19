@@ -29,7 +29,6 @@ shoves bytes through it directly *and* in the reactor's per-fd
 callback.
 """
 
-from std.memory import unsafe_memcpy
 from std.collections import Dict, Optional
 
 from flare.http.wire import HeaderMap, Method, Request, Response
@@ -778,37 +777,13 @@ struct Http2Connection(Defaultable, Movable):
         for i in range(len(sids)):
             var sid = sids[i]
             var pos = self.pending_pos[sid]
-            var total = len(self.pending_body[sid])
-
-            # Only what the window will actually take. This used to copy the
-            # whole parked body and then the whole remainder of it, on every
-            # inbound frame -- and a WINDOW_UPDATE is an inbound frame, so a
-            # body large enough to park was copied twice per window's worth
-            # of progress. That is quadratic in the body: a 28 MiB gRPC
-            # message advancing 64 KiB at a time copied gigabytes to send
-            # megabytes, and it was the whole cost of a large response once
-            # the framing itself stopped going a byte at a time.
-            var budget = self._send_budget(sid)
-            if budget <= 0:
-                continue
-            var take = total - pos
-            if take > budget:
-                take = budget
-            var rest = List[UInt8]()
-            if take > 0:
-                # A copy rather than a span of the parked body, because the
-                # body lives in `self` and `queue_stream_data` takes `self`
-                # mutably. It is bounded by the window now, which is what
-                # makes it cheap.
-                rest.resize(unsafe_uninit_length=take)
-                unsafe_memcpy(
-                    dest=rest.unsafe_ptr(),
-                    src=self.pending_body[sid].unsafe_ptr().unsafe_offset(pos),
-                    count=take,
-                )
-            var n = self.queue_stream_data(sid, Span[UInt8, _](rest))
+            # Moved out and back rather than borrowed: the body lives in
+            # `self` and the call below takes `self` mutably. A `List` move is
+            # a pointer transfer, so this costs nothing per pump.
+            var body = self.pending_body.pop(sid)
+            var total = len(body)
+            var n = self.queue_parked_body(sid, Span(body), pos)
             if pos + n >= total:
-                _ = self.pending_body.pop(sid)
                 _ = self.pending_pos.pop(sid)
                 # Whatever trailers the response owed, emitted now that its
                 # last body byte is out. An empty list here would close a
@@ -821,6 +796,7 @@ struct Http2Connection(Defaultable, Movable):
                     tv = self.pending_tv.pop(sid)
                 self.end_stream_response(sid, tk, tv)
             else:
+                self.pending_body[sid] = body^
                 self.pending_pos[sid] = pos + n
 
     # ── WebSocket-over-HTTP/2 bridge (RFC 8441) ────────────────────────────
@@ -922,6 +898,37 @@ struct Http2Connection(Defaultable, Movable):
             < s.send_window else s.send_window
         )
 
+    def queue_parked_body(
+        mut self, sid: Int, body: Span[UInt8, _], pos: Int
+    ) raises -> Int:
+        """Frame as much of `body[pos:]` as the send windows will take.
+
+        The point of it is what it does *not* copy. A body too large for the
+        window is parked and re-pumped on every WINDOW_UPDATE, so handing the
+        whole remainder over each time and letting `queue_stream_data` use a
+        window's worth of it is quadratic in the body: at a 64 KiB window a
+        28 MiB response copies about 6 GB to send 28 MB. Asking the window
+        first makes each pump cost a window, not a body.
+
+        Returns the bytes consumed. Both pump paths -- a buffered response
+        here and a streaming one in `Http2ConnHandle` -- go through this
+        rather than repeating it.
+        """
+        var budget = self._send_budget(sid)
+        if budget <= 0:
+            return 0
+        var take = len(body) - pos
+        if take > budget:
+            take = budget
+        if take <= 0:
+            return 0
+        # A copy rather than a span of the caller's buffer, because
+        # `queue_stream_data` takes `self` mutably and the parked body may
+        # live in it. Bounded by the window, which is what makes it cheap.
+        var chunk = List[UInt8]()
+        chunk.extend(body[pos : pos + take])
+        return self.queue_stream_data(sid, Span(chunk))
+
     def queue_stream_data(
         mut self, sid: Int, data: Span[UInt8, _]
     ) raises -> Int:
@@ -960,21 +967,10 @@ struct Http2Connection(Defaultable, Movable):
             # they were the whole cost of a large response — every byte of a
             # 28 MiB gRPC message appended twice, individually.
             var pl = List[UInt8]()
-            pl.resize(unsafe_uninit_length=take)
-            unsafe_memcpy(
-                dest=pl.unsafe_ptr(),
-                src=data.unsafe_ptr().unsafe_offset(sent),
-                count=take,
-            )
+            pl.extend(data[sent : sent + take])
             df.payload = pl^
             var bytes = encode_frame(df)
-            var base = len(self.outbox)
-            self.outbox.resize(unsafe_uninit_length=base + len(bytes))
-            unsafe_memcpy(
-                dest=self.outbox.unsafe_ptr().unsafe_offset(base),
-                src=bytes.unsafe_ptr(),
-                count=len(bytes),
-            )
+            self.outbox.extend(Span(bytes))
             sent += take
             budget -= take
         self.conn.send_window -= sent
