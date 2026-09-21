@@ -99,6 +99,10 @@ requirements:
     # solve to an OpenSSL the library has never been built against.
     - openssl >=3.6.1,<4
     - ca-certificates
+    # Headers and libz for the zlib wrapper built above. Upstream declares
+    # this for the same reason; taking its build step without its host
+    # dependency is what broke the linux-64 package job.
+    - zlib >=1.3.1,<2
   run:
     # Upstream's pin, unwidened. This used to be widened to admit Mojo 1.0.0
     # because magmalake still built on it; the whole stack is on 1.1.0 now and
