@@ -43,7 +43,7 @@ context:
   # Renaming only the package keeps every import unchanged, so switching to an
   # official flare package later is a one-line dependency change.
   name: flare_mlake
-  version: "0.10.1"
+  version: "0.10.2"
 
 package:
   name: ${{ name }}
