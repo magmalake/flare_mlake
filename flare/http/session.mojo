@@ -7,7 +7,7 @@ familiar to anyone who has read RFC 7515. The MAC is computed
 over the *base64url-encoded payload* (not the raw bytes) so the
 verifier can split on ``.`` without first decoding.
 
-``Session[T]`` wraps an arbitrary ``Copyable & Movable`` payload
+``Session[T]`` wraps an arbitrary ``Copyable`` payload
 and (de)serialises it through a user-supplied ``SessionCodec[T]``.
 ``SessionStore`` is the abstraction over storage; flare ships:
 
@@ -75,7 +75,7 @@ def new_session_id(n_bytes: Int = 32) raises -> String:
         raw = f.read_bytes(n_bytes)
     if len(raw) < n_bytes:
         raise Error("new_session_id: short read from /dev/urandom")
-    var hex = String(capacity=n_bytes * 2 + 1)
+    var hex = String(capacity_bytes=n_bytes * 2 + 1)
     comptime digits = "0123456789abcdef"
     for i in range(n_bytes):
         var b = Int(raw[i])
@@ -186,7 +186,7 @@ def signed_cookie_decode_keys(
 # ── SessionCodec: payload <-> bytes ───────────────────────────────────────
 
 
-trait SessionCodec(Copyable, Defaultable, Deinitable, Movable):
+trait SessionCodec(Copyable, Defaultable, Deinitable):
     """Encode / decode a typed payload to/from raw bytes.
 
     Implementations live alongside the user's payload type; the
@@ -205,7 +205,7 @@ trait SessionCodec(Copyable, Defaultable, Deinitable, Movable):
 
 
 @fieldwise_init
-struct StringSessionCodec(Copyable, Defaultable, Movable, SessionCodec):
+struct StringSessionCodec(Copyable, Defaultable, SessionCodec):
     """The default codec: payload is just a UTF-8 string.
 
     Pair with ``flare.json``-encoded text payloads (or any other
@@ -226,7 +226,7 @@ struct StringSessionCodec(Copyable, Defaultable, Movable, SessionCodec):
     def decode(data: List[UInt8]) raises -> String:
         if len(data) == 0:
             return ""
-        var out = String(capacity=len(data) + 1)
+        var out = String(capacity_bytes=len(data) + 1)
         for b in data:
             out += chr(Int(b))
         return out^
@@ -235,7 +235,7 @@ struct StringSessionCodec(Copyable, Defaultable, Movable, SessionCodec):
 # ── Session[T] + SessionStore ─────────────────────────────────────────────
 
 
-trait SessionStore(Copyable, Movable):
+trait SessionStore(Copyable):
     """The read surface every cookie-backed session store shares.
 
     Lets handler code stay generic over the storage strategy
@@ -254,7 +254,7 @@ trait SessionStore(Copyable, Movable):
         ...
 
 
-struct Session(Copyable, Defaultable, Movable):
+struct Session(Copyable, Defaultable):
     """A typed session payload, carried in either a signed cookie
     or an in-memory store.
 
@@ -292,7 +292,7 @@ struct Session(Copyable, Defaultable, Movable):
 # ── CookieSessionStore: encode payload directly into a signed cookie ──────
 
 
-struct CookieSessionStore(Copyable, Defaultable, Movable, SessionStore):
+struct CookieSessionStore(Copyable, Defaultable, SessionStore):
     """Stateless store: the entire session is encoded into the
     signed cookie. Suitable for small payloads (< 4 KiB).
 
@@ -348,7 +348,7 @@ struct CookieSessionStore(Copyable, Defaultable, Movable, SessionStore):
             keys.append(k.copy())
         try:
             var payload = signed_cookie_decode_keys(cookie_value, keys)
-            var out = String(capacity=len(payload) + 1)
+            var out = String(capacity_bytes=len(payload) + 1)
             for b in payload:
                 out += chr(Int(b))
             return Session(out^)
@@ -365,7 +365,7 @@ struct CookieSessionStore(Copyable, Defaultable, Movable, SessionStore):
 # ── InMemorySessionStore: signed cookie carries an opaque id ──────────────
 
 
-struct InMemorySessionStore(Copyable, Defaultable, Movable, SessionStore):
+struct InMemorySessionStore(Copyable, Defaultable, SessionStore):
     """Server-side session table keyed by signed session id.
 
     Concurrency note: the implementation is single-worker; for
@@ -438,7 +438,7 @@ struct InMemorySessionStore(Copyable, Defaultable, Movable, SessionStore):
             keys.append(k.copy())
         try:
             var payload = signed_cookie_decode_keys(cookie_value, keys)
-            var id_str = String(capacity=len(payload) + 1)
+            var id_str = String(capacity_bytes=len(payload) + 1)
             for b in payload:
                 id_str += chr(Int(b))
             for i in range(len(self._ids)):
@@ -455,7 +455,7 @@ struct InMemorySessionStore(Copyable, Defaultable, Movable, SessionStore):
 # ── SessionBackend: pluggable server-side storage with TTL ────────────────
 
 
-trait SessionBackend(Copyable, Deinitable, Movable):
+trait SessionBackend(Copyable, Deinitable):
     """Storage abstraction behind :class:`BackedSessionStore`.
 
     A backend maps an opaque session id to its value with a TTL. The
@@ -485,7 +485,7 @@ trait SessionBackend(Copyable, Deinitable, Movable):
         ...
 
 
-struct MemorySessionBackend(Copyable, Defaultable, Movable, SessionBackend):
+struct MemorySessionBackend(Copyable, Defaultable, SessionBackend):
     """Reference in-process :trait:`SessionBackend` with TTL expiry.
 
     ponytail: linear-scan parallel lists (id / value / expiry). Fine for
@@ -555,7 +555,7 @@ struct MemorySessionBackend(Copyable, Defaultable, Movable, SessionBackend):
 # ── BackedSessionStore: signed-id cookie + pluggable backend + TTL ────────
 
 
-struct BackedSessionStore[B: SessionBackend](Copyable, Movable):
+struct BackedSessionStore[B: SessionBackend](Copyable):
     """Server-side session store over a pluggable :trait:`SessionBackend`.
 
     The cookie carries only a CSPRNG session id (signed, so a client
@@ -595,7 +595,7 @@ struct BackedSessionStore[B: SessionBackend](Copyable, Movable):
             return Optional[String]()
         try:
             var payload = signed_cookie_decode(cv, self._key)
-            var id = String(capacity=len(payload) + 1)
+            var id = String(capacity_bytes=len(payload) + 1)
             for b in payload:
                 id += chr(Int(b))
             return Optional[String](id^)

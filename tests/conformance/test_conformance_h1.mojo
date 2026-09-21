@@ -1,6 +1,6 @@
-"""Conformance runner for ``conformance/h1/`` fixtures.
+"""Conformance runner for ``tests/conformance/h1/`` fixtures.
 
-Loads every ``*.json`` fixture under ``conformance/h1/``, decodes the
+Loads every ``*.json`` fixture under ``tests/conformance/h1/``, decodes the
 hex bytes, and invokes :func:`flare.http.server._parse_http_request_bytes`
 with the fixture's leniency overlay applied. Fixtures declare an
 expected outcome (``accept`` / ``reject``) plus, on accept, the
@@ -42,7 +42,7 @@ def _decode_hex(s: String) raises -> List[UInt8]:
     var n = s.byte_length()
     var i = 0
     while i < n:
-        var c = p[i]
+        var c = p[unsafe_offset=i]
         if (
             c == UInt8(ord(" "))
             or c == UInt8(ord("\t"))
@@ -53,7 +53,7 @@ def _decode_hex(s: String) raises -> List[UInt8]:
             continue
         if i + 1 >= n:
             raise Error("conformance: dangling hex digit")
-        var c2 = p[i + 1]
+        var c2 = p[unsafe_offset=i + 1]
         var hi = _digit(c)
         var lo = _digit(c2)
         out.append(UInt8((hi << 4) | lo))
@@ -186,9 +186,9 @@ def _validate_fixture(j: Value) raises:
 
 
 def _conformance_dir() -> Path:
-    """The repo-rooted ``conformance/h1/`` path. Tests run from the
+    """The repo-rooted ``tests/conformance/h1/`` path. Tests run from the
     repo root via ``mojo -I .``."""
-    return Path("conformance") / "h1"
+    return Path("tests") / "conformance" / "h1"
 
 
 def test_directory_exists() raises:

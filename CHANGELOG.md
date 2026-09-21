@@ -8,6 +8,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-09-21
+
+Tracks upstream **flare main** at `c3dc933`, 72 commits past `1e92aa3`,
+including upstream's own move to Mojo 1.1.0 (`f6b5b16`).
+
+### Changed
+- **Mojo 1.1.0.** `mojo >=1.1.0,<2.0.0` in both `pixi.toml` and the recipe.
+  The widened `>=1.0.0,<1.2.0` pin this distribution carried is gone: it
+  existed so magmalake repos could build flare from one source tree on both
+  1.0.0 and the nightlies, and the whole org is on 1.1.0 now. Upstream's
+  `Atomic[T]` spelling requires it in any case.
+- `json_mlake >=0.4.0,<0.5` and `threads-mojo >=0.6.0,<0.7`, both the Mojo
+  1.1.0 releases of those tins.
+- Takes upstream's build of `libflare_zlib.so` in the recipe. Its absence was
+  not a build error, only a runtime one at the first compressed response, so
+  this distribution had been shipping without it.
+
+### Removed — deltas upstream has absorbed
+- **The `nanosleep` fix.** `flare/runtime/_libc_time.mojo` calling
+  `std.time.sleep` instead of declaring its own `nanosleep` extern is
+  upstream's own code now, so this is no longer a delta to hand-merge.
+- **The build-backend pin.** This fork tracked `0.4.*` to escape upstream's
+  unsolvable `==0.3.13`; upstream now takes `>=0.3.13`, which is the better
+  fix — a backend declares the `pixi-build-api-version` it speaks, so the
+  range lets the solver match backend to client.
+- The pre-review copies of the gRPC-compression and HTTP/2 bulk-copy work
+  (this fork's #3 and #4) are superseded by upstream's reviewed #29 and #30.
+
+### Kept — deltas that still stand
+- `flare/runtime/_thread.mojo` as an adapter over threads.mojo. Upstream
+  still binds `pthread_*` itself, and exactly one library may bind a given
+  libc symbol or Mojo refuses to lower.
+- The macOS shared-listener default in `flare/runtime/scheduler.mojo`: BSD's
+  `SO_REUSEPORT` does not load-balance, so per-worker listeners are a
+  pessimisation there.
+- `json_mlake` / `mozz_mlake` instead of upstream's `json` / `mozz`, so a
+  consumer resolves one org's packages. (The old reason — their unsolvable
+  backend pins — is fixed upstream; org consistency is what remains.)
+- mojodoc dropped, the packaging and attribution files, and a CI that builds
+  the package and consumes it rather than running upstream's test matrix.
+
 ## [0.10.1] - 2026-09-16
 
 Tracks upstream **flare main** at `1e92aa3`, which is past the `v0.10.0` tag

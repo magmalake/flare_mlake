@@ -14,9 +14,10 @@ from std.os import getenv
 from std.collections import Optional
 
 from ..proto.h1_leniency import H1LeniencyConfig
+from ..proto.h2_config import Http2Config
 
 # WebSocket upgrade seam. ``WsConnection`` is named here so
-# :attr:`ServerConfig.ws_handler` can carry the per-connection callback.
+# :attr:`WsUpgrade.handler` can carry the per-connection callback.
 # No import cycle: ``flare.ws.server`` reaches into ``flare.http`` only
 # for ``flare.http.response`` (a leaf) -- never for the server or this
 # package.
@@ -28,7 +29,44 @@ comptime WsHandlerFn = def(mut WsConnection) raises thin -> None
 ``WsServer`` plugs into ``HttpServer.serve_ws_upgrade`` unchanged."""
 
 
-struct ServerConfig(Copyable, Movable):
+@fieldwise_init
+struct WsUpgrade(Copyable, Defaultable):
+    """Opt-in WebSocket upgrade handling on the same port as HTTP.
+
+    Set ``handler`` and any request arriving with a valid RFC 6455
+    upgrade is routed to it, while everything else goes to the ordinary
+    ``Handler``. ``offload`` moves each upgraded socket onto its own
+    detached thread, which suits long-lived connections that would
+    otherwise hold a reactor slot for their whole lifetime.
+
+    Grouped into one struct in v0.11: these were two loose fields on
+    ``ServerConfig``, which made it easy to set the handler and forget
+    the offload flag existed.
+    """
+
+    var handler: Optional[WsHandlerFn]
+    """The upgrade handler, or ``None`` to serve HTTP only."""
+
+    var offload: Bool
+    """Run each upgraded socket on its own detached thread."""
+
+    def __init__(out self):
+        """No WebSocket handling."""
+        self.handler = None
+        self.offload = False
+
+    def __init__(out self, handler: WsHandlerFn, offload: Bool = False):
+        """Handle WebSocket upgrades with ``handler``.
+
+        Args:
+            handler: Called once per upgraded connection.
+            offload: Give each socket its own detached thread.
+        """
+        self.handler = Optional[WsHandlerFn](handler)
+        self.offload = offload
+
+
+struct ServerConfig(Copyable):
     """Configuration for the HTTP server.
 
     Fields:
@@ -139,60 +177,18 @@ struct ServerConfig(Copyable, Movable):
     file-descriptor-exhaustion / connection-flood DoS surface on the
     plain Handler path, mirroring what the streaming path already
     does with its own 503 + Retry-After shed."""
-    var ws_handler: Optional[WsHandlerFn]
-    """Opt-in HTTP/1.1 ``Upgrade: websocket`` handler (RFC 6455).
+    var ws: WsUpgrade
+    """WebSocket-on-the-same-port configuration. Default: HTTP only.
 
-    ``None`` (the default) means the server has no WebSocket endpoint
-    and every request takes the unary
-    ``Handler.serve(req) -> Response`` path exactly as before. When set
-    -- via :meth:`flare.http.HttpServer.serve_ws_upgrade` or by
-    assigning the field -- the HTTP/1.1 per-connection state machine
-    (:class:`flare.http._reactor.ConnHandle`) recognises a qualifying
-    upgrade on the SAME listener, answers ``101 Switching Protocols``,
-    wraps the socket in a :class:`flare.ws.WsConnection` and calls this
-    handler. Non-upgrade requests are untouched.
+    Replaces the loose ``ws_handler`` / ``ws_offload`` fields in v0.11.
+    ``HttpServer.serve_ws_upgrade`` sets this for you."""
 
-    Distinct from the WS-over-h2 sidecar passed to
-    ``HttpServer.serve(handler, ws_handler)``: that one tunnels
-    ``:protocol: websocket`` CONNECT streams inside an h2 connection
-    (RFC 8441); this one is the plain HTTP/1.1 handshake.
+    var h2: Http2Config
+    """HTTP/2 SETTINGS and per-stream limits, applied when a connection
+    negotiates h2 by ALPN or upgrades via h2c.
 
-    The callback is a trivially-copyable ``def`` function pointer, so
-    it rides through :meth:`ServerConfig.copy` into each per-worker
-    config clone at no cost -- the same property the standalone
-    ``WsServer`` multi-worker path relies on."""
-    var ws_offload: Bool
-    """Run each upgraded WebSocket on its own detached thread instead of
-    inline on the reactor worker.
-
-    ``False`` (the default) keeps the historical behaviour: the reactor
-    calls ``ws_handler(conn)`` synchronously and that worker is parked
-    for the connection's whole lifetime -- the model
-    :class:`flare.ws.WsServer` uses. That is fine for short handlers,
-    but one long-lived connection head-of-line-blocks every OTHER
-    connection pinned to that worker, ordinary keep-alive HTTP requests
-    included.
-
-    ``True`` hands the (already-detached, blocking-mode) fd to a fresh
-    detached thread via :func:`flare.ws.server._spawn_ws_offload` and
-    returns, so the worker keeps serving other connections while the
-    WebSocket runs to completion off-reactor. The connection stays on
-    that one thread start to finish, so ``WsConnection``'s
-    non-thread-safe writes are never touched concurrently.
-
-    The costs: one thread per concurrent WebSocket, with no built-in
-    cap, and handlers that used to be serialised per worker now run
-    concurrently -- any state they share is theirs to protect.
-
-    An offloaded connection leaves the reactor's live-connection table
-    as soon as the handshake completes, so
-    :attr:`ServerConfig.max_connections` does not bound it. Until a cap
-    exists, leave this off on a listener reachable by untrusted peers:
-    N concurrent handshakes means N pthreads, each with a
-    platform-default stack.
-
-    A trivially-copyable ``Bool``, so it propagates through
-    :meth:`ServerConfig.copy` to every per-worker clone."""
+    Replaces the ``h2_config`` argument that every ``bind*`` used to
+    take separately in v0.11."""
 
     def __init__(
         out self,
@@ -213,8 +209,8 @@ struct ServerConfig(Copyable, Movable):
         use_bufring: Bool = False,
         var h1_leniency: H1LeniencyConfig = H1LeniencyConfig(),
         max_connections: Int = 0,
-        ws_handler: Optional[WsHandlerFn] = None,
-        ws_offload: Bool = False,
+        var ws: WsUpgrade = WsUpgrade(),
+        var h2: Http2Config = Http2Config(),
     ):
         self.read_buffer_size = read_buffer_size
         self.max_header_size = max_header_size
@@ -235,8 +231,89 @@ struct ServerConfig(Copyable, Movable):
         self.use_bufring = use_bufring
         self.h1_leniency = h1_leniency^
         self.max_connections = max_connections
-        self.ws_handler = ws_handler
-        self.ws_offload = ws_offload
+        self.ws = ws^
+        self.h2 = h2^
+
+    @staticmethod
+    def check[cfg: ServerConfig]() -> None:
+        """Validate a comptime ``ServerConfig`` at compile time.
+
+        Every invariant is a ``comptime assert``, so a configuration
+        that violates one fails the build with the message below rather
+        than misbehaving at run time. The deadline ordering is the one
+        worth stating out loud: when ``request_timeout_ms`` is enabled it
+        must bound both ``handler_timeout_ms`` and
+        ``read_body_timeout_ms``, or the handler could keep working past
+        the request deadline -- the bug these checks exist to prevent.
+
+        Added in v0.11. These lived inside ``HttpServer.serve_comptime``,
+        which meant the only way to get them was to also accept that
+        method's single-worker, single-listener, no-TLS reactor. They are
+        reusable now.
+
+        Parameters:
+            cfg: The configuration to validate.
+
+        Example:
+            ```mojo
+            comptime CFG = ServerConfig(max_body_size=1 << 20)
+            ServerConfig.check[CFG]()
+            ```
+        """
+        comptime assert (
+            cfg.read_buffer_size > 0
+        ), "ServerConfig.read_buffer_size must be > 0"
+        comptime assert (
+            cfg.max_header_size > 0
+        ), "ServerConfig.max_header_size must be > 0"
+        comptime assert (
+            cfg.max_uri_length > 0
+        ), "ServerConfig.max_uri_length must be > 0"
+        comptime assert (
+            cfg.max_body_size >= cfg.max_header_size
+        ), "ServerConfig.max_body_size must be >= ServerConfig.max_header_size"
+        comptime assert (
+            cfg.max_keepalive_requests >= 1
+        ), "ServerConfig.max_keepalive_requests must be >= 1"
+        comptime assert (
+            cfg.idle_timeout_ms >= 0
+        ), "ServerConfig.idle_timeout_ms must be >= 0"
+        comptime assert (
+            cfg.write_timeout_ms >= 0
+        ), "ServerConfig.write_timeout_ms must be >= 0"
+        comptime assert (
+            cfg.read_body_timeout_ms >= 0
+        ), "ServerConfig.read_body_timeout_ms must be >= 0 (0 disables)"
+        comptime assert (
+            cfg.handler_timeout_ms >= 0
+        ), "ServerConfig.handler_timeout_ms must be >= 0 (0 disables)"
+        comptime assert (
+            cfg.request_timeout_ms >= 0
+        ), "ServerConfig.request_timeout_ms must be >= 0 (0 disables)"
+        # When request_timeout_ms is non-zero (enabled), it must
+        # bound the per-handler and per-body deadlines so the
+        # outer-most reactor deadline is the last to fire. A
+        # request_timeout_ms shorter than handler_timeout_ms would
+        # let the handler keep working past the request deadline,
+        # which is the bug we're trying to prevent.
+        comptime assert (
+            cfg.request_timeout_ms == 0
+            or cfg.handler_timeout_ms == 0
+            or cfg.request_timeout_ms >= cfg.handler_timeout_ms
+        ), (
+            "ServerConfig.request_timeout_ms must be >="
+            " ServerConfig.handler_timeout_ms (or one must be 0 to"
+            " disable)"
+        )
+        comptime assert (
+            cfg.request_timeout_ms == 0
+            or cfg.read_body_timeout_ms == 0
+            or cfg.request_timeout_ms >= cfg.read_body_timeout_ms
+        ), (
+            "ServerConfig.request_timeout_ms must be >="
+            " ServerConfig.read_body_timeout_ms (or one must be 0 to"
+            " disable)"
+        )
 
 
 def _resolve_bufring_handler_env() -> Bool:

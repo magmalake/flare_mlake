@@ -38,7 +38,8 @@ chain stays monomorphised -- no virtual dispatch.
 """
 
 from std.atomic import Atomic, Ordering
-from std.memory import UnsafePointer, alloc
+from std.memory import Pointer
+from std.memory.alloc import unsafe_alloc
 from std.time import perf_counter_ns
 from std.random import random_ui64
 
@@ -57,28 +58,28 @@ def _alloc_cell(n: Int) -> Int:
     double-free across worker copies. One small cell per middleware
     instance (created once at setup) is a negligible, bounded leak.
     """
-    var p = alloc[Int](n)
+    var p = unsafe_alloc[Int](n)
     for i in range(n):
-        (p + i).unsafe_write(0)
+        (p.unsafe_offset(i)).unsafe_write(0)
     return Int(p)
 
 
 @always_inline
 def _cell_get(addr: Int, i: Int) -> Int64:
-    var p = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
-    var slot = (p + i).unsafe_bitcast[Scalar[DType.int64]]()
-    return Atomic[DType.int64].load[ordering=Ordering.ACQUIRE](slot)
+    var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+    var slot = (p.unsafe_offset(i)).unsafe_bitcast[Scalar[DType.int64]]()
+    return Atomic[Int64].load[ordering=Ordering.ACQUIRE](slot)
 
 
 @always_inline
 def _cell_set(addr: Int, i: Int, v: Int64):
-    var p = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
-    var slot = (p + i).unsafe_bitcast[Scalar[DType.int64]]()
-    Atomic[DType.int64].store[ordering=Ordering.RELEASE](slot, v)
+    var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+    var slot = (p.unsafe_offset(i)).unsafe_bitcast[Scalar[DType.int64]]()
+    Atomic[Int64].store[ordering=Ordering.RELEASE](slot, v)
 
 
 @fieldwise_init
-struct RetryPolicy(Copyable, Defaultable, Movable):
+struct RetryPolicy(Copyable, Defaultable):
     """Tunable retry policy.
 
     - ``max_attempts``: total number of inner-handler invocations
@@ -179,9 +180,7 @@ def _backoff_sleep_ms(policy: RetryPolicy, attempt: Int) -> Int:
     return Int(random_ui64(0, UInt64(capped)))
 
 
-struct Retry[Inner: Handler & Copyable & Defaultable](
-    Copyable, Defaultable, Handler, Movable
-):
+struct Retry[Inner: Handler & Copyable](Copyable, Handler):
     """Retry the inner handler on transient failure.
 
     A response with status >= 500 triggers a retry; a raised
@@ -203,10 +202,6 @@ struct Retry[Inner: Handler & Copyable & Defaultable](
 
     var inner: Self.Inner
     var policy: RetryPolicy
-
-    def __init__(out self):
-        self.inner = Self.Inner()
-        self.policy = RetryPolicy()
 
     def __init__(
         out self, var inner: Self.Inner, var policy: RetryPolicy = RetryPolicy()
@@ -255,9 +250,7 @@ struct Retry[Inner: Handler & Copyable & Defaultable](
         return self.inner.serve(req).lower()
 
 
-struct PostHocDeadline[Inner: Handler & Copyable & Defaultable](
-    Copyable, Defaultable, Handler, Movable
-):
+struct PostHocDeadline[Inner: Handler & Copyable](Copyable, Handler):
     """Post-hoc wall-clock deadline check.
 
     The middleware records the entry timestamp, runs the inner
@@ -287,10 +280,6 @@ struct PostHocDeadline[Inner: Handler & Copyable & Defaultable](
     var inner: Self.Inner
     var budget_ms: Int
 
-    def __init__(out self):
-        self.inner = Self.Inner()
-        self.budget_ms = 30_000
-
     def __init__(out self, var inner: Self.Inner, budget_ms: Int = 30_000):
         self.inner = inner^
         self.budget_ms = budget_ms
@@ -313,9 +302,7 @@ struct PostHocDeadline[Inner: Handler & Copyable & Defaultable](
         return resp^
 
 
-struct RateLimit[Inner: Handler & Copyable & Defaultable](
-    Copyable, Defaultable, Handler, Movable
-):
+struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
     """Token-bucket rate limiter.
 
     Admits up to ``rate_per_sec`` requests per second with a bucket
@@ -334,12 +321,6 @@ struct RateLimit[Inner: Handler & Copyable & Defaultable](
     var burst: Int
     var _cell: Int
     """Leaked 2-slot cell: [0] = milli-tokens, [1] = last-refill ns."""
-
-    def __init__(out self):
-        self.inner = Self.Inner()
-        self.rate_per_sec = 0
-        self.burst = 0
-        self._cell = _alloc_cell(2)
 
     def __init__(
         out self, var inner: Self.Inner, rate_per_sec: Int, burst: Int = 0
@@ -383,9 +364,7 @@ comptime _CB_OPEN: Int64 = 1
 comptime _CB_HALF_OPEN: Int64 = 2
 
 
-struct CircuitBreaker[Inner: Handler & Copyable & Defaultable](
-    Copyable, Defaultable, Handler, Movable
-):
+struct CircuitBreaker[Inner: Handler & Copyable](Copyable, Handler):
     """Trip open after consecutive failures, fast-fail during cooldown.
 
     Counts consecutive failures (a raised exception or a ``>= 500``
@@ -405,12 +384,6 @@ struct CircuitBreaker[Inner: Handler & Copyable & Defaultable](
     var _cell: Int
     """Leaked 3-slot cell: [0] = state, [1] = consecutive fails,
     [2] = opened-at ns."""
-
-    def __init__(out self):
-        self.inner = Self.Inner()
-        self.failure_threshold = 0
-        self.cooldown_ms = 0
-        self._cell = _alloc_cell(3)
 
     def __init__(
         out self,

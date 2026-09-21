@@ -78,12 +78,12 @@ def _json_escape(s: String) -> String:
     var n = s.byte_length()
     if n == 0:
         return String("")
-    var out = String(capacity=n + 8)
+    var out = String(capacity_bytes=n + 8)
     var p = s.unsafe_ptr()
     var hex_chars = String("0123456789abcdef")
     var hp = hex_chars.unsafe_ptr()
     for i in range(n):
-        var b = Int(p[i])
+        var b = Int(p[unsafe_offset=i])
         if b == ord('"'):
             out += '\\"'
         elif b == ord("\\"):
@@ -100,8 +100,8 @@ def _json_escape(s: String) -> String:
             out += "\\r"
         elif b < 0x20:
             out += "\\u00"
-            out += chr(Int(hp[(b >> 4) & 0xF]))
-            out += chr(Int(hp[b & 0xF]))
+            out += chr(Int(hp[unsafe_offset=(b >> 4) & 0xF]))
+            out += chr(Int(hp[unsafe_offset=b & 0xF]))
         else:
             out += chr(b)
     return out^
@@ -126,7 +126,7 @@ def _format_iso8601_utc(unix_ns: Int) -> String:
     var unix_secs = Int(unix_ms_total // 1000)
     var ct = unix_seconds_to_civil(unix_secs)
 
-    var out = String(capacity=24)
+    var out = String(capacity_bytes=24)
     out += _pad(ct.year, 4)
     out += "-"
     out += _pad(ct.month, 2)
@@ -149,7 +149,7 @@ def _pad(n: Int, width: Int) -> String:
     var s = String(n)
     if s.byte_length() >= width:
         return s
-    var out = String(capacity=width + 1)
+    var out = String(capacity_bytes=width + 1)
     for _ in range(width - s.byte_length()):
         out += "0"
     out += s
@@ -159,9 +159,7 @@ def _pad(n: Int, width: Int) -> String:
 # ── StructuredLogger ────────────────────────────────────────────────────────
 
 
-struct StructuredLogger[Inner: Handler & Copyable & Defaultable](
-    Copyable, Defaultable, Handler, Movable
-):
+struct StructuredLogger[Inner: Handler & Copyable](Copyable, Handler):
     """JSON-per-line request logger around the inner handler.
 
     Emits one line of JSON per request to stdout:
@@ -196,18 +194,6 @@ struct StructuredLogger[Inner: Handler & Copyable & Defaultable](
     pthread — and a 1-second drift on a 24-hour soak is OK for
     log-line resolution."""
 
-    def __init__(out self):
-        self.inner = Self.Inner()
-        # perf_counter_ns is monotonic; we'd ideally subtract it
-        # from a wall-clock read here. The stdlib doesn't expose
-        # gettimeofday or clock_gettime(REALTIME), so the offset
-        # stays 0 and the ``ts`` field is "ns since
-        # the worker started" presented as ISO-8601. The line
-        # shape is forward-compatible -- when wall-clock support
-        # lands the offset can be back-filled without consumers
-        # noticing.
-        self._epoch_offset_ns = 0
-
     def __init__(out self, var inner: Self.Inner):
         self.inner = inner^
         self._epoch_offset_ns = 0
@@ -236,7 +222,7 @@ struct StructuredLogger[Inner: Handler & Copyable & Defaultable](
         latency_ms: Int,
         start_ns: Int,
     ) -> String:
-        var line = String(capacity=192)
+        var line = String(capacity_bytes=192)
         line += '{"ts":"'
         line += _format_iso8601_utc(start_ns + self._epoch_offset_ns)
         line += '","method":"'
@@ -267,7 +253,7 @@ struct StructuredLogger[Inner: Handler & Copyable & Defaultable](
         latency_ms: Int,
         start_ns: Int,
     ) -> String:
-        var line = String(capacity=192)
+        var line = String(capacity_bytes=192)
         line += '{"ts":"'
         line += _format_iso8601_utc(start_ns + self._epoch_offset_ns)
         line += '","method":"'

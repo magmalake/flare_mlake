@@ -59,22 +59,22 @@ def _f64_from_bits(bits: UInt64) -> Float64:
     round-trip through a 1-cell stack slot and a pointer bitcast.
     """
     var p = stack_allocation[1, UInt64]()
-    p[0] = bits
-    return p.unsafe_bitcast[Float64]()[0]
+    p[unsafe_offset=0] = bits
+    return p.unsafe_bitcast[Float64]()[unsafe_offset=0]
 
 
 @always_inline
 def _f32_from_bits(bits: UInt32) -> Float32:
     """Reinterpret a 32-bit pattern as a ``Float32`` (IEEE-754)."""
     var p = stack_allocation[1, UInt32]()
-    p[0] = bits
-    return p.unsafe_bitcast[Float32]()[0]
+    p[unsafe_offset=0] = bits
+    return p.unsafe_bitcast[Float32]()[unsafe_offset=0]
 
 
 # ── Writer ─────────────────────────────────────────────────────────────────────
 
 
-struct ProtoWriter(Copyable, Movable):
+struct ProtoWriter(Copyable):
     """Accumulates proto3-encoded fields into an owned byte buffer.
 
     Example:
@@ -180,7 +180,7 @@ struct ProtoWriter(Copyable, Movable):
 # ── Reader ─────────────────────────────────────────────────────────────────────
 
 
-struct ProtoReader(Copyable, Movable):
+struct ProtoReader(Copyable):
     """Walks a proto3-encoded buffer field by field.
 
     Typical loop::

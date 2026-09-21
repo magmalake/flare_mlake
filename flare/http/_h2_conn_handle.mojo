@@ -37,7 +37,8 @@ SETTINGS-ACK in one syscall.
 from std.builtin.debug_assert import debug_assert
 from std.collections import Dict, Optional
 from std.ffi import c_int, c_size_t, ErrNo, get_errno
-from std.memory import UnsafePointer, alloc, stack_allocation
+from std.memory import Pointer, stack_allocation
+from std.memory.alloc import unsafe_alloc
 
 from flare.errors import map_handler_error
 from flare.http.cancel import Cancel, CancelCell, CancelReason
@@ -161,7 +162,7 @@ struct Http2ConnHandle(Movable):
     isn't -- it owns a heap-allocated ``Int`` whose lifetime is
     tied to the cell). The address is allocated when a stream is
     first dispatched to a :trait:`flare.http.CancelHandler` and
-    freed (``destroy_pointee`` + ``free``) once
+    freed (``unsafe_deinit_pointee`` + ``free``) once
     :meth:`emit_response` queues that stream's response.
 
     Flipped on inbound RST_STREAM(stream_id) so a handler in
@@ -422,15 +423,11 @@ struct Http2ConnHandle(Movable):
         self.h2.feed(bytes)
         var ack = self.h2.drain()
 
-        if len(ack) > 0:
+        # One copy: this is every outbound byte of the connection, and
 
-            # One copy: this is every outbound byte of the
+        # for a streaming response it runs once per window's worth.
 
-            # connection, and for a streaming response it runs once
-
-            # per window's worth of body.
-
-            self.write_buf.extend(Span(ack))
+        self.write_buf.extend(Span(ack))
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
@@ -561,15 +558,11 @@ struct Http2ConnHandle(Movable):
         # Drain everything the driver wants to send.
         var out = self.h2.drain()
 
-        if len(out) > 0:
+        # One copy: this is every outbound byte of the connection, and
 
-            # One copy: this is every outbound byte of the
+        # for a streaming response it runs once per window's worth.
 
-            # connection, and for a streaming response it runs once
-
-            # per window's worth of body.
-
-            self.write_buf.extend(Span(out))
+        self.write_buf.extend(Span(out))
         if self.h2.conn.goaway_received:
             self.should_close = True
         if self.h2.conn.goaway_sent:
@@ -590,7 +583,7 @@ struct Http2ConnHandle(Movable):
         return StepResult(
             want_read=True,
             want_write=False,
-            idle_timeout_ms=self._read_wait_timeout_ms(config),
+            idle_timeout_ms=config.idle_timeout_ms,
         )
 
     # ── WebSocket-over-HTTP/2 sidecar dispatch (RFC 8441) ────────────────────
@@ -705,7 +698,7 @@ struct Http2ConnHandle(Movable):
         var addr = self._stream_out[sid]
         var st = Pool[H2StreamOut].get_ptr(addr)
         if st[].ppos < len(st[].pending):
-            # Only what the window will take -- see `queue_parked_body`, which
+            # Only what the window will take — see `queue_parked_body`, which
             # the buffered path uses for the same reason: re-copying the whole
             # stash on every pump, and a pump is what a WINDOW_UPDATE
             # triggers, is quadratic in the response.
@@ -734,33 +727,13 @@ struct Http2ConnHandle(Movable):
             if n < clen:
                 # Window exhausted mid-chunk: stash the tail and stop.
                 # The tail is stashed once per chunk, so this is linear —
-                # but it is the same 28 MiB, and a byte at a time is a byte
-                # at a time.
+                # but it is the same bytes, and a byte at a time is a byte at
+                # a time.
                 var tail = List[UInt8]()
                 tail.extend(Span(nxt.value())[n:clen])
                 st[].pending = tail^
                 st[].ppos = 0
                 return
-
-    def _read_wait_timeout_ms(self, config: ServerConfig) -> Int:
-        """How long this connection may sit unreadable before it is reaped.
-
-        ``idle_timeout_ms`` is the budget for a connection with nothing in
-        flight -- half a second by default, which is the right answer for a
-        keep-alive socket nobody is using. A connection with active streams is
-        not that: its send window is exhausted and it is waiting for the
-        peer's WINDOW_UPDATE, which is a readable event that arrives when the
-        peer gets round to it. Charging that wait to the idle budget reaps a
-        response mid-flight, and the peer sees its stream vanish with no error
-        from a server that is working correctly.
-
-        A stalled peer still has to be bounded, so the wait is charged to
-        ``write_timeout_ms`` -- the budget that already covers "we owe bytes
-        and cannot send them".
-        """
-        if len(self._stream_out) > 0:
-            return config.write_timeout_ms
-        return config.idle_timeout_ms
 
     def _clear_stream(mut self, sid: Int) raises:
         """Free + remove the boxed streaming state for ``sid`` once its
@@ -801,7 +774,7 @@ struct Http2ConnHandle(Movable):
         """
         if sid in self.stream_cells:
             return self.stream_cells[sid]
-        var p = alloc[Int](1)
+        var p = unsafe_alloc[Int](1)
         p.unsafe_write(CancelReason.NONE)
         var addr = Int(p)
         self.stream_cells[sid] = addr
@@ -814,11 +787,9 @@ struct Http2ConnHandle(Movable):
             return
         var addr = self.stream_cells.pop(sid)
         if addr != 0:
-            var p = UnsafePointer[Int, MutUntrackedOrigin](
-                unsafe_from_address=addr
-            )
+            var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
             p.unsafe_deinit_pointee()
-            p.free()
+            p.unsafe_free()
 
     def _flip_all_stream_cells(mut self, reason: Int) raises -> None:
         """Flip every live per-stream cell + the connection-level cell.
@@ -851,12 +822,10 @@ struct Http2ConnHandle(Movable):
             _ = self._alloc_stream_cell(sid)
         var addr = self.stream_cells[sid]
         if addr != 0:
-            var p = UnsafePointer[Int, MutUntrackedOrigin](
-                unsafe_from_address=addr
-            )
+            var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
             p[] = reason
 
-    def _stream_cell_cancelled(read self, sid: Int) raises -> Bool:
+    def _stream_cell_cancelled(imm self, sid: Int) raises -> Bool:
         """Return ``True`` if the cell bound to ``sid`` has been
         flipped to a non-zero reason. False (and stream not
         cancelled) if no cell is allocated for ``sid``.
@@ -866,7 +835,7 @@ struct Http2ConnHandle(Movable):
         var addr = self.stream_cells[sid]
         if addr == 0:
             return False
-        var p = UnsafePointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+        var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
         return p[] != CancelReason.NONE
 
     def on_readable_cancel[
@@ -923,7 +892,7 @@ struct Http2ConnHandle(Movable):
                 if got > 0:
                     var got_int = Int(got)
                     for i in range(got_int):
-                        inbound.append(chunk[i])
+                        inbound.append(chunk[unsafe_offset=i])
                 elif got == 0:
                     # Peer FIN -- flip every live cell so in-flight
                     # handlers short-circuit cooperatively.
@@ -997,15 +966,11 @@ struct Http2ConnHandle(Movable):
                 self.should_close = True
         var out = self.h2.drain()
 
-        if len(out) > 0:
+        # One copy: this is every outbound byte of the connection, and
 
-            # One copy: this is every outbound byte of the
+        # for a streaming response it runs once per window's worth.
 
-            # connection, and for a streaming response it runs once
-
-            # per window's worth of body.
-
-            self.write_buf.extend(Span(out))
+        self.write_buf.extend(Span(out))
         if self.h2.conn.goaway_received:
             self.should_close = True
         var has_outbound = len(self.write_buf) > self.write_pos
@@ -1019,7 +984,7 @@ struct Http2ConnHandle(Movable):
         return StepResult(
             want_read=True,
             want_write=False,
-            idle_timeout_ms=self._read_wait_timeout_ms(config),
+            idle_timeout_ms=config.idle_timeout_ms,
         )
 
     def signal_drain(mut self) raises -> None:
@@ -1130,7 +1095,7 @@ struct Http2ConnHandle(Movable):
         return StepResult(
             want_read=True,
             want_write=False,
-            idle_timeout_ms=self._read_wait_timeout_ms(config),
+            idle_timeout_ms=config.idle_timeout_ms,
         )
 
 

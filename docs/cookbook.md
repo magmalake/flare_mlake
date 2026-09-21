@@ -55,8 +55,10 @@ basics.
 | [`forms.mojo`](../examples/intermediate/forms.mojo) | `application/x-www-form-urlencoded` parsing + the `Form` extractor |
 | [`multipart_upload.mojo`](../examples/intermediate/multipart_upload.mojo) | `multipart/form-data` (file uploads) + the `Multipart` extractor |
 | [`sessions.mojo`](../examples/intermediate/sessions.mojo) | Typed `Session[T]` over `CookieSessionStore` (HMAC-SHA256 signed) |
+| [`http_ws_one_port.mojo`](../examples/intermediate/http_ws_one_port.mojo) | HTTP and WebSocket served by one `HttpServer` on one port, via `ServerConfig.ws` |
 | [`cors.mojo`](../examples/intermediate/cors.mojo) | `Cors` permissive vs allowlist + preflight + credentials |
 | [`static_files.mojo`](../examples/intermediate/static_files.mojo) | `FileServer` with HEAD + Range + path safety |
+| [`openapi.mojo`](../examples/intermediate/openapi.mojo) | Derive an OpenAPI 3.1 document from a live `Router` with `spec_from_router` |
 | [`brotli.mojo`](../examples/intermediate/brotli.mojo) | `compress_brotli` / `decompress_brotli` + `Compress` middleware emitting `br` |
 | [`ok_json_typed.mojo`](../examples/intermediate/ok_json_typed.mojo) | Typed JSON request → typed JSON response via `ok_json_value` |
 | [`infallible_handler.mojo`](../examples/intermediate/infallible_handler.mojo) | `HandlerInfallible` + `WithRaises` adapter for provably no-`raises` paths |
@@ -136,6 +138,7 @@ natural.
 | Use signed-cookie sessions | [`sessions.mojo`](../examples/intermediate/sessions.mojo) |
 | Configure CORS | [`cors.mojo`](../examples/intermediate/cors.mojo) |
 | Serve static files (with `Range`) | [`static_files.mojo`](../examples/intermediate/static_files.mojo) |
+| Publish an OpenAPI spec for my routes | [`openapi.mojo`](../examples/intermediate/openapi.mojo) -- `spec_from_router(router, title, version)` then `emit_openapi_json`; body schemas are hand-written, the router cannot supply them |
 | Send `Content-Encoding: br` | [`brotli.mojo`](../examples/intermediate/brotli.mojo) |
 | Return a typed JSON response | [`ok_json_typed.mojo`](../examples/intermediate/ok_json_typed.mojo) |
 | Use a no-`raises` handler | [`infallible_handler.mojo`](../examples/intermediate/infallible_handler.mojo) |
@@ -147,6 +150,10 @@ natural.
 | Tune HTTP/2 SETTINGS | [`http2_config.mojo`](../examples/advanced/http2_config.mojo) |
 | Make HTTP/2 client requests (h2c via prior knowledge; `https://` auto-negotiates h2 vs h1.1 via ALPN) | [`http2_client.mojo`](../examples/advanced/http2_client.mojo) |
 | Serve HTTP/1.1 + HTTP/2 from one port | [`http2_server_router.mojo`](../examples/advanced/http2_server_router.mojo) |
+| Serve HTTP and WebSocket from one port | [`http_ws_one_port.mojo`](../examples/intermediate/http_ws_one_port.mojo) -- set `ServerConfig.ws = WsUpgrade(ws_fn)`, or `WsUpgrade(ws_fn, offload=True)` to give each socket its own thread |
+| Bound a slow or silent peer on the client | `HttpClient.with_read_timeout(ms)` arms `SO_RCVTIMEO` for each read; the `timeout_ms` constructor argument bounds the connect and, on `https://`, the TLS handshake. There is no whole-request deadline yet |
+| Stream a response too large to buffer | [`http_stream_client.mojo`](../examples/advanced/http_stream_client.mojo) -- `get_streaming(url)` on either scheme, then loop `read_chunk(n)` until it returns empty |
+| Upload a body too large to buffer | [`streaming_upload.mojo`](../examples/advanced/streaming_upload.mojo) -- `send_chunked` from a `ChunkSource`; pass `body_size` when the length is known |
 | AF_UNIX sidecar IPC | [`uds_sidecar.mojo`](../examples/advanced/uds_sidecar.mojo) |
 | Proxy an external producer's stream with end-to-end backpressure | [`streaming_proxy.mojo`](../examples/advanced/streaming_proxy.mojo) |
 | Even out skewed-keepalive load | [`work_stealing.mojo`](../examples/advanced/work_stealing.mojo) |

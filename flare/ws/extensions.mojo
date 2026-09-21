@@ -31,7 +31,7 @@ Public surface:
 from .permessage_deflate import PermessageDeflateConfig
 
 
-struct ExtensionParameter(Copyable, Defaultable, Movable):
+struct ExtensionParameter(Copyable, Defaultable):
     """One ``;``-separated parameter inside an
     :class:`ExtensionOffer`."""
 
@@ -50,7 +50,7 @@ struct ExtensionParameter(Copyable, Defaultable, Movable):
         self.value = value
 
 
-struct ExtensionOffer(Copyable, Defaultable, Movable):
+struct ExtensionOffer(Copyable, Defaultable):
     """One comma-separated extension offer + its parameters."""
 
     var name: String
@@ -66,7 +66,7 @@ struct ExtensionOffer(Copyable, Defaultable, Movable):
         self.name = name
         self.params = List[ExtensionParameter]()
 
-    def get(read self, name: String) raises -> Optional[String]:
+    def get(imm self, name: String) raises -> Optional[String]:
         """Return the value for parameter ``name`` (case-folded)
         if present; ``None`` otherwise. Flag-shaped parameters
         return ``Some("")``."""
@@ -75,7 +75,7 @@ struct ExtensionOffer(Copyable, Defaultable, Movable):
                 return Optional[String](self.params[i].value.copy())
         return None
 
-    def has(read self, name: String) raises -> Bool:
+    def has(imm self, name: String) raises -> Bool:
         """Return ``True`` if parameter ``name`` is present."""
         return Bool(self.get(name))
 
@@ -91,7 +91,7 @@ def _ascii_lower(s: String) -> String:
     rest of the codebase (which spells the helper
     ``_ascii_lower``).
     """
-    var out = String(capacity=s.byte_length())
+    var out = String(capacity_bytes=s.byte_length())
     for b in s.as_bytes():
         var c = Int(b)
         if c >= 65 and c <= 90:

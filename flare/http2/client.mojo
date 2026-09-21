@@ -72,7 +72,7 @@ plumbing) lives here.
 # ``Http2ClientConnection`` struct (frame codec drive + stream state + flow
 # control + HPACK + request/response pump). Mojo cannot split one struct's
 # methods across files, so the file sits over the 1000-line Pass-B cap.
-# Allowlisted in tools/check_reactor_size.sh until then.
+# Allowlisted in tests/tools/check_reactor_size.sh until then.
 from std.collections import Dict, Optional
 
 from .frame import (
@@ -399,11 +399,22 @@ struct Http2ClientConnection(Defaultable, Movable):
         for i in range(len(data)):
             self.inbox.append(data[i])
         # Drain frames until we run out of complete ones.
+        var window_updated = False
         while True:
+            if len(self.inbox) >= 9:
+                var frame_size = (
+                    (Int(self.inbox[0]) << 16)
+                    | (Int(self.inbox[1]) << 8)
+                    | Int(self.inbox[2])
+                )
+                if frame_size > self.config.max_frame_size:
+                    raise Error(
+                        "h2 client: frame exceeds advertised maximum size"
+                    )
             var span = Span[UInt8, _](self.inbox)
             var got = parse_frame(span)
             if not got:
-                return
+                break
             var frame = got.value().copy()
             var consumed = 9 + frame.header.length
             var rest = List[UInt8](capacity=len(self.inbox) - consumed)
@@ -440,20 +451,66 @@ struct Http2ClientConnection(Defaultable, Movable):
                         | (Int(frame.payload[2]) << 8)
                         | Int(frame.payload[3])
                     )
-                    self._stream_errors[frame.header.stream_id] = code
-            var was_window_update = (
-                frame.header.type.value == FrameType.WINDOW_UPDATE().value
-            )
+                    var sid = frame.header.stream_id
+                    var completed = False
+                    if sid in self.conn.streams:
+                        var s = self.conn.streams[sid].copy()
+                        completed = s.headers_complete and s.data_complete
+                    # RFC 9113 sec 8.1: NO_ERROR after a complete response
+                    # asks us to stop uploading, without discarding it.
+                    if code != 0 or not completed:
+                        self._stream_errors[sid] = code
+                    self._discard_pending_body(sid)
+            if (
+                frame.header.type.value == FrameType.GOAWAY().value
+                and len(frame.payload) >= 8
+            ):
+                var last = (
+                    (Int(frame.payload[0]) << 24)
+                    | (Int(frame.payload[1]) << 16)
+                    | (Int(frame.payload[2]) << 8)
+                    | Int(frame.payload[3])
+                ) & 0x7FFFFFFF
+                var code = (
+                    (Int(frame.payload[4]) << 24)
+                    | (Int(frame.payload[5]) << 16)
+                    | (Int(frame.payload[6]) << 8)
+                    | Int(frame.payload[7])
+                )
+                for entry in self.conn.streams.items():
+                    if entry[0] > last:
+                        # RFC 9113 sec 6.8: streams above last_stream_id
+                        # were never processed, so they are safe to retry
+                        # on a fresh connection. On a graceful GOAWAY
+                        # (code 0) recording 0 for them made
+                        # stream_error(sid) indistinguishable from the
+                        # clean RST_STREAM(NO_ERROR)-after-a-complete-
+                        # response case. REFUSED_STREAM is the code that
+                        # carries the retry-safe meaning, and retry logic
+                        # reads this.
+                        self._stream_errors[
+                            entry[0]
+                        ] = Http2ErrorCode.REFUSED_STREAM().value
+                    elif code != 0:
+                        self._stream_errors[entry[0]] = code
+            if frame.header.type.value == FrameType.WINDOW_UPDATE().value:
+                window_updated = True
             var reply = self.conn.handle_frame(frame^)
             for i in range(len(reply)):
+                if reply[i].header.type.value == FrameType.RST_STREAM().value:
+                    self._stream_errors[reply[i].header.stream_id] = (
+                        (Int(reply[i].payload[0]) << 24)
+                        | (Int(reply[i].payload[1]) << 16)
+                        | (Int(reply[i].payload[2]) << 8)
+                        | Int(reply[i].payload[3])
+                    )
                 var rb = encode_frame(reply[i])
                 for j in range(len(rb)):
                     self.outbox.append(rb[j])
-            # An inbound WINDOW_UPDATE (connection- or stream-level)
-            # may have opened the send window; drain any body stashed
-            # when a prior send exhausted it.
-            if was_window_update:
-                self._pump_all_pending()
+        # Process responses and resets from the same read before sending
+        # more upload bytes on newly granted credit.
+        if window_updated and not self.conn.goaway_sent:
+            self._pump_all_pending()
 
     # ── Stream id allocation ─────────────────────────────────────────────
 
@@ -544,6 +601,19 @@ struct Http2ClientConnection(Defaultable, Movable):
         has no pending body."""
         if sid not in self._pending_body:
             return
+        if self.response_ready(sid) or sid in self._stream_errors:
+            # Dropping the stashed body is right, but the stream has to
+            # be closed out as well. Discarding alone left our half open
+            # with no END_STREAM and no RST_STREAM on the wire: the peer
+            # kept counting it against SETTINGS_MAX_CONCURRENT_STREAMS
+            # and the request was truncated at whatever frame boundary
+            # we reached, with nothing recorded anywhere. finish_upload
+            # already handles the CLOSED / HALF_CLOSED_LOCAL case that
+            # `sid in self._stream_errors` implies, so it is a no-op when
+            # the stream really is finished.
+            self._discard_pending_body(sid)
+            self.finish_upload(sid)
+            return
         var rem = self._pending_body[sid].copy()
         var fin = self._pending_body_fin[sid]
         var sent = self._emit_body_span(sid, Span(rem), 0, fin)
@@ -569,6 +639,29 @@ struct Http2ClientConnection(Defaultable, Movable):
         """True if stream ``sid`` has a body remainder still awaiting a
         WINDOW_UPDATE (RFC 9113 §6.9)."""
         return sid in self._pending_body
+
+    def _discard_pending_body(mut self, sid: Int) raises:
+        if sid in self._pending_body:
+            _ = self._pending_body.pop(sid)
+        if sid in self._pending_body_fin:
+            _ = self._pending_body_fin.pop(sid)
+
+    def finish_upload(mut self, sid: Int) raises:
+        """Drop unsent request bytes and finish our half after an early reply.
+
+        Preserve the received response. A peer reset may already have closed
+        the stream, in which case no further DATA is permitted.
+        """
+        self._discard_pending_body(sid)
+        if sid not in self.conn.streams:
+            return
+        var s = self.conn.streams[sid].copy()
+        if s.state.value == StreamState.CLOSED().value or (
+            s.state.value == StreamState.HALF_CLOSED_LOCAL().value
+        ):
+            return
+        var empty = List[UInt8]()
+        self.send_data(sid, Span(empty), True)
 
     # ── Sending requests ─────────────────────────────────────────────────
 
@@ -700,6 +793,7 @@ struct Http2ClientConnection(Defaultable, Movable):
             s.state = StreamState.HALF_CLOSED_LOCAL()
         else:
             s.state = StreamState.OPEN()
+        s.response_body_allowed = method.upper() != "HEAD"
         self.conn.streams[sid] = s^
         # Body: emit DATA frames bounded by the current send windows
         # + max_frame_size. If the window is exhausted mid-body the
@@ -800,7 +894,10 @@ struct Http2ClientConnection(Defaultable, Movable):
                 self.outbox.append(db[i])
             if sid in self.conn.streams:
                 var s_local = self.conn.streams[sid].copy()
-                s_local.state = StreamState.HALF_CLOSED_LOCAL()
+                s_local.state = (
+                    StreamState.CLOSED() if s_local.state.value
+                    == StreamState.HALF_CLOSED_REMOTE().value else StreamState.HALF_CLOSED_LOCAL()
+                )
                 self.conn.streams[sid] = s_local^
             return
         # Emit as far as the window allows; stash any remainder for
@@ -809,7 +906,7 @@ struct Http2ClientConnection(Defaultable, Movable):
         if sent < n_body:
             self._stash_pending(sid, body, sent, end_stream)
 
-    def peer_supports_extended_connect(read self) -> Bool:
+    def peer_supports_extended_connect(imm self) -> Bool:
         """Return ``True`` once the peer has advertised
         ``SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`` (RFC 8441 §3).
 
@@ -1039,6 +1136,7 @@ struct Http2ClientConnection(Defaultable, Movable):
         s.send_window = self.conn.initial_window_size
         s.recv_window = self.conn.initial_window_size
         s.state = StreamState.OPEN()
+        s.response_body_allowed = method.upper() != "HEAD"
         self.conn.streams[sid] = s^
 
     def headers_received(self, sid: Int) raises -> Bool:
@@ -1073,8 +1171,29 @@ struct Http2ClientConnection(Defaultable, Movable):
         var s = self.conn.streams.pop(sid)
         var out = s.data^
         s.data = List[UInt8]()
+        var credit = s.pending_body_credit
+        s.pending_body_credit = 0
+        s.recv_window += credit
+        if (
+            credit > 0
+            and not s.data_complete
+            and (s.state.value != StreamState.CLOSED().value)
+        ):
+            self.outbox.extend(
+                encode_frame(Connection._window_update_frame(sid, credit))
+            )
         self.conn.streams[sid] = s^
         return out^
+
+    def enable_response_streaming(mut self, sid: Int) raises:
+        """Return this stream's DATA credit only when drain_body consumes it.
+
+        Call before feeding the response. Drain outbound WINDOW_UPDATEs
+        before waiting for more inbound data.
+        """
+        var s = self.conn.streams[sid].copy()
+        s.defer_body_credit = True
+        self.conn.streams[sid] = s^
 
     def response_headers(self, sid: Int) raises -> List[HpackHeader]:
         """Return a copy of the current header list for ``sid`` (initial
@@ -1091,5 +1210,24 @@ struct Http2ClientConnection(Defaultable, Movable):
         try:
             if sid in self.conn.streams:
                 _ = self.conn.streams.pop(sid)
+            self._discard_pending_body(sid)
         except:
             pass
+
+    def initial_response_headers(self, sid: Int) raises -> List[HpackHeader]:
+        var out = List[HpackHeader]()
+        var s = self.conn.streams[sid].copy()
+        for i in range(s.initial_header_count):
+            out.append(s.headers[i].copy())
+        return out^
+
+    def response_trailers(self, sid: Int) raises -> List[HpackHeader]:
+        var out = List[HpackHeader]()
+        var s = self.conn.streams[sid].copy()
+        for i in range(s.initial_header_count, len(s.headers)):
+            out.append(s.headers[i].copy())
+        return out^
+
+    def cancel_stream(mut self, sid: Int):
+        self._send_rst_stream(sid, Http2ErrorCode.CANCEL().value)
+        self.discard_stream(sid)

@@ -8,7 +8,7 @@ accepted connection and dispatches HTTP/1.1 or HTTP/2 to the
 same handler. ``HttpClient.get("https://...")`` advertises ALPN
 ``["h2", "http/1.1"]`` and switches wires from what the server
 picks. The application surface (``Router``,
-middleware, typed extractors, ``Auth``, ``Session[T]``) doesn't
+middleware, typed extractors, ``Auth``, ``Session``) doesn't
 know which wire is talking to it.
 
 Small FFI footprint: libc syscalls, OpenSSL for TLS, zlib +
@@ -62,7 +62,7 @@ extractors (``PathInt`` / ``QueryInt`` /
 generic middleware (``Logger`` / ``RequestId`` / ``Compress`` /
 ``CatchPanic``), ``Cors``, ``FileServer`` with HEAD + Range,
 gzip + brotli content negotiation, RFC 6265 cookie jars,
-HMAC-SHA256 signed cookies, and typed ``Session[T]`` stores.
+HMAC-SHA256 signed cookies, and signed ``Session`` stores.
 
 ## Architecture
 
@@ -227,7 +227,7 @@ from flare.http import (
 from flare.net import SocketAddr
 
 @fieldwise_init
-struct GetUser(Copyable, Defaultable, Handler, Movable):
+struct GetUser(Copyable, Defaultable, Handler):
     var id: PathInt["id"]
     var page: OptionalQueryInt["page"]
     var auth: HeaderStr["Authorization"]
@@ -242,7 +242,7 @@ struct GetUser(Copyable, Defaultable, Handler, Movable):
 
 def main() raises:
     var r = Router()
-    r.get[Extracted[GetUser]]("/users/:id", Extracted[GetUser]())
+    r.get("/users/:id", Extracted[GetUser]())
     var srv = HttpServer.bind(SocketAddr.localhost(8080))
     srv.serve(r^)
 ```
@@ -301,7 +301,7 @@ from flare.http import Router, Request, Response, Handler, ok, HttpServer
 from flare.net import SocketAddr
 
 @fieldwise_init
-struct Counters(Copyable, Movable):
+struct Counters(Copyable):
     var hits: Int
 
 def home(req: Request) raises -> Response:
@@ -596,14 +596,19 @@ def main() raises:
 # flare application reaches for. Lower-level codecs (HTTP/2 frames,
 # QUIC varints, HPACK Huffman, gRPC LPM internals, runtime advanced
 # primitives, internal SIMD / intern helpers) live behind their
-# respective submodules. For an "everything at the top level" feel,
-# use ``from flare.prelude import *``.
+# respective submodules. ``flare.prelude`` exports this same list --
+# it is a single-import alias for it, not a wider surface.
 # ─────────────────────────────────────────────────────────────────────────
 
 # Errors
 from .errors import HttpStatusError, IoError, ValidationError
 
 # HTTP core types + builders
+# `WsUpgrade` and `Http2Config` are the types of `ServerConfig.ws` and
+# `ServerConfig.h2`, so the closure rule above puts them here: you
+# cannot configure an exported struct's field without naming its type.
+from .http._server.config import WsUpgrade
+from .http.proto.h2_config import Http2Config
 from .http.server import (
     HttpServer,
     ServerConfig,
@@ -626,12 +631,20 @@ from .http.request_view import RequestView
 from .http.url import Url, UrlParseError
 from .http.headers import HeaderMap, HeaderInjectionError
 from .http.cancel import Cancel
-from .http.handler import Handler, CancelHandler, ViewHandler, WithCancel
+from .http.handler import (
+    Handler,
+    CancelHandler,
+    ViewHandler,
+    WithCancel,
+    WithViewCancel,
+    HandlerInfallible,
+    WithRaises,
+)
 from .http.router import Router
 from .http.routes import ComptimeRoute, ComptimeRouter
 from .http.auth import Auth, BasicAuth, BearerAuth
 from .http.error import HttpError, TooManyRedirects
-from .http.static_response import precompute_response
+from .http.static_response import precompute_response, StaticResponse
 from .http.cookie import Cookie, CookieJar, parse_set_cookie_header
 
 # Streaming-proxy surface (typed streaming server + reactor-integrated
@@ -640,14 +653,6 @@ from .http.cookie import Cookie, CookieJar, parse_set_cookie_header
 from .io import ByteReader, ByteWriter
 from .http.streaming_server import StreamHandler, StreamConn
 from .http.async_body import AsyncChunkSource, ChunkPoll, UpstreamChunkSource
-from .uds.frame_mux import (
-    Frame,
-    FrameDemux,
-    FrameKind,
-    FrameMux,
-    encode_frame,
-    decode_frame,
-)
 
 # Extractors (concrete; custom types belong as their own Extractor struct)
 from .http.extract import (
@@ -696,7 +701,7 @@ from .http.middleware import (
     RequestId,
 )
 from .http.cors import Cors, CorsConfig
-from .http.cache import Cache
+from .http.cache import Cache, InMemoryCacheStore
 from .http.fs import FileServer
 from .http.reliability import Retry, RetryPolicy, PostHocDeadline
 
@@ -715,10 +720,12 @@ from .tls.acceptor import TlsAcceptor, TlsServerConfig
 from .net.address import IpAddr, SocketAddr
 from .tcp.stream import TcpStream
 from .tcp.listener import TcpListener
+from .uds.listener import UnixListener
+from .uds.stream import UnixStream
 
 # WebSocket (high-level only; frame codec lives in flare.ws)
 from .ws.client import WsClient, WsMessage
-from .ws.server import WsServer
+from .ws.server import WsServer, WsConnection
 
 # Testing
 from .testing import TestClient

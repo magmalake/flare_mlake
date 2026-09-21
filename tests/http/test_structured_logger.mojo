@@ -63,7 +63,7 @@ def test_json_escape_carriage_return() raises:
 
 def test_json_escape_low_control_byte() raises:
     """0x07 (BEL) → ``\\u0007`` per RFC 8259 §7."""
-    var s = String(capacity=2)
+    var s = String(capacity_bytes=2)
     s += chr(7)
     assert_equal(_json_escape(s), "\\u0007")
 
@@ -99,7 +99,7 @@ def test_iso8601_handles_fractional_milliseconds() raises:
 # ── StructuredLogger.serve via fixed inner ───────────────────────────────
 
 
-struct _OK200(Copyable, Defaultable, Handler, Movable):
+struct _OK200(Copyable, Defaultable, Handler):
     """Inner handler that always returns 200 with body 'hello'
     and an X-Request-Id echo."""
 
@@ -115,7 +115,7 @@ struct _OK200(Copyable, Defaultable, Handler, Movable):
         return resp^
 
 
-struct _Raises500(Copyable, Defaultable, Handler, Movable):
+struct _Raises500(Copyable, Defaultable, Handler):
     """Inner handler that raises a known exception so the error
     path is exercised."""
 
@@ -129,7 +129,7 @@ struct _Raises500(Copyable, Defaultable, Handler, Movable):
 def test_serve_success_returns_inner_response() raises:
     """Just confirm the wrapper preserves the inner response on
     success — the line emit is a side effect to stdout."""
-    var lg = StructuredLogger[_OK200]()
+    var lg = StructuredLogger(_OK200())
     var req = Request(method=String("GET"), url=String("/x"))
     var resp = lg.serve(req)
     assert_equal(resp.status, 200)
@@ -139,7 +139,7 @@ def test_serve_success_returns_inner_response() raises:
 def test_serve_error_re_raises() raises:
     """The wrapper logs the error then re-raises so upstream
     middleware can ``CatchPanic`` if it wants."""
-    var lg = StructuredLogger[_Raises500]()
+    var lg = StructuredLogger(_Raises500())
     var req = Request(method=String("GET"), url=String("/x"))
     var raised = False
     try:

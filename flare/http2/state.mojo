@@ -25,10 +25,16 @@ Connection-level concerns *not* implemented :
 - Priority dependency tree (deprecated by RFC 9113 §5.3.2 — frames
   are accepted and ignored).
 - Server push (we never originate PUSH_PROMISE).
-- Per-stream flow control beyond the basic window accounting; we
-  emit WINDOW_UPDATE eagerly so default-sized requests don't stall.
 """
 
+# TODO(2026-12-31, track-http2-state): this module is dominated by the
+# single ``Connection`` struct -- frame validation, stream state,
+# per-stream and connection flow control, header-block assembly, and the
+# GOAWAY / RST_STREAM machinery, all reached through ``handle_frame``.
+# Mojo cannot split one struct's methods across files, so the file sits
+# over the 1000-line Pass-B cap. The enums and the ``Stream`` record
+# could move out, but they are only ~200 lines and would not bring it
+# under. Allowlisted in tests/tools/check_reactor_size.sh until then.
 from std.collections import Dict, Optional
 
 from .frame import (
@@ -46,7 +52,7 @@ from .stream_slab import StreamSlab
 # ── H2 error codes (RFC 9113 §7) ────────────────────────────────────────
 
 
-struct Http2ErrorCode(Copyable, Defaultable, Movable):
+struct Http2ErrorCode(Copyable, Defaultable):
     """One of the 14 RFC 9113 §7 error codes."""
 
     var value: Int
@@ -121,7 +127,7 @@ ponytail: lifetime cap, not a time-windowed token bucket --
 upgrade path is a clock-fed bucket if that ever bites."""
 
 
-struct Http2Error(Copyable, Defaultable, Movable):
+struct Http2Error(Copyable, Defaultable):
     """A typed HTTP/2 error. ``stream_id == 0`` means connection error."""
 
     var code: Http2ErrorCode
@@ -144,7 +150,7 @@ struct Http2Error(Copyable, Defaultable, Movable):
 # ── Stream state machine (RFC 9113 §5.1) ────────────────────────────────
 
 
-struct StreamState(Copyable, Defaultable, Movable):
+struct StreamState(Copyable, Defaultable):
     """Stream lifecycle states. Numeric values are intentional."""
 
     var value: Int
@@ -179,13 +185,19 @@ struct StreamState(Copyable, Defaultable, Movable):
 comptime StreamId = Int
 
 
-struct Stream(Copyable, Defaultable, Movable):
+struct Stream(Copyable, Defaultable):
     """Per-stream record."""
 
     var id: StreamId
     var state: StreamState
     var headers: List[HpackHeader]
+    var initial_header_count: Int
     var data: List[UInt8]
+    var received_body_bytes: Int
+    var response_body_allowed: Bool
+    var defer_body_credit: Bool
+    """Return DATA credit on body drains for a streaming response reader."""
+    var pending_body_credit: Int
     var send_window: Int
     var recv_window: Int
     var headers_complete: Bool
@@ -202,6 +214,15 @@ struct Stream(Copyable, Defaultable, Movable):
     """Declared ``content-length``, or ``-1`` when absent. RFC 9113
     sec 8.1.2.6 makes a mismatch against the DATA actually received a
     malformed request."""
+    var response_started: Bool
+    """Set once a response has been scheduled for this stream.
+
+    ``take_completed_streams`` uses it to decide whether a stream still
+    needs dispatching. The stream state alone is not enough: a response
+    whose body does not fit the peer's send window is parked and the
+    stream stays open, so a state-only guard re-dispatches the handler
+    on every WINDOW_UPDATE and re-sends the whole response head."""
+
     var extended_connect_protocol: String
     """RFC 8441 ``:protocol`` pseudo-header value when the stream
     was opened with ``:method = CONNECT``. Empty string otherwise.
@@ -214,7 +235,12 @@ struct Stream(Copyable, Defaultable, Movable):
         self.id = 0
         self.state = StreamState()
         self.headers = List[HpackHeader]()
+        self.initial_header_count = 0
         self.data = List[UInt8]()
+        self.received_body_bytes = 0
+        self.response_body_allowed = True
+        self.defer_body_credit = False
+        self.pending_body_credit = 0
         self.send_window = 65535
         self.recv_window = 65535
         self.headers_complete = False
@@ -222,13 +248,14 @@ struct Stream(Copyable, Defaultable, Movable):
         self.header_list_bytes = 0
         self.continuation_count = 0
         self.content_length = -1
+        self.response_started = False
         self.extended_connect_protocol = ""
 
 
 # ── Connection ──────────────────────────────────────────────────────────
 
 
-struct Connection(Copyable, Defaultable, Movable):
+struct Connection(Copyable, Defaultable):
     """Per-connection HTTP/2 state."""
 
     var streams: StreamSlab[Stream]
@@ -240,6 +267,12 @@ struct Connection(Copyable, Defaultable, Movable):
     var hpack_encoder: HpackEncoder
     var max_frame_size: Int
     var max_concurrent_streams: Int
+    var max_request_body_size: Int
+    """Maximum buffered request bytes per stream; defaults to 10 MiB.
+
+    Server requests are buffered until END_STREAM, so receive credit alone
+    cannot bound them. This limit does not apply to client response bodies.
+    """
     var initial_window_size: Int
     var max_header_list_size: Int
     """SETTINGS_MAX_HEADER_LIST_SIZE (RFC 9113 §6.5.2). ``0`` means
@@ -326,6 +359,7 @@ struct Connection(Copyable, Defaultable, Movable):
         self.hpack_encoder = HpackEncoder()
         self.max_frame_size = H2_DEFAULT_FRAME_SIZE
         self.max_concurrent_streams = 100
+        self.max_request_body_size = 10 * 1024 * 1024
         self.initial_window_size = 65535
         self.max_header_list_size = 0  # unset / unbounded (RFC default)
         self.send_window = 65535
@@ -448,6 +482,18 @@ struct Connection(Copyable, Defaultable, Movable):
         p.append(UInt8(error_code & 0xFF))
         f.payload = p^
         f.header.length = len(f.payload)
+        return f^
+
+    @staticmethod
+    def _window_update_frame(sid: Int, credit: Int) -> Frame:
+        var f = Frame()
+        f.header.type = FrameType.WINDOW_UPDATE()
+        f.header.stream_id = sid
+        f.payload.append(UInt8((credit >> 24) & 0x7F))
+        f.payload.append(UInt8((credit >> 16) & 0xFF))
+        f.payload.append(UInt8((credit >> 8) & 0xFF))
+        f.payload.append(UInt8(credit & 0xFF))
+        f.header.length = 4
         return f^
 
     def _goaway_frame(self, last_stream_id: Int, error_code: Int) -> Frame:
@@ -688,6 +734,113 @@ struct Connection(Copyable, Defaultable, Movable):
                 self._put_stream(s^)
                 return out^
 
+        if self.is_client:
+            # RFC 9113 sec 8.1.1: a malformed response "MUST be treated
+            # as a stream error of type PROTOCOL_ERROR". These checks
+            # used to raise, and Connection.handle_frame raises straight
+            # out through Http2ClientConnection.feed, whose contract is
+            # for the caller to GOAWAY and close the socket. So one bad
+            # response on stream 5 tore down streams 1, 3 and 7 with it.
+            # Raising also skipped _put_stream below, discarding the
+            # recv_window decrement taken for this frame and leaving a
+            # caller that recovers with flow-control accounting the peer
+            # does not share.
+            #
+            # The same function already answers three other violations
+            # this way: the header-list cap and the server-side request
+            # check above, and the content-length mismatch below.
+            var bad = False
+            var status = 0
+            var regular = False
+            for field in hdrs:
+                if (
+                    field.name.byte_length() == 0
+                    or field.name != field.name.lower()
+                    or Connection._is_connection_specific(field.name)
+                ):
+                    bad = True
+                    break
+                if field.name == ":status":
+                    if (
+                        is_trailers
+                        or status != 0
+                        or regular
+                        or field.value.byte_length() != 3
+                    ):
+                        bad = True
+                        break
+                    var digits_ok = True
+                    for b in field.value.as_bytes():
+                        if b < 48 or b > 57:
+                            digits_ok = False
+                            break
+                    if not digits_ok:
+                        bad = True
+                        break
+                    status = Int(field.value)
+                elif field.name.startswith(":"):
+                    bad = True
+                    break
+                else:
+                    regular = True
+                    if is_trailers and field.name == "content-length":
+                        bad = True
+                        break
+            if not bad:
+                var declared = -1
+                for field in hdrs:
+                    if field.name == "content-length":
+                        var n = 0
+                        var bytes = field.value.as_bytes()
+                        if len(bytes) == 0:
+                            bad = True
+                            break
+                        var num_ok = True
+                        for b in bytes:
+                            if (
+                                b < 48
+                                or b > 57
+                                or n > (Int.MAX - Int(b - 48)) // 10
+                            ):
+                                num_ok = False
+                                break
+                            n = n * 10 + Int(b - 48)
+                        if not num_ok:
+                            bad = True
+                            break
+                        if declared >= 0 and n != declared:
+                            bad = True
+                            break
+                        declared = n
+            var informational = False
+            if not bad:
+                if not is_trailers:
+                    if status < 100 or status > 599 or status == 101:
+                        bad = True
+                    elif status < 200:
+                        if end_stream:
+                            bad = True
+                        else:
+                            informational = True
+                    elif status == 204 or status == 304:
+                        s.response_body_allowed = False
+                elif not end_stream:
+                    bad = True
+            if bad:
+                out.append(
+                    self._rst_stream_frame(
+                        sid, Http2ErrorCode.PROTOCOL_ERROR().value
+                    )
+                )
+                s.state = StreamState.CLOSED()
+                s.data = List[UInt8]()
+                s.headers = List[HpackHeader]()
+                self._put_stream(s^)
+                return out^
+            if informational:
+                self._put_stream(s^)
+                return out^
+
         for j in range(len(hdrs)):
             s.headers.append(hdrs[j].copy())
             # RFC 8441 sec 4: capture ``:protocol`` on Extended CONNECT
@@ -696,12 +849,18 @@ struct Connection(Copyable, Defaultable, Movable):
                 s.extended_connect_protocol = hdrs[j].value
         if not is_trailers:
             s.content_length = Connection._declared_content_length(hdrs)
+            s.initial_header_count = len(s.headers)
+            if self.is_client and not s.response_body_allowed:
+                s.content_length = -1
         s.headers_complete = True
 
         if end_stream:
             # sec 8.1.2.6: a declared content-length must match the DATA
             # actually delivered.
-            if s.content_length >= 0 and len(s.data) != s.content_length:
+            if (
+                s.content_length >= 0
+                and s.received_body_bytes != s.content_length
+            ):
                 out.append(
                     self._rst_stream_frame(
                         sid, Http2ErrorCode.PROTOCOL_ERROR().value
@@ -1073,6 +1232,8 @@ struct Connection(Copyable, Defaultable, Movable):
                     )
                 return self._conn_error(Http2ErrorCode.STREAM_CLOSED().value)
             var s = self.streams[sid].copy()
+            if self.is_client and not s.headers_complete:
+                return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
             var st = s.state.value
             if (
                 st == StreamState.CLOSED().value
@@ -1098,11 +1259,64 @@ struct Connection(Copyable, Defaultable, Movable):
                 s.state = StreamState.CLOSED()
                 self._put_stream(s^)
                 return out^
+            if self.is_client and not s.response_body_allowed and len(body) > 0:
+                # Stream error, for the same reason as the response-head
+                # checks above: one peer sending DATA on its own 204 must
+                # not close every other stream on the connection.
+                out.append(
+                    self._rst_stream_frame(
+                        sid, Http2ErrorCode.PROTOCOL_ERROR().value
+                    )
+                )
+                s.state = StreamState.CLOSED()
+                s.data = List[UInt8]()
+                s.headers = List[HpackHeader]()
+                self._put_stream(s^)
+                if len(f.payload) > 0:
+                    out.append(Self._window_update_frame(0, len(f.payload)))
+                return out^
+            if not self.is_client and len(body) > (
+                self.max_request_body_size - len(s.data)
+            ):
+                out.append(
+                    self._rst_stream_frame(
+                        sid, Http2ErrorCode.ENHANCE_YOUR_CALM().value
+                    )
+                )
+                s.data = List[UInt8]()
+                # Drop the header list too. Nothing in the tree removes a
+                # CLOSED stream from Connection.streams, and
+                # _active_stream_count skips closed streams, so the peer
+                # is not throttled by the concurrency limit either. It
+                # could otherwise open stream after stream, each with a
+                # header list up to the cap and one oversized DATA frame,
+                # and keep every one of those lists alive for the life of
+                # the connection -- trading a bounded body buffer for
+                # unbounded header retention. Safe here:
+                # take_completed_streams skips CLOSED streams and
+                # take_request is never reached for one.
+                s.headers = List[HpackHeader]()
+                s.state = StreamState.CLOSED()
+                self._put_stream(s^)
+                if len(f.payload) > 0:
+                    out.append(Self._window_update_frame(0, len(f.payload)))
+                return out^
             for j in range(len(body)):
                 s.data.append(body[j])
+            s.received_body_bytes += len(body)
+            # Padding is immediately consumed. Streaming DATA credit is
+            # returned by drain_body, not merely by pumping the socket.
+            var credit = len(f.payload)
+            if s.defer_body_credit:
+                credit -= len(body)
+                s.pending_body_credit += len(body)
+            s.recv_window += credit
             if f.header.flags.has(FrameFlags.END_STREAM()):
                 # sec 8.1.2.6: content-length must match what arrived.
-                if s.content_length >= 0 and len(s.data) != s.content_length:
+                if (
+                    s.content_length >= 0
+                    and s.received_body_bytes != s.content_length
+                ):
                     out.append(
                         self._rst_stream_frame(
                             sid, Http2ErrorCode.PROTOCOL_ERROR().value
@@ -1122,18 +1336,12 @@ struct Connection(Copyable, Defaultable, Movable):
                 else:
                     s.state = StreamState.HALF_CLOSED_REMOTE()
             self._put_stream(s^)
-            # Send a generous WINDOW_UPDATE to keep things flowing.
+            # Connection credit lets unrelated streams progress; each
+            # streaming response remains bounded by its own receive window.
             if len(f.payload) > 0:
-                var wu = Frame()
-                wu.header.type = FrameType.WINDOW_UPDATE()
-                wu.header.stream_id = 0
-                var n = len(f.payload)
-                wu.payload = List[UInt8]()
-                wu.payload.append(UInt8((n >> 24) & 0x7F))
-                wu.payload.append(UInt8((n >> 16) & 0xFF))
-                wu.payload.append(UInt8((n >> 8) & 0xFF))
-                wu.payload.append(UInt8(n & 0xFF))
-                out.append(wu^)
+                if credit > 0:
+                    out.append(Self._window_update_frame(sid, credit))
+                out.append(Self._window_update_frame(0, len(f.payload)))
             return out^
 
         if ft == FrameType.GOAWAY().value:

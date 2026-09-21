@@ -37,7 +37,7 @@ sequential same-origin requests, proving reuse.
 
 from std.collections import Dict, List, Optional
 from std.ffi import c_int, external_call
-from std.memory import Layout, UnsafePointer, alloc
+from std.memory import Layout, Pointer, alloc
 from std.sys.info import CompilationTarget
 
 from flare.http3.client import Http3ClientConnection
@@ -79,7 +79,7 @@ struct _QuicPoolState(Movable):
     :meth:`note_dial` -- observability + reuse assertions."""
 
 
-struct QuicConnectionPool(Copyable, Movable):
+struct QuicConnectionPool(Copyable):
     """Idle h3-connection pool handle (pointer-backed)."""
 
     var _addr: Int
@@ -140,7 +140,7 @@ struct QuicConnectionPool(Copyable, Movable):
         var sp = self._state()
         sp[].dials += 1
 
-    def dials(read self) -> Int:
+    def dials(imm self) -> Int:
         """How many fresh dials the owner has reported."""
         if not self.enabled():
             return 0
@@ -204,7 +204,7 @@ struct QuicConnectionPool(Copyable, Movable):
         sp[].entries[key] = deque^
         sp[].ts_ms[addr] = _monotonic_ms()
 
-    def idle_count(read self) -> Int:
+    def idle_count(imm self) -> Int:
         """Total idle connections across all origins."""
         if not self.enabled():
             return 0

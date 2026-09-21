@@ -104,7 +104,7 @@ def urlencode(s: String) -> String:
     comptime HEX = "0123456789ABCDEF"
     var n = s.byte_length()
     var src = s.unsafe_ptr()
-    var hex_p = HEX.unsafe_ptr()
+    var hex_p = HEX.ptr()
     var out = List[UInt8]()
     out.reserve(n)
     for i in range(n):
@@ -129,7 +129,7 @@ def urlencode(s: String) -> String:
     return String(unsafe_from_utf8=Span[UInt8, _](out))
 
 
-struct FormData(Copyable, Defaultable, Movable):
+struct FormData(Copyable, Defaultable):
     """A name → value(s) multimap, in insertion order.
 
     Backs the ``Form`` extractor; mirrors the API of ``HeaderMap`` so
@@ -203,7 +203,7 @@ struct FormData(Copyable, Defaultable, Movable):
         input. Uses ``+`` for spaces and ``%XX`` for everything else
         outside the unreserved set.
         """
-        var out = String(capacity=len(self._keys) * 16)
+        var out = String(capacity_bytes=len(self._keys) * 16)
         for i in range(len(self._keys)):
             if i > 0:
                 out += "&"

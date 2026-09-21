@@ -38,7 +38,7 @@ from flare.http.streaming_serialize import serialize_streaming_response
 
 
 @fieldwise_init
-struct _OneShot(Body, Copyable, Movable):
+struct _OneShot(Body, Copyable):
     """Minimal ``Body`` impl: emits one fixed chunk then EOF.
 
     Used to drive the chunked emission path without pulling in
@@ -72,7 +72,7 @@ def _bytes(s: String) -> List[UInt8]:
 
 
 def _wire_str(wire: List[UInt8]) -> String:
-    var s = String(capacity=len(wire) + 1)
+    var s = String(capacity_bytes=len(wire) + 1)
     for b in wire:
         s += chr(Int(b))
     return s^

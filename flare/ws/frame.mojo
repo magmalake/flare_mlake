@@ -26,7 +26,7 @@ Masking (§5.3):
 """
 
 from std.format import Writable, Writer
-from std.memory import UnsafePointer
+from std.memory import Pointer
 
 # SIMD chunk width for XOR masking (matches bench_ws_mask.mojo)
 comptime _SIMD_W: Int = 32
@@ -77,7 +77,7 @@ struct WsCloseCode:
     """Server encountered an internal error."""
 
 
-struct WsProtocolError(Copyable, Movable, Writable):
+struct WsProtocolError(Copyable, Writable):
     """Raised when an incoming frame violates RFC 6455."""
 
     var message: String

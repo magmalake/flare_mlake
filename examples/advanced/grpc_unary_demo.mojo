@@ -33,8 +33,6 @@ from std.collections import List
 from std.collections.span import Span
 
 from flare.grpc import (
-    GRPC_STATUS_OK,
-    GRPC_STATUS_RESOURCE_EXHAUSTED,
     GrpcCallContext,
     GrpcCallOutcome,
     GrpcMessage,
@@ -49,7 +47,7 @@ from flare.grpc import (
 
 
 @fieldwise_init
-struct EchoHandler(Copyable, GrpcUnary, Movable):
+struct EchoHandler(Copyable, GrpcUnary):
     """Tiny handler that echoes the request bytes back, or fails
     with the configured error status when ``fail`` is set.
     """
@@ -64,7 +62,7 @@ struct EchoHandler(Copyable, GrpcUnary, Movable):
         if self.fail:
             return GrpcUnaryReply.err(
                 GrpcStatus.err(
-                    GRPC_STATUS_RESOURCE_EXHAUSTED, String("quota exhausted")
+                    GrpcStatus.RESOURCE_EXHAUSTED, String("quota exhausted")
                 )
             )
         var echoed = List[UInt8](capacity=len(request_bytes))
@@ -74,7 +72,7 @@ struct EchoHandler(Copyable, GrpcUnary, Movable):
 
 
 def _hex(bytes: List[UInt8]) -> String:
-    var s = String(capacity=len(bytes) * 3)
+    var s = String(capacity_bytes=len(bytes) * 3)
     for i in range(len(bytes)):
         var b = Int(bytes[i])
         var hi = b // 16

@@ -91,9 +91,7 @@ from .request import Request
 
 
 @fieldwise_init
-struct TemplateError(
-    Copyable, Equatable, ImplicitlyCopyable, Movable, Writable
-):
+struct TemplateError(Copyable, Equatable, ImplicitlyCopyable, Writable):
     """Typed error raised by :func:`Template.compile` /
     :func:`Template.render`.
 
@@ -209,10 +207,10 @@ def html_escape(s: String) -> String:
     var n = s.byte_length()
     if n == 0:
         return String("")
-    var out = String(capacity=n + 8)
+    var out = String(capacity_bytes=n + 8)
     var p = s.unsafe_ptr()
     for i in range(n):
-        var b = Int(p[i])
+        var b = Int(p[unsafe_offset=i])
         if b == ord("&"):
             out += "&amp;"
         elif b == ord("<"):
@@ -246,7 +244,7 @@ child did not override the block."""
 
 
 @fieldwise_init
-struct TemplateNode(Copyable, Deinitable, Movable):
+struct TemplateNode(Copyable, Deinitable):
     """Single node in the parsed template tree.
 
     ``kind`` is one of the ``_NODE_*`` constants above. The other
@@ -286,7 +284,7 @@ struct TemplateNode(Copyable, Deinitable, Movable):
 
 
 @fieldwise_init
-struct TemplateContext(Copyable, Defaultable, Movable):
+struct TemplateContext(Copyable, Defaultable):
     """Variable bag for :func:`Template.render`.
 
     Two flat maps:
@@ -418,17 +416,18 @@ def _parse_segment(
         var open_pos = -1
         var i = pos
         while i + 1 < n:
-            if Int(p[i]) == ord("{") and (
-                Int(p[i + 1]) == ord("{") or Int(p[i + 1]) == ord("%")
+            if Int(p[unsafe_offset=i]) == ord("{") and (
+                Int(p[unsafe_offset=i + 1]) == ord("{")
+                or Int(p[unsafe_offset=i + 1]) == ord("%")
             ):
                 open_pos = i
                 break
             i += 1
         if open_pos < 0:
             if pos < n:
-                var t = String(capacity=n - pos)
+                var t = String(capacity_bytes=n - pos)
                 for j in range(pos, n):
-                    t += chr(Int(p[j]))
+                    t += chr(Int(p[unsafe_offset=j]))
                 out.append(
                     TemplateNode(
                         _NODE_TEXT,
@@ -441,9 +440,9 @@ def _parse_segment(
             pos = n
             return out^
         if open_pos > pos:
-            var t = String(capacity=open_pos - pos)
+            var t = String(capacity_bytes=open_pos - pos)
             for j in range(pos, open_pos):
-                t += chr(Int(p[j]))
+                t += chr(Int(p[unsafe_offset=j]))
             out.append(
                 TemplateNode(
                     _NODE_TEXT,
@@ -453,7 +452,7 @@ def _parse_segment(
                     List[TemplateNode](),
                 )
             )
-        var second = Int(p[open_pos + 1])
+        var second = Int(p[unsafe_offset=open_pos + 1])
         if second == ord("{"):
             var close = _find_close(src, open_pos + 2, "}}")
             if close < 0:
@@ -601,7 +600,7 @@ def _find_close(src: String, start: Int, marker: String) -> Int:
     while i + m <= n:
         var hit = True
         for j in range(m):
-            if p[i + j] != mp[j]:
+            if p[unsafe_offset=i + j] != mp[unsafe_offset=j]:
                 hit = False
                 break
         if hit:
@@ -614,16 +613,16 @@ def _find_byte(s: String, target: Int) -> Int:
     var n = s.byte_length()
     var p = s.unsafe_ptr()
     for i in range(n):
-        if Int(p[i]) == target:
+        if Int(p[unsafe_offset=i]) == target:
             return i
     return -1
 
 
 def _slice(s: String, start: Int, end: Int) -> String:
     var p = s.unsafe_ptr()
-    var out = String(capacity=end - start)
+    var out = String(capacity_bytes=end - start)
     for i in range(start, end):
-        out += chr(Int(p[i]))
+        out += chr(Int(p[unsafe_offset=i]))
     return out^
 
 
@@ -632,18 +631,18 @@ def _strip(s: String) -> String:
     var p = s.unsafe_ptr()
     var i = 0
     while i < n and (
-        Int(p[i]) == ord(" ")
-        or Int(p[i]) == ord("\t")
-        or Int(p[i]) == ord("\n")
-        or Int(p[i]) == ord("\r")
+        Int(p[unsafe_offset=i]) == ord(" ")
+        or Int(p[unsafe_offset=i]) == ord("\t")
+        or Int(p[unsafe_offset=i]) == ord("\n")
+        or Int(p[unsafe_offset=i]) == ord("\r")
     ):
         i += 1
     var j = n - 1
     while j >= i and (
-        Int(p[j]) == ord(" ")
-        or Int(p[j]) == ord("\t")
-        or Int(p[j]) == ord("\n")
-        or Int(p[j]) == ord("\r")
+        Int(p[unsafe_offset=j]) == ord(" ")
+        or Int(p[unsafe_offset=j]) == ord("\t")
+        or Int(p[unsafe_offset=j]) == ord("\n")
+        or Int(p[unsafe_offset=j]) == ord("\r")
     ):
         j -= 1
     return _slice(s, i, j + 1)
@@ -655,12 +654,19 @@ def _split_ws(s: String) -> List[String]:
     var p = s.unsafe_ptr()
     var i = 0
     while i < n:
-        while i < n and (Int(p[i]) == ord(" ") or Int(p[i]) == ord("\t")):
+        while i < n and (
+            Int(p[unsafe_offset=i]) == ord(" ")
+            or Int(p[unsafe_offset=i]) == ord("\t")
+        ):
             i += 1
         if i >= n:
             break
         var j = i
-        while j < n and Int(p[j]) != ord(" ") and Int(p[j]) != ord("\t"):
+        while (
+            j < n
+            and Int(p[unsafe_offset=j]) != ord(" ")
+            and Int(p[unsafe_offset=j]) != ord("\t")
+        ):
             j += 1
         out.append(_slice(s, i, j))
         i = j
@@ -688,7 +694,7 @@ def _render_nodes(
     mut ctx: TemplateContext,
     child_blocks: Dict[String, List[TemplateNode]],
 ) raises TemplateError -> String:
-    var out = String(capacity=256)
+    var out = String(capacity_bytes=256)
     for i in range(len(nodes)):
         var node = nodes[i].copy()
         if node.kind == _NODE_TEXT:
@@ -847,7 +853,7 @@ def _truthy(ctx: TemplateContext, name: String) raises TemplateError -> Bool:
 
 
 @fieldwise_init
-struct Template(Copyable, Movable):
+struct Template(Copyable):
     """Compiled template ready to render against a
     :class:`TemplateContext`.
 

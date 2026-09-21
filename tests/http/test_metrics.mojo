@@ -260,7 +260,7 @@ def test_render_includes_in_flight_value() raises:
 # ── Metrics[Inner] middleware ─────────────────────────────────────────────
 
 
-struct _OK200(Copyable, Defaultable, Handler, Movable):
+struct _OK200(Copyable, Defaultable, Handler):
     def __init__(out self):
         pass
 
@@ -268,7 +268,7 @@ struct _OK200(Copyable, Defaultable, Handler, Movable):
         return Response(status=200)
 
 
-struct _Created201(Copyable, Defaultable, Handler, Movable):
+struct _Created201(Copyable, Defaultable, Handler):
     def __init__(out self):
         pass
 
@@ -276,7 +276,7 @@ struct _Created201(Copyable, Defaultable, Handler, Movable):
         return Response(status=201)
 
 
-struct _Boom(Copyable, Defaultable, Handler, Movable):
+struct _Boom(Copyable, Defaultable, Handler):
     def __init__(out self):
         pass
 
@@ -285,7 +285,7 @@ struct _Boom(Copyable, Defaultable, Handler, Movable):
 
 
 def test_metrics_serve_records_success() raises:
-    var m = Metrics[_OK200]()
+    var m = Metrics(_OK200())
     var req = Request(method=String("GET"), url=String("/x"))
     var resp = m.serve(req)
     var reg = Pool[MetricsRegistry].get_ptr(m.registry_addr)
@@ -298,7 +298,7 @@ def test_metrics_serve_records_success() raises:
 
 
 def test_metrics_serve_records_201_with_post() raises:
-    var m = Metrics[_Created201]()
+    var m = Metrics(_Created201())
     var req = Request(method=String("POST"), url=String("/x"))
     var _resp = m.serve(req)
     var reg = Pool[MetricsRegistry].get_ptr(m.registry_addr)
@@ -307,7 +307,7 @@ def test_metrics_serve_records_201_with_post() raises:
 
 
 def test_metrics_serve_re_raises_and_records_error() raises:
-    var m = Metrics[_Boom]()
+    var m = Metrics(_Boom())
     var req = Request(method=String("GET"), url=String("/x"))
     var raised = False
     try:
@@ -324,7 +324,7 @@ def test_metrics_serve_re_raises_and_records_error() raises:
 def test_metrics_render_helper_matches_registry_render() raises:
     """``Metrics.render()`` snapshots the same underlying
     registry as a direct ``Pool[MetricsRegistry].get_ptr`` call."""
-    var m = Metrics[_OK200]()
+    var m = Metrics(_OK200())
     var req = Request(method=String("GET"), url=String("/x"))
     var _r = m.serve(req)
     var via_helper = m.render()

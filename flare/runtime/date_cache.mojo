@@ -44,7 +44,7 @@ The cache is **not** thread-safe. Each worker constructs its own.
 """
 
 from std.ffi import c_int, external_call
-from std.memory import UnsafePointer, stack_allocation
+from std.memory import Pointer, stack_allocation
 
 
 comptime _IMF_FIXDATE_LEN: Int = 29
@@ -100,7 +100,7 @@ def civil_to_unix_seconds(
 
 
 @fieldwise_init
-struct CivilTime(Copyable, Movable):
+struct CivilTime(Copyable):
     """Civil (Gregorian) date-time + day-of-week derived from a
     Unix epoch second.
 

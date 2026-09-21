@@ -25,7 +25,7 @@ struct SameSite:
     comptime STRICT: String = "Strict"
 
 
-struct Cookie(Copyable, Movable):
+struct Cookie(Copyable):
     """An HTTP cookie (RFC 6265).
 
     Fields:
@@ -264,7 +264,7 @@ def parse_set_cookie_header(header: String) -> Cookie:
     return cookie^
 
 
-struct CookieJar(Copyable, Defaultable, Movable):
+struct CookieJar(Copyable, Defaultable):
     """A collection of cookies for request/response management.
 
     Stores cookies by name. Supports serialisation to request ``Cookie``
@@ -338,7 +338,7 @@ struct CookieJar(Copyable, Defaultable, Movable):
         Returns:
             ``"name1=value1; name2=value2; ..."`` format string.
         """
-        var out = String(capacity=256)
+        var out = String(capacity_bytes=256)
         for i in range(len(self._cookies)):
             if i > 0:
                 out += "; "

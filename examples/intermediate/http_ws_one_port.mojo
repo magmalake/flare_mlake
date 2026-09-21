@@ -15,8 +15,10 @@ RFC 6455 requests to WebSocket on the SAME listener:
                 break
             conn.send_text("echo: " + frame.text_payload())
 
-    var srv = HttpServer.bind(SocketAddr.localhost(8080))
-    srv.serve_ws_upgrade(http_handler, ws_handler)  # one port, both protocols
+    var cfg = ServerConfig()
+    cfg.ws = WsUpgrade(ws_handler)   # one port, both protocols
+    var srv = HttpServer.bind(SocketAddr.localhost(8080), cfg)
+    srv.serve(http_handler)
 
 This example forks a child running exactly that, then drives both a
 plain HTTP GET and a WebSocket echo from the parent over the same port,
@@ -31,7 +33,14 @@ from std.memory import stack_allocation
 
 from flare.utils import SIGKILL, exit, fork, kill, usleep, waitpid
 
-from flare.http import HttpServer, Request, Response, ok
+from flare.http import (
+    HttpServer,
+    Request,
+    Response,
+    ServerConfig,
+    WsUpgrade,
+    ok,
+)
 from flare.net import SocketAddr
 from flare.net._libc import (
     AF_INET,
@@ -68,12 +77,12 @@ def _connect_loopback(port: UInt16) raises -> c_int:
         raise Error("socket() failed: " + _strerror(get_errno().value))
     var sa = stack_allocation[16, UInt8]()
     for i in range(16):
-        (sa + i).init_pointee_copy(UInt8(0))
+        sa.unsafe_offset(i).unsafe_write(copy=UInt8(0))
     var ip = stack_allocation[4, UInt8]()
-    (ip + 0).init_pointee_copy(UInt8(127))
-    (ip + 1).init_pointee_copy(UInt8(0))
-    (ip + 2).init_pointee_copy(UInt8(0))
-    (ip + 3).init_pointee_copy(UInt8(1))
+    ip.unsafe_offset(0).unsafe_write(copy=UInt8(127))
+    ip.unsafe_offset(1).unsafe_write(copy=UInt8(0))
+    ip.unsafe_offset(2).unsafe_write(copy=UInt8(0))
+    ip.unsafe_offset(3).unsafe_write(copy=UInt8(1))
     _fill_sockaddr_in(sa, port, ip)
     if _connect(c, sa, c_int(16).cast[DType.uint32]()) < c_int(0):
         var msg = _strerror(get_errno().value)
@@ -86,7 +95,15 @@ def main() raises:
     print("=== flare: HTTP + WebSocket on one port ===")
     print()
 
-    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    # `ServerConfig.ws` is what makes the one-port shape work. Setting
+    # it is the whole opt-in: `serve` routes a valid RFC 6455 upgrade to
+    # `ws_handler` and everything else to `http_handler`. Before v0.11
+    # this was `serve_ws_upgrade(http_handler, ws_handler)`, which still
+    # works this release and goes away in 0.12.
+    var cfg = ServerConfig()
+    cfg.ws = WsUpgrade(ws_handler)
+
+    var srv = HttpServer.bind(SocketAddr.localhost(0), cfg.copy())
     var port = UInt16(srv.local_addr().port)
     print("── Bound HttpServer on 127.0.0.1:" + String(Int(port)) + " ──")
 
@@ -94,8 +111,8 @@ def main() raises:
     if pid == 0:
         try:
             # ONE server, ONE port, BOTH the unary HTTP handler and the
-            # opt-in WebSocket upgrade handler.
-            srv.serve_ws_upgrade(http_handler, ws_handler)
+            # opt-in WebSocket upgrade handler from `cfg.ws`.
+            srv.serve(http_handler)
         except:
             pass
         exit()
@@ -121,7 +138,7 @@ def main() raises:
         if Int(n) <= 0:
             break
         for i in range(Int(n)):
-            http_body += chr(Int(buf[i]))
+            http_body += chr(Int(buf[unsafe_offset=i]))
     _ = _close(fd)
     if "hello from" in http_body:
         print("   HTTP response body contained: 'hello from HTTP route /hello'")

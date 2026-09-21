@@ -41,7 +41,7 @@ HTTP/1.0 close semantics, ``Connection: close``, and the
 saving is that we don't re-build identical bytes per request.
 
 The pre-encoded buffer is a plain ``List[UInt8]`` rather than an
-``InlineArray`` so the reactor can ``memcpy`` from it at the same cost
+``Array`` so the reactor can ``memcpy`` from it at the same cost
 as a ``stack_allocation`` source.
 """
 
@@ -50,7 +50,7 @@ from std.memory import unsafe_memcpy
 from .headers import HeaderMap
 
 
-struct StaticResponse(Copyable, Movable):
+struct StaticResponse(Copyable):
     """A pair of pre-encoded HTTP/1.1 response buffers.
 
     ``keepalive_bytes`` is emitted when the connection will stay open

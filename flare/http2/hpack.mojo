@@ -43,7 +43,7 @@ from flare.http.hpack_huffman import (
 # ── Integer codec (§5.1) ─────────────────────────────────────────────────
 
 
-struct StringPair(Copyable, Defaultable, Movable):
+struct StringPair(Copyable, Defaultable):
     """Tuple of (string, new_offset)."""
 
     var value: String
@@ -58,7 +58,7 @@ struct StringPair(Copyable, Defaultable, Movable):
         self.offset = offset
 
 
-struct IntPair(Copyable, Defaultable, Movable):
+struct IntPair(Copyable, Defaultable):
     """Tuple of (value, new_offset) used by :func:`decode_integer`."""
 
     var value: Int
@@ -133,7 +133,7 @@ def encode_integer(
 # ── HpackHeader ─────────────────────────────────────────────────────────
 
 
-struct HpackHeader(Copyable, Defaultable, Movable):
+struct HpackHeader(Copyable, Defaultable):
     """A decoded ``(name, value)`` header pair."""
 
     var name: String
@@ -224,7 +224,7 @@ comptime STATIC_TABLE_LEN = 61
 # ── HpackDecoder ─────────────────────────────────────────────────────────
 
 
-struct HpackDecoder(Copyable, Defaultable, Movable):
+struct HpackDecoder(Copyable, Defaultable):
     """Stateful HPACK decoder.
 
     A decoder must be reused across all HEADERS frames on a single
@@ -322,11 +322,11 @@ struct HpackDecoder(Copyable, Defaultable, Movable):
                 huffman_decode(encoded, decoded)
             except e:
                 raise Error("hpack: Huffman decode failed: " + String(e))
-            var s = String(capacity=len(decoded) + 1)
+            var s = String(capacity_bytes=len(decoded) + 1)
             for i in range(len(decoded)):
                 s += chr(Int(decoded[i]))
             return StringPair(s^, off + slen)
-        var s = String(capacity=slen + 1)
+        var s = String(capacity_bytes=slen + 1)
         for i in range(slen):
             s += chr(Int(buf[off + i]))
         return StringPair(s^, off + slen)
@@ -398,7 +398,7 @@ struct HpackDecoder(Copyable, Defaultable, Movable):
 # ── HpackEncoder ─────────────────────────────────────────────────────────
 
 
-struct HpackEncoder(Copyable, Defaultable, Movable):
+struct HpackEncoder(Copyable, Defaultable):
     """Stateless-ish HPACK encoder.
 
     Every header is emitted as a Literal-without-Indexing field

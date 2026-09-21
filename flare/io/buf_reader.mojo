@@ -32,7 +32,7 @@ trait Readable(Deinitable, Movable):
     Example:
         ```mojo
         struct MyStream(Readable):
-            def read(mut self, buf: UnsafePointer[UInt8, _], size: Int) raises -> Int:
+            def read(mut self, buf: Pointer[UInt8, _], size: Int) raises -> Int:
                 ...
         ```
     """
@@ -183,7 +183,7 @@ struct BufReader[S: Readable](Movable):
             var line = reader.readline() # e.g. "HTTP/1.1 200 OK"
             ```
         """
-        var out = String(capacity=256)
+        var out = String(capacity_bytes=256)
         while True:
             var mb = self._consume_byte()
             if not mb:
@@ -219,7 +219,7 @@ struct BufReader[S: Readable](Movable):
             var field = reader.read_until(ord(","))
             ```
         """
-        var out = String(capacity=256)
+        var out = String(capacity_bytes=256)
         while True:
             var mb = self._consume_byte()
             if not mb:

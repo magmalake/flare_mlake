@@ -45,7 +45,7 @@ not currently handled and is skipped on decode like any other
 unknown id. Adding it is a strict superset change.
 
 Sans-I/O contract: zero I/O imports; registered in
-``tools/check_sans_io.sh`` so the contract is lint-enforced.
+``tests/tools/check_sans_io.sh`` so the contract is lint-enforced.
 
 References:
 - RFC 9000 §18 "Transport Parameter Encoding".
@@ -102,7 +102,7 @@ comptime DEFAULT_ACTIVE_CONNECTION_ID_LIMIT: UInt64 = UInt64(2)
 
 
 @fieldwise_init
-struct TransportParameters(Copyable, Movable):
+struct TransportParameters(Copyable):
     """Decoded QUIC transport parameters (RFC 9000 §18).
 
     Optional fields default to ``None`` to distinguish "absent on
@@ -169,7 +169,7 @@ def empty_transport_parameters() -> TransportParameters:
 
 
 @fieldwise_init
-struct PeerSendLimits(Copyable, Movable):
+struct PeerSendLimits(Copyable):
     """The subset of a peer's transport parameters that constrains what
     *we* may send, with RFC 9000 §18.2 defaults already applied.
 

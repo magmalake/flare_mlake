@@ -17,7 +17,7 @@ from std.collections import Optional
 from std.ffi import c_int, c_size_t, c_uint
 
 from flare.utils import usleep
-from std.memory import UnsafePointer, stack_allocation
+from std.memory import Pointer, stack_allocation
 from std.testing import assert_equal, assert_true
 
 from flare.http import Request, Response, ServerConfig, ok, stream_response
@@ -37,7 +37,7 @@ from flare.tcp import TcpListener, TcpStream
 
 
 @fieldwise_init
-struct _TaggedSource(ChunkSource, Copyable, Movable):
+struct _TaggedSource(ChunkSource, Copyable):
     """Test chunk source: yields ``count`` chunks of four ``tag`` bytes
     each, then end-of-stream. Distinct tags per concurrent stream let the
     test assert each stream received exactly its own body (no cross-stream

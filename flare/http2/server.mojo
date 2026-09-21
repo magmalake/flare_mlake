@@ -43,13 +43,21 @@ from .frame import (
     parse_frame,
 )
 from .hpack import HpackHeader
+from flare.http.proto.h2_config import (
+    Http2Config,
+    _H2_DEFAULT_HEADER_TABLE_SIZE,
+    _H2_DEFAULT_INITIAL_WINDOW_SIZE,
+    _H2_DEFAULT_MAX_CONCURRENT_STREAMS,
+    _H2_DEFAULT_MAX_FRAME_SIZE,
+    _H2_DEFAULT_MAX_HEADER_LIST_SIZE,
+)
 from .state import Connection, Http2ErrorCode, Stream, StreamState
 
 
 def _lower_ascii(k: String) -> String:
     """Lowercase ASCII ``A-Z`` in a header name (HTTP/2 requires
     lowercase field names, RFC 9113 8.2.1)."""
-    var out = String(capacity=k.byte_length() + 1)
+    var out = String(capacity_bytes=k.byte_length() + 1)
     var kp = k.unsafe_ptr()
     for j in range(k.byte_length()):
         var c = Int(kp[unsafe_offset=j])
@@ -58,180 +66,6 @@ def _lower_ascii(k: String) -> String:
         else:
             out += chr(c)
     return out^
-
-
-# ── Http2Config ─────────────────────────────────────────────────────────────
-
-
-comptime _H2_DEFAULT_MAX_CONCURRENT_STREAMS: Int = 100
-"""RFC 9113 §5.1.2 has no protocol default; flare ships 100 to bound
-per-connection memory under adversarial peers without breaking
-common interactive workloads (a browser tab opening ~6 parallel
-sub-requests sits well below this)."""
-
-comptime _H2_DEFAULT_INITIAL_WINDOW_SIZE: Int = 65535
-"""RFC 9113 §6.5.2 mandates 65535 as the default for new streams
-until SETTINGS negotiates a different value. ``Http2Config`` ships
-the same number so the default ``Http2Config()`` is observably
-identical to the legacy ``Http2Connection()`` shape."""
-
-comptime _H2_DEFAULT_MAX_FRAME_SIZE: Int = 16384
-"""RFC 9113 §6.5.2 mandates 16384 (2^14) as both the protocol
-default and the minimum any peer must accept."""
-
-comptime _H2_DEFAULT_MAX_HEADER_LIST_SIZE: Int = 16384
-"""RFC 9113 §6.5.2 default is unbounded; flare caps it because every
-production proxy / origin we'd reasonably ship behind caps the header
-list aggressively to defang request smuggling + header pollution
-shaped at h2.
-
-16 KiB rather than the 8 KiB flare shipped through v0.9: the size is
-accounted with RFC 7541 §4.1's +32 bytes per field, so 8 KiB rejected
-header lists that every other implementation accepts -- h2spec's
-CONTINUATION test sends one at 8269 accounted bytes. 16 KiB matches
-hyper's default and still bounds the accumulation hard."""
-
-comptime _H2_DEFAULT_HEADER_TABLE_SIZE: Int = 4096
-"""RFC 7541 §4.2 default for the HPACK dynamic table size."""
-
-
-@fieldwise_init
-struct Http2Config(Copyable, Defaultable, Movable):
-    """Tunable HTTP/2 SETTINGS for an :class:`Http2Connection`.
-
-    All five fields map 1:1 to RFC 9113 §6.5.2 SETTINGS identifiers
-    (plus the RFC 7541 HPACK header-table size). Defaults are the
-    production-shape numbers flare's reactor wiring uses for both
-    the inline test driver in :mod:`tests.test_h2_server` and the
-    reactor-attached driver.
-
-    The ``allow_huffman_decode`` flag gates HPACK Huffman decoding
-    on the inbound HEADERS path. **Default ``True``, and it should
-    stay that way.** RFC 7541 sec 5.2 lets the *encoder* choose
-    whether a literal is Huffman-coded and signals it with the H bit;
-    a decoder does not get the same choice. curl, every browser, and
-    h2load Huffman-code by default, so a server that rejects H=1
-    cannot talk to them -- it answers the client's first HEADERS
-    frame by tearing down the connection. This defaulted to ``False``
-    through v0.9, which is why flare's h2 interop was only ever
-    exercised against flare's own client (which emits H=0).
-
-    Set it to ``False`` only to reproduce the legacy raw-literal
-    wire for a specific peer.
-
-    The ``allow_huffman_encode`` flag is the emit-side twin and
-    legitimately defaults to ``False``: what a server *sends* is its
-    own choice, H=0 output is CRIME-class-side-channel-free by
-    construction, and every compliant client accepts it. Set it
-    ``True`` to pick the shorter of raw vs Huffman per literal.
-
-    Example:
-
-    ```mojo
-    from flare.http2 import Http2Connection, Http2Config
-
-    var cfg = Http2Config(
-        max_concurrent_streams=200,
-        initial_window_size=131072,
-        max_frame_size=32768,
-        max_header_list_size=16384,
-        header_table_size=8192,
-        allow_huffman_decode=True,
-        allow_huffman_encode=False,
-    )
-    var conn = Http2Connection.with_config(cfg)
-    ```
-
-    Fields:
-        max_concurrent_streams: SETTINGS_MAX_CONCURRENT_STREAMS
-            (RFC 9113 §6.5.2). Bounds the per-connection live-stream
-            count.
-        initial_window_size: SETTINGS_INITIAL_WINDOW_SIZE
-            (RFC 9113 §6.5.2). Per-stream flow-control receive
-            window the server advertises on inbound connections.
-            Must be ``<= 2^31 - 1`` per RFC 9113 §6.9.2.
-        max_frame_size: SETTINGS_MAX_FRAME_SIZE (RFC 9113 §6.5.2).
-            Largest frame payload the server is willing to accept.
-            Must be in ``[16384, 16777215]`` per RFC 9113 §6.5.2.
-        max_header_list_size: SETTINGS_MAX_HEADER_LIST_SIZE
-            (RFC 9113 §6.5.2). Header-list size cap (uncompressed,
-            including 32-byte per-entry overhead).
-        header_table_size: SETTINGS_HEADER_TABLE_SIZE (RFC 7541
-            §4.2). HPACK dynamic-table size budget.
-        allow_huffman_decode: When ``True``, the HPACK decoder
-            accepts H=1 literals (Huffman-encoded) via the RFC
-            7541 Appendix B codec. Defaults to ``False`` --
-            reject-by-default until soak data justifies flipping
-            it on.
-        allow_huffman_encode: When ``True``, the HPACK encoder
-            picks the shorter of raw vs Huffman per emitted
-            literal (size-only optimisation; H=1 frames remain
-            CRIME-safe because the encoder dynamic table stays
-            empty). Defaults to ``False`` -- H=0-only wire
-            output until peers and soak data confirm interop.
-    """
-
-    var max_concurrent_streams: Int
-    var initial_window_size: Int
-    var max_frame_size: Int
-    var max_header_list_size: Int
-    var header_table_size: Int
-    var allow_huffman_decode: Bool
-    var allow_huffman_encode: Bool
-    var enable_connect_protocol: Bool
-    # ``enable_connect_protocol``: when True, the server advertises
-    # SETTINGS_ENABLE_CONNECT_PROTOCOL=1 (RFC 8441) in its initial
-    # SETTINGS frame, allowing peers to issue Extended CONNECT
-    # requests (the WebSocket-over-HTTP/2 bootstrap). Default
-    # False -- the unified flare.http.HttpServer flips this on
-    # automatically when the WebSocket-over-HTTP/2 bridge is
-    # wired in (Phase 6).
-
-    def __init__(out self):
-        """Default to the production-shape SETTINGS pinned in
-        the design doc: 100 concurrent streams, 64 KiB-1 initial
-        window, 16 KiB max frame, 8 KiB max header list, 4 KiB
-        HPACK dynamic table, Huffman decode **on** and encode off,
-        Extended CONNECT disabled.
-        """
-        self.max_concurrent_streams = _H2_DEFAULT_MAX_CONCURRENT_STREAMS
-        self.initial_window_size = _H2_DEFAULT_INITIAL_WINDOW_SIZE
-        self.max_frame_size = _H2_DEFAULT_MAX_FRAME_SIZE
-        self.max_header_list_size = _H2_DEFAULT_MAX_HEADER_LIST_SIZE
-        self.header_table_size = _H2_DEFAULT_HEADER_TABLE_SIZE
-        self.allow_huffman_decode = True
-        self.allow_huffman_encode = False
-        self.enable_connect_protocol = False
-
-    def validate(self) raises -> None:
-        """Raise if any field violates the RFC 9113 / RFC 7541 bounds.
-
-        The reactor-side wiring calls this once at acceptor handoff
-        so a misconfigured server fails fast at boot rather than
-        emitting malformed SETTINGS frames mid-handshake.
-        """
-        if self.max_concurrent_streams < 0:
-            raise Error("Http2Config: max_concurrent_streams must be >= 0")
-        if self.initial_window_size < 0:
-            raise Error("Http2Config: initial_window_size must be >= 0")
-        if self.initial_window_size > 0x7FFFFFFF:
-            raise Error(
-                "Http2Config: initial_window_size must be <= 2^31-1"
-                " (RFC 9113 §6.9.2)"
-            )
-        if self.max_frame_size < H2_DEFAULT_FRAME_SIZE:
-            raise Error(
-                "Http2Config: max_frame_size must be >= 16384 (RFC 9113 §6.5.2)"
-            )
-        if self.max_frame_size > 16777215:
-            raise Error(
-                "Http2Config: max_frame_size must be <= 2^24-1"
-                " (RFC 9113 §6.5.2)"
-            )
-        if self.max_header_list_size < 0:
-            raise Error("Http2Config: max_header_list_size must be >= 0")
-        if self.header_table_size < 0:
-            raise Error("Http2Config: header_table_size must be >= 0")
 
 
 # ── ALPN / h2c detection ────────────────────────────────────────────────
@@ -296,16 +130,6 @@ struct Http2Connection(Defaultable, Movable):
     is re-pumped when a WINDOW_UPDATE arrives."""
     var pending_pos: Dict[Int, Int]
     """Offset already flushed out of the matching ``pending_body``."""
-    var pending_tk: Dict[Int, List[String]]
-    """Trailer field names owed to a stream whose body is still draining.
-
-    A gRPC response ends in trailing HEADERS (``grpc-status``), and a body
-    parked by a closed window has not reached them yet. Holding them here is
-    what lets the window-aware path serve a trailered response: the trailers
-    are emitted by :meth:`pump_pending` when the last body byte goes out, not
-    dropped because the response could not be framed in one shot."""
-    var pending_tv: Dict[Int, List[String]]
-    """Trailer field values paired with :attr:`pending_tk`."""
 
     def __init__(out self):
         """Default-construct with :class:`Http2Config` defaults.
@@ -322,8 +146,6 @@ struct Http2Connection(Defaultable, Movable):
         self.config = Http2Config()
         self.pending_body = Dict[Int, List[UInt8]]()
         self.pending_pos = Dict[Int, Int]()
-        self.pending_tk = Dict[Int, List[String]]()
-        self.pending_tv = Dict[Int, List[String]]()
 
     @staticmethod
     def with_config(var config: Http2Config) raises -> Http2Connection:
@@ -349,6 +171,7 @@ struct Http2Connection(Defaultable, Movable):
         var out = Http2Connection()
         out.config = config^
         out.conn.max_concurrent_streams = out.config.max_concurrent_streams
+        out.conn.max_request_body_size = out.config.max_body_size
         out.conn.initial_window_size = out.config.initial_window_size
         out.conn.send_window = out.config.initial_window_size
         out.conn.recv_window = out.config.initial_window_size
@@ -574,6 +397,18 @@ struct Http2Connection(Defaultable, Movable):
         self.outbox = List[UInt8]()
         return out^
 
+    def _mark_response_started(mut self, sid: Int) raises:
+        """Record that ``sid`` has had a response scheduled.
+
+        Called by both response paths. Idempotent, and a no-op on a
+        stream that is already gone.
+        """
+        if sid not in self.conn.streams:
+            return
+        var s = self.conn.streams[sid].copy()
+        s.response_started = True
+        self.conn.streams[sid] = s^
+
     def take_completed_streams(self) -> List[Int]:
         """Return stream ids whose request is fully buffered."""
         var ids = List[Int]()
@@ -583,15 +418,29 @@ struct Http2Connection(Defaultable, Movable):
             # eagerly inside ``items()`` so this loop never aliases the
             # slab's owned storage.
             var s = entry[1].copy()
-            # Skip streams already dispatched: ``emit_response`` moves a
-            # served stream to ``CLOSED``, but ``headers_complete`` /
-            # ``data_complete`` stay set. Without this guard a second
-            # ``on_readable`` (e.g. an EAGAIN re-pump on macOS loopback,
-            # or any later readable event in the live reactor) would
-            # re-return the same id and double-dispatch the handler.
+            # Skip streams already dispatched. Two things can mark a
+            # stream as served. ``emit_response`` moves a fully written
+            # one to ``CLOSED`` while ``headers_complete`` /
+            # ``data_complete`` stay set, so without the state check a
+            # second ``on_readable`` (an EAGAIN re-pump on macOS
+            # loopback, or any later readable event in the live reactor)
+            # re-returns the id and double-dispatches the handler.
+            #
+            # ``response_started`` covers the case the state check
+            # cannot: a response whose body is larger than the peer's
+            # send window is parked in ``pending_body`` and its stream
+            # stays open until the remainder drains. Every WINDOW_UPDATE
+            # from that peer arrives as a readable event, so a
+            # state-only guard re-ran the handler and re-sent the
+            # response head on each one -- which the peer is right to
+            # reject, a second HEADERS block without END_STREAM being a
+            # protocol error (RFC 9113 sec 8.1). Any client advertising
+            # the default 65535-byte window hit this on the first
+            # response larger than that.
             if (
                 s.headers_complete
                 and s.data_complete
+                and not s.response_started
                 and s.state.value != StreamState.CLOSED().value
             ):
                 ids.append(s.id)
@@ -660,6 +509,7 @@ struct Http2Connection(Defaultable, Movable):
         """
         if sid not in self.conn.streams:
             raise Error("h2: emit_response on unknown stream")
+        self._mark_response_started(sid)
         # Window-aware buffered response (RFC 9113 sec 6.9 / sec 4.2): a
         # peer that advertised a 1-byte window gets 1 byte now and the
         # rest on its WINDOW_UPDATE, and a body past max_frame_size is
@@ -668,17 +518,7 @@ struct Http2Connection(Defaultable, Movable):
         # Only taken when the body does not fit; the common case keeps
         # the one-shot framing below, END_STREAM riding the single DATA
         # frame, so the wire shape is unchanged for ordinary responses.
-        #
-        # Trailered responses take it too. They used to be excluded, which
-        # meant every gRPC response -- they all carry ``grpc-status`` --
-        # skipped the window and the frame-size split and went out as one
-        # unsplit DATA frame. That is fine while a body is small and a
-        # connection error once it is not: a 8 MB reply is both an oversized
-        # frame (RFC 9113 sec 4.2) and a flow-control violation (sec 6.9), and
-        # the peer answers by killing the connection. The symptom is a client
-        # reporting "Stream removed (Socket closed)" against a server that
-        # logs nothing, because from the server's side the write succeeded.
-        if len(resp.body) > 0:
+        if len(resp.trailers._keys) == 0 and len(resp.body) > 0:
             var st = self.conn.streams[sid].copy()
             var budget = (
                 self.conn.send_window if self.conn.send_window
@@ -690,23 +530,13 @@ struct Http2Connection(Defaultable, Movable):
             )
             if too_big:
                 var body = resp.body.copy()
-                # Captured before the move: ``begin_stream_response`` takes
-                # ``resp`` and emits only the leading block, so the trailers
-                # have to be held until the body has drained.
-                var tk = List[String]()
-                var tv = List[String]()
-                for i in range(len(resp.trailers._keys)):
-                    tk.append(resp.trailers._keys[i])
-                    tv.append(resp.trailers._values[i])
                 self.begin_stream_response(sid, resp^)
                 var n = self.queue_stream_data(sid, Span[UInt8, _](body))
                 if n < len(body):
                     self.pending_body[sid] = body^
                     self.pending_pos[sid] = n
-                    self.pending_tk[sid] = tk^
-                    self.pending_tv[sid] = tv^
                     return  # open until the remainder drains
-                self.end_stream_response(sid, tk, tv)
+                self.end_stream_response(sid, List[String](), List[String]())
                 return
         # Build HpackHeader list from the response's HeaderMap.
         # HTTP/2 forbids ``Connection`` / ``Transfer-Encoding`` / ``Keep-Alive``
@@ -715,7 +545,7 @@ struct Http2Connection(Defaultable, Movable):
         for i in range(len(resp.headers._keys)):
             var k = resp.headers._keys[i]
             var v = resp.headers._values[i]
-            var lk = String(capacity=k.byte_length() + 1)
+            var lk = String(capacity_bytes=k.byte_length() + 1)
             var kp = k.unsafe_ptr()
             for j in range(k.byte_length()):
                 var c = Int(kp[unsafe_offset=j])
@@ -740,7 +570,7 @@ struct Http2Connection(Defaultable, Movable):
         for i in range(len(resp.trailers._keys)):
             var tk = resp.trailers._keys[i]
             var tv = resp.trailers._values[i]
-            var ltk = String(capacity=tk.byte_length() + 1)
+            var ltk = String(capacity_bytes=tk.byte_length() + 1)
             var tkp = tk.unsafe_ptr()
             for j in range(tk.byte_length()):
                 var tc = Int(tkp[unsafe_offset=j])
@@ -785,16 +615,7 @@ struct Http2Connection(Defaultable, Movable):
             var n = self.queue_parked_body(sid, Span(body), pos)
             if pos + n >= total:
                 _ = self.pending_pos.pop(sid)
-                # Whatever trailers the response owed, emitted now that its
-                # last body byte is out. An empty list here would close a
-                # gRPC stream with no ``grpc-status``, which a client reads
-                # as a broken call rather than a completed one.
-                var tk = List[String]()
-                var tv = List[String]()
-                if sid in self.pending_tk:
-                    tk = self.pending_tk.pop(sid)
-                    tv = self.pending_tv.pop(sid)
-                self.end_stream_response(sid, tk, tv)
+                self.end_stream_response(sid, List[String](), List[String]())
             else:
                 self.pending_body[sid] = body^
                 self.pending_pos[sid] = pos + n
@@ -863,6 +684,7 @@ struct Http2Connection(Defaultable, Movable):
         """
         if sid not in self.conn.streams:
             raise Error("h2: begin_stream_response on unknown stream")
+        self._mark_response_started(sid)
         var hdrs = List[HpackHeader]()
         for i in range(len(resp.headers._keys)):
             var lk = _lower_ascii(resp.headers._keys[i])
@@ -886,9 +708,7 @@ struct Http2Connection(Defaultable, Movable):
         """How many body bytes may go out on `sid` right now.
 
         The min of the connection and stream send windows — the same bound
-        `queue_stream_data` applies, exposed so a caller can size what it
-        hands over rather than handing over everything and being told how
-        much fitted.
+        `queue_stream_data` applies, asked before the copy rather than after.
         """
         if sid not in self.conn.streams:
             return 0
@@ -910,9 +730,9 @@ struct Http2Connection(Defaultable, Movable):
         28 MiB response copies about 6 GB to send 28 MB. Asking the window
         first makes each pump cost a window, not a body.
 
-        Returns the bytes consumed. Both pump paths -- a buffered response
-        here and a streaming one in `Http2ConnHandle` -- go through this
-        rather than repeating it.
+        Returns the bytes consumed, which the caller adds to its own offset.
+        Both pump paths — a buffered response here and a streaming one in
+        `Http2ConnHandle` — go through this rather than repeating it.
         """
         var budget = self._send_budget(sid)
         if budget <= 0:
@@ -964,8 +784,8 @@ struct Http2Connection(Defaultable, Movable):
             df.header.flags = FrameFlags()
             # Two copies of the payload, both in one go: `data` into the
             # frame, and the encoded frame into the outbox. A byte at a time
-            # they were the whole cost of a large response — every byte of a
-            # 28 MiB gRPC message appended twice, individually.
+            # they are the whole cost of a large response — every byte of it
+            # appended twice, individually.
             var pl = List[UInt8]()
             pl.extend(data[sent : sent + take])
             df.payload = pl^

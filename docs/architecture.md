@@ -58,13 +58,13 @@ flare.http     HTTP/1.1 client + reactor server + Handler / Router
                + content-encoding (gzip + brotli)
                + signed cookies + typed Session[T] stores
                + HTTP/1.1 trailers (parse + emit) + multi-listener
-               HttpServer.bind_many + HttpClient.with_pool
+               HttpServer.bind(addrs) + HttpClient.with_pool
                connection pool + h2c-via-Upgrade client.
                Sans-I/O parser sublayer under flare.http.proto.*
                with _ExperimentalH1LeniencyConfig (future-policy
                knobs; the strict default is the only wire shape
                currently enforced); conformance corpora under
-               conformance/h1/ + conformance/ws/. Template
+               tests/conformance/h1/ + tests/conformance/ws/. Template
                engine with single-level inheritance via {% block %}
                + {% extends %}. RFC 9111 cache primitives --
                CacheControl directive parser, CacheKey + Vary-
@@ -113,8 +113,9 @@ flare.quic     Sans-I/O QUIC v1 codec primitives + pure state
                buffer; transport-parameter codec (RFC 9000 §18);
                connection + stream state machines (RFC 9000 §3,
                §10, §13); CUBIC + HyStart++ congestion
-               controller + RFC 9002 §7.7 pacing budget as pure
-               functions over a `CcState` value. The
+               controller as pure functions over a `CcState`
+               value. The congestion window gates egress on both
+               peers; RFC 9002 §7.7 pacing is not wired. The
                `CongestionController` trait pairs a CUBIC default
                (production) with a Reno fallback (deterministic
                tests) per RFC 9002 Appendix B.

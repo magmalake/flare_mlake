@@ -36,7 +36,7 @@ References:
 """
 
 from std.collections import List, Optional
-from std.memory import UnsafePointer
+from std.memory import Pointer
 
 from ..http.url import Url
 from ..http2.client import Http2ClientConnection
@@ -89,7 +89,7 @@ struct WsWireChoice:
 # ── Configuration carrier ──────────────────────────────────────────────
 
 
-struct WsAutoClientConfig(Copyable, Defaultable, Movable):
+struct WsAutoClientConfig(Copyable, Defaultable):
     """Inputs to :class:`WsAutoClient`'s wire-selection.
 
     The carrier holds the URL + the protocol preferences; the

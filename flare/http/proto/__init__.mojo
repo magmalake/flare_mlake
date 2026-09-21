@@ -14,7 +14,7 @@ for ``String`` / ``List[UInt8]`` allocation. The strict contract:
 - No imports from ``flare.net`` (socket address resolution).
 
 The contract is enforced statically by ``pixi run check-sans-io``
-which scans every file registered in ``tools/check_sans_io.sh``
+which scans every file registered in ``tests/tools/check_sans_io.sh``
 for the forbidden import prefixes. Adding a file to the sans-I/O
 list is a one-line change in that script.
 
@@ -202,3 +202,4 @@ from flare.http.proto.ascii import (
 # Both ``flare.http2.server.detect_h2c_upgrade`` and the unified
 # reactor's per-conn helper delegate to this canonical surface.
 from flare.http.proto.h2c_upgrade import detect_h2c_upgrade
+from flare.http.proto.h2_config import Http2Config

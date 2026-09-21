@@ -45,8 +45,7 @@ from flare.http.cache import (
 )
 
 
-@fieldwise_init
-struct DemoApp(Copyable, Defaultable, Handler, Movable):
+struct DemoApp(Copyable, Defaultable, Handler):
     """Tiny app that serves two cacheable JSON endpoints + one
     no-store endpoint. The inner handler is intentionally
     self-describing: every response carries a fresh timestamp in
@@ -54,10 +53,8 @@ struct DemoApp(Copyable, Defaultable, Handler, Movable):
     a cache miss (which gets a fresh timestamp) are visually
     distinguishable when you read the trace."""
 
-    var _placeholder: UInt8
-
     def __init__(out self):
-        self._placeholder = UInt8(0)
+        pass
 
     def serve(self, req: Request) raises -> Response:
         if req.url == String("/no-store"):

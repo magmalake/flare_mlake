@@ -40,10 +40,10 @@ def main() raises:
 ## Why flare
 
 - **Batteries included:** HTTP/1.1, HTTP/2, and HTTP/3 over QUIC (server + client), WebSocket (RFC 6455 + permessage-deflate), gRPC, TLS 1.2/1.3 + mTLS + in-process HTTPS termination (`bind_tls` / `serve_tls`), streaming responses on every wire (one handler streams byte-identically over h1 / h2 / h3 / https), sessions, gzip + brotli, CORS, static files, SSE, templates, RFC 9111 caching, and an OpenAPI 3.1 emitter. Full inventory in [`docs/features.md`](docs/features.md).
-- **Composable by types, not callbacks:** `Handler` is a trait; `Router`, middleware, and typed extractors (`PathInt`, `Json[T]`, `Cookies`, ...) compose by nesting structs, monomorphised into one direct call sequence per request type with no virtual dispatch.
+- **Composable by types, not callbacks:** `Handler` is a trait; `Router`, middleware, and typed extractors (`PathInt`, `JsonAs[T]`, `Cookies`, ...) compose by nesting structs, monomorphised into one direct call sequence per request type with no virtual dispatch.
 - **Hard to misuse under load:** Per-request `Cancel` tokens, graceful drain, sanitized 4xx/5xx, TLS cert reload, structured logging, Prometheus metrics, and an in-process `TestClient[H]`.
 - **Fast, with a tight tail:** Thread-per-core reactor (`kqueue` / `epoll`, opt-in `io_uring`); top-of-pack throughput with a p99 median that ties `actix_web` and beats `hyper` / `axum`, plus [match-or-beat-quiche on HTTP/3](#performance).
-- **Fuzzed:** 62 fuzz harnesses, 9M+ runs, zero known crashes; ASan + assert-mode coverage on every FFI boundary.
+- **Fuzzed:** 63 fuzz harnesses, 9M+ runs, zero known crashes; ASan + assert-mode coverage on every FFI boundary.
 
 ## Install
 
@@ -101,7 +101,7 @@ def main() raises:
 
 `srv.serve(r^)` accepts any `Handler`. Multi-worker (`num_workers=N`) needs a `Copyable` handler (each worker gets its own `H.copy()`); `Router` qualifies because its routes sit behind an Arc-style refcount. Bare functions and `ComptimeRouter[ROUTES]` work the same.
 
-`flare.prelude` re-exports the everyday surface (`Request`, `Response`, `Router`, `HttpServer`, the `ok` / `ok_json` / `not_found` / ... builders, `Method` / `Status`, the `Handler` family, `SocketAddr`). Everything else (extractors, middleware, sessions, transports) stays an explicit `from flare.http import ...` so imports document intent, which is why the Intermediate example below spells them out.
+`flare.prelude` and the root `flare` package export the same list: `Request`, `Response`, `Router`, `HttpServer`, the `ok` / `ok_json` / `not_found` / ... builders, `Method` / `Status`, the `Handler` family, `SocketAddr`, the extractors, the stock middleware, sessions, and the TCP / TLS / Unix / WebSocket types. A symbol is on it if another exported symbol's signature names it, or if the examples below need it. Wire-format codecs, runtime primitives and anything in a `_`-prefixed module are not, and keep their own import: `from flare.http2 import Http2Connection`. The Intermediate example spells its imports out because naming the module you took something from is the better habit in code meant to last, not because the prelude lacks them.
 
 `raises` is optional and tracks the body: drop it when the handler cannot fail, keep it when it parses input or does I/O (the server converts a raise to a sanitized 500). Both shapes bind at the same `Router.get(...)` call. For stateful infallible handlers see [`HandlerInfallible`](examples/intermediate/infallible_handler.mojo).
 
@@ -109,7 +109,7 @@ Free: 404 on unknown paths, 405 with `Allow`, sanitized 4xx/5xx, peer-FIN cancel
 
 ### Intermediate: typed extractors
 
-When handlers need structured input, make each `Handler` a struct whose fields *are* the inputs. `PathInt["id"]` / `QueryInt` / `HeaderStr` / `Form[T]` / `Multipart` / `Cookies` / ... parse and validate at extraction; `Extracted[H]` pulls them in before `serve`. Bad values become a sanitized 400, so `serve` only sees well-typed values.
+When handlers need structured input, make each `Handler` a struct whose fields *are* the inputs. `PathInt["id"]` / `QueryInt` / `HeaderStr` / `Form` / `JsonAs[T]` / `Multipart` / `Cookies` / ... parse and validate at extraction; `Extracted[H]` pulls them in before `serve`. Bad values become a sanitized 400, so `serve` only sees well-typed values.
 
 ```mojo
 from flare.http import (
@@ -122,7 +122,7 @@ def home(req: Request) raises -> Response:
     return ok("home")
 
 @fieldwise_init
-struct GetUser(Copyable, Defaultable, Handler, Movable):
+struct GetUser(Copyable, Defaultable, Handler):
     var id: PathInt["id"]
 
     def __init__(out self):
@@ -134,7 +134,7 @@ struct GetUser(Copyable, Defaultable, Handler, Movable):
 def main() raises:
     var r = Router()
     r.get("/", home)
-    r.get[Extracted[GetUser]]("/users/:id", Extracted[GetUser]())
+    r.get("/users/:id", Extracted[GetUser]())
     HttpServer.bind(SocketAddr.localhost(8080)).serve(r^, num_workers=4)
 ```
 
@@ -150,7 +150,7 @@ Three independent patterns. Pick the ones your workload needs.
 from flare.http import CancelHandler, Cancel, Request, Response, ok
 
 @fieldwise_init
-struct SlowHandler(CancelHandler, Copyable, Movable):
+struct SlowHandler(CancelHandler, Copyable):
     def serve(self, req: Request, cancel: Cancel) raises -> Response:
         for i in range(100):
             if cancel.cancelled():
@@ -195,7 +195,7 @@ from flare.http import Router, Request, Response, Handler, ok, HttpServer
 from flare.net import SocketAddr
 
 @fieldwise_init
-struct Counters(Copyable, Movable):
+struct Counters(Copyable):
     var hits: Int
 
 def home(req: Request) raises -> Response:
@@ -219,7 +219,7 @@ def main() raises:
     srv.serve(WithHits(inner=router^, counters=Counters(hits=37)))
 ```
 
-For `serve_static`, `serve_comptime[handler, config]` (build-time invariant checks), shared-listener multi-worker mode, and the cross-worker `WorkerHandoffPool`, see [`docs/cookbook.md`](docs/cookbook.md) and the linked examples.
+For `serve_static`, `ServerConfig.check[config]()` (build-time invariant checks), shared-listener multi-worker mode, and the cross-worker `WorkerHandoffPool`, see [`docs/cookbook.md`](docs/cookbook.md) and the linked examples.
 
 ### Streaming proxy: relay an upstream with backpressure
 
@@ -242,15 +242,37 @@ struct Proxy(Movable, StreamHandler):
     def on_upstream(mut self, mut conn: StreamConn) raises:
         conn.relay_upstream()
 
-    def on_writable(mut self, mut conn: StreamConn) raises: pass
-    def on_close(mut self, mut conn: StreamConn) raises: pass
-
 def main() raises:
     var srv = HttpServer.bind(SocketAddr.localhost(8080))
     srv.serve_streaming(Proxy("/run/backend.sock"))
 ```
 
 `set_watermarks` couples the two pipes: when the relay buffer crosses the high mark the reactor stops reading upstream until it drains to the low mark, so a slow consumer cannot force unbounded buffering. A client disconnect propagates a `CANCEL` upstream. Runnable version: [`examples/advanced/streaming_proxy.mojo`](examples/advanced/streaming_proxy.mojo).
+
+### Streaming client: a body larger than memory, in one call
+
+The client side of the same idea, new in v0.11. One entry point covers every wire: ALPN settles HTTP/2 against HTTP/1.1 on `https://`, and `http://` speaks HTTP/1.1, or prior-knowledge h2c when asked. Nothing buffers the body.
+
+```mojo
+from flare.http import HttpClient
+
+def main() raises:
+    var c = HttpClient()
+    var r = c.get_streaming("https://example.com/big.bin")
+    r.raise_for_status()
+    print(r.status, "on", r.protocol())
+
+    var total = 0
+    while True:
+        var chunk = r.read_chunk(65536)
+        if len(chunk) == 0:
+            break
+        total += len(chunk)
+    r.close()
+    print("read", total, "bytes")
+```
+
+Uploads go the other way through `send_chunked`, pulling from a `ChunkSource` with an optional known `body_size` and a real `Cancel`. Runnable: [`examples/advanced/http_stream_client.mojo`](examples/advanced/http_stream_client.mojo) and [`examples/advanced/streaming_upload.mojo`](examples/advanced/streaming_upload.mojo). HTTP/3 has a reader but no entry point wires to it yet; see the known gaps in [`docs/features.md`](docs/features.md).
 
 ## Performance
 
@@ -397,7 +419,7 @@ pixi install                  # lean: tests, examples, microbench, format-check
 pixi install -e dev           # adds mojodoc + pre-commit
 ```
 
-flare uses four pixi environments, layered:
+flare uses five pixi environments, layered:
 
 | Env | Adds | What it unlocks |
 |---|---|---|
@@ -412,8 +434,11 @@ Common tasks (run with `pixi run [--environment <env>] <task>`):
 |---|---|---|
 | `tests` | `default` | Full unit + integration suite plus every example under [`examples/`](examples/) |
 | `format-check` / `format` | `default` / `dev` | `mojo format` over `flare`, `tests`, `benchmark`, `examples`, `fuzz` |
+| `check-sans-io` / `check-no-http-http2-cycle` / `check-reactor-size` / `check-example-tasks` | `default` | The four structural lints CI runs on a bare checkout: the sans-io core imports no I/O, `flare.http` and `flare.http2` stay acyclic, per-file size caps with a dated allowlist, and every example is run by something. A few seconds each, no toolchain needed |
+| `interop-smoke` | `default` | Talk to flare with software we did not write: curl and h2load on every wire, plus flare's own streaming client pulling a megabyte on each |
+| `conformance` | `default` | h2spec and the Autobahn WebSocket suite, each gated against a documented known-fail list; a leg whose binary is not provisioned skips rather than passing |
 | `docs` / `docs-build` | `dev` | mojodoc-rendered package docstring (live or static) |
-| `fuzz-all` | `fuzz` | Every harness in [`fuzz/`](fuzz/) (62 harnesses, 9M+ runs combined) |
+| `fuzz-all` | `fuzz` | Every harness in [`fuzz/`](fuzz/) (63 harnesses, 9M+ runs combined) |
 | `fuzz-<name>` / `prop-<name>` | `fuzz` | Single harness - see [`pixi.toml`](pixi.toml) for the full list |
 | `bench-vs-baseline-quick` | `bench` | flare vs Go `net/http`, throughput config (~7 min) |
 | `bench-vs-baseline` | `bench` | flare vs all baselines (Go, nginx, hyper, axum, actix_web), all configs |
@@ -425,7 +450,9 @@ Common tasks (run with `pixi run [--environment <env>] <task>`):
 
 ```bash
 pixi run tests                                          # full suite + every example under examples/
-pixi run --environment fuzz fuzz-all                    # 62 harnesses
+pixi run tests-gen                                      # regenerate tests/_agg after adding a test file
+pixi run mojo -I . tests/http/test_router.mojo          # one test file on its own
+pixi run --environment fuzz fuzz-all                    # 63 harnesses
 pixi run --environment bench bench-vs-baseline-quick    # ~7 min
 ```
 

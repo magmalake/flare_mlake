@@ -16,7 +16,7 @@ from flare.testing import TestClient
 
 
 @fieldwise_init
-struct EchoMethodHandler(Copyable, Handler, Movable):
+struct EchoMethodHandler(Copyable, Handler):
     """Returns the request method in the body so tests can
     confirm the TestClient dispatched correctly."""
 
@@ -44,7 +44,7 @@ def _bytes_of(s: String) -> List[UInt8]:
     var out = List[UInt8]()
     var p = s.unsafe_ptr()
     for i in range(s.byte_length()):
-        out.append(p[i])
+        out.append(p[unsafe_offset=i])
     return out^
 
 

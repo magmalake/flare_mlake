@@ -27,13 +27,22 @@ from flare.net._libc import (
     _close,
     _connect,
     _fill_sockaddr_in,
+    _recv,
     _send,
     _socket,
     _strerror,
     get_errno,
 )
+from flare.tcp import TcpStream
 from flare.tls import TlsConfig, TlsStream
-from flare.http import HttpClient, HttpServer, Request, Response, ok
+from flare.http import (
+    FnHandler,
+    HttpClient,
+    HttpServer,
+    Request,
+    Response,
+    ok,
+)
 from flare.http.body import ChunkSource
 from flare.http.cancel import Cancel
 from flare.http.response import stream_response
@@ -47,12 +56,12 @@ def _connect_loopback(port: UInt16) raises -> c_int:
         raise Error("socket() failed: " + _strerror(get_errno().value))
     var sa = stack_allocation[16, UInt8]()
     for i in range(16):
-        (sa + i).unsafe_write(UInt8(0))
+        (sa.unsafe_offset(i)).unsafe_write(UInt8(0))
     var ip = stack_allocation[4, UInt8]()
-    (ip + 0).unsafe_write(UInt8(127))
-    (ip + 1).unsafe_write(UInt8(0))
-    (ip + 2).unsafe_write(UInt8(0))
-    (ip + 3).unsafe_write(UInt8(1))
+    (ip.unsafe_offset(0)).unsafe_write(UInt8(127))
+    (ip.unsafe_offset(1)).unsafe_write(UInt8(0))
+    (ip.unsafe_offset(2)).unsafe_write(UInt8(0))
+    (ip.unsafe_offset(3)).unsafe_write(UInt8(1))
     _fill_sockaddr_in(sa, port, ip)
     if _connect(c, sa, c_int(16).cast[DType.uint32]()) < c_int(0):
         var msg = _strerror(get_errno().value)
@@ -80,7 +89,7 @@ def _hello(req: Request) raises -> Response:
 
 
 @fieldwise_init
-struct _ThreeChunks(ChunkSource, Copyable, Movable):
+struct _ThreeChunks(ChunkSource, Copyable):
     var idx: Int
 
     def next(mut self, cancel: Cancel) raises -> Optional[List[UInt8]]:
@@ -126,7 +135,7 @@ def _read_until_close(mut stream: TlsStream) -> String:
         if n <= 0:
             break
         for i in range(n):
-            acc.append(tmp[i])
+            acc.append(tmp[unsafe_offset=i])
     return String(unsafe_from_utf8=Span[UInt8, _](acc))
 
 
@@ -323,6 +332,133 @@ def test_https_multi_worker() raises:
     assert_equal(ok_count, 4)
 
 
+def test_https_single_worker_explicit_serves_tls() raises:
+    """Regression: ``serve_tls(handler, 1)`` used to serve plaintext.
+
+    An explicit worker count routes ``serve_tls`` into
+    ``serve[H: Handler & Copyable]``, whose ``num_workers <= 1`` branch
+    called the unified reactor loop without passing
+    ``self._tls_ctx_addr()``. That parameter defaults to ``0``, so every
+    accepted connection was registered as a plaintext ``ConnHandle`` and
+    an HTTPS port answered ClientHello bytes in cleartext.
+
+    The arity-1 ``serve_tls`` and the ``num_workers >= 2`` path both
+    passed the context, which is why nothing caught it: before this test
+    no call site in the repo had ever given ``serve_tls`` a worker count.
+    """
+    var srv = HttpServer.bind_tls(
+        SocketAddr(IpAddr.parse("127.0.0.1"), UInt16(0)),
+        _SERVER_CRT,
+        _SERVER_KEY,
+        alpn=_alpn_h1(),
+    )
+    var port = UInt16(srv.local_addr().port)
+
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve_tls(FnHandler(_hello), 1)
+        except:
+            pass
+        exit()
+    usleep(300000)
+
+    var got = String("")
+    var raised = False
+    try:
+        var cfg = TlsConfig(ca_bundle=_CA_CRT)
+        var s = TlsStream.connect("localhost", port, cfg)
+        s.write_all(
+            Span[UInt8, _](
+                _bytes(
+                    "GET / HTTP/1.1\r\nHost: localhost\r\nConnection:"
+                    " close\r\n\r\n"
+                )
+            )
+        )
+        got = _read_until_close(s)
+        s.close()
+    except:
+        raised = True
+
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+    assert_true(not raised, "TLS handshake against serve_tls(h, 1) raised")
+    assert_true("200" in got, "expected 200, got: " + got)
+    assert_true("hello https" in got, "expected body, got: " + got)
+
+
+def test_https_single_worker_explicit_never_answers_cleartext() raises:
+    """The same port must not answer a cleartext HTTP request.
+
+    The direct assertion of the downgrade. Against the unfixed build a
+    plaintext ``GET`` on the TLS port came back as an ASCII ``HTTP/1.1``
+    status line. A real TLS listener cannot read that as a ClientHello,
+    so it answers with an alert record or closes without replying; the
+    short idle timeout bounds the read in the closing case.
+    """
+    var cfg_srv = ServerConfig(idle_timeout_ms=500)
+    var srv = HttpServer.bind_tls(
+        SocketAddr(IpAddr.parse("127.0.0.1"), UInt16(0)),
+        _SERVER_CRT,
+        _SERVER_KEY,
+        alpn=_alpn_h1(),
+        config=cfg_srv^,
+    )
+    var port = UInt16(srv.local_addr().port)
+
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve_tls(FnHandler(_hello), 1)
+        except:
+            pass
+        exit()
+    usleep(300000)
+
+    var n = 0
+    var first = UInt8(0)
+    var reply = List[UInt8]()
+    try:
+        var c = _connect_loopback(port)
+        var req = _bytes(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        var out = stack_allocation[128, UInt8]()
+        for i in range(len(req)):
+            (out.unsafe_offset(i)).unsafe_write(req[i])
+        _ = _send(c, out, c_size_t(len(req)), c_int(MSG_NOSIGNAL))
+
+        var buf = stack_allocation[64, UInt8]()
+        n = Int(_recv(c, buf, c_size_t(64), c_int(0)))
+        if n > 0:
+            first = buf[unsafe_offset=0]
+            for i in range(n):
+                reply.append(buf[unsafe_offset=i])
+        _ = _close(c)
+    except:
+        pass
+
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+
+    var text = String(unsafe_from_utf8=Span[UInt8, _](reply))
+    assert_true(
+        not text.startswith("HTTP/1.1"),
+        "TLS port answered cleartext HTTP: " + text,
+    )
+    # ``n <= 0`` covers both an orderly close and the abrupt reset that
+    # OpenSSL produces when it gives up on the record layer; ``recv``
+    # reports the latter as -1 (ECONNRESET), not 0.
+    assert_true(
+        n <= 0 or first == UInt8(0x15) or first == UInt8(0x16),
+        "expected a TLS record or a close, got "
+        + String(n)
+        + " bytes starting with "
+        + String(Int(first)),
+    )
+
+
 def test_https_alpn_negotiates_h2() raises:
     """The server actually selects ``h2`` when the client offers it.
 
@@ -356,6 +492,91 @@ def test_https_alpn_negotiates_h2() raises:
         cfg.alpn.append("h2")
         cfg.alpn.append("http/1.1")
         var s = TlsStream.connect("localhost", port, cfg^)
+        negotiated = s.alpn_selected()
+        s.close()
+    except:
+        pass
+
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+    assert_equal(negotiated, "h2")
+
+
+def test_alpn_is_offered_by_connect_timeout() raises:
+    """``connect_timeout`` must offer ALPN, like ``connect`` does.
+
+    Only ``TlsStream.connect`` set the ALPN protocol list; the three
+    other entry points built their ``SSL_CTX`` without it, so anything
+    dialled through them silently negotiated nothing. ``HttpClient``
+    reaches TLS through ``connect_timeout`` and ``connect_over_tcp``,
+    never ``connect``, so on the pre-fix build the HTTP client could not
+    negotiate HTTP/2 over TLS at all regardless of what it advertised.
+    """
+    var srv = HttpServer.bind_tls(
+        SocketAddr(IpAddr.parse("127.0.0.1"), UInt16(0)),
+        _SERVER_CRT,
+        _SERVER_KEY,
+        alpn=_alpn_h2_first(),
+    )
+    var port = UInt16(srv.local_addr().port)
+
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve(_hello)
+        except:
+            pass
+        exit()
+    usleep(300000)
+
+    var negotiated = String("")
+    try:
+        var cfg = TlsConfig(ca_bundle=_CA_CRT)
+        cfg.alpn = List[String]()
+        cfg.alpn.append("h2")
+        cfg.alpn.append("http/1.1")
+        var s = TlsStream.connect_timeout("localhost", port, cfg^, 5000)
+        negotiated = s.alpn_selected()
+        s.close()
+    except:
+        pass
+
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+    assert_equal(negotiated, "h2")
+
+
+def test_alpn_is_offered_by_connect_over_tcp() raises:
+    """``connect_over_tcp`` must offer ALPN too.
+
+    This is the path a proxied HTTPS request takes after the CONNECT
+    tunnel is established, and the gRPC client's TLS path.
+    """
+    var srv = HttpServer.bind_tls(
+        SocketAddr(IpAddr.parse("127.0.0.1"), UInt16(0)),
+        _SERVER_CRT,
+        _SERVER_KEY,
+        alpn=_alpn_h2_first(),
+    )
+    var port = UInt16(srv.local_addr().port)
+
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve(_hello)
+        except:
+            pass
+        exit()
+    usleep(300000)
+
+    var negotiated = String("")
+    try:
+        var cfg = TlsConfig(ca_bundle=_CA_CRT)
+        cfg.alpn = List[String]()
+        cfg.alpn.append("h2")
+        cfg.alpn.append("http/1.1")
+        var tcp = TcpStream.connect(SocketAddr(IpAddr.parse("127.0.0.1"), port))
+        var s = TlsStream.connect_over_tcp(tcp^, "localhost", cfg^)
         negotiated = s.alpn_selected()
         s.close()
     except:
@@ -442,7 +663,7 @@ def test_stalled_handshake_does_not_block_other_clients() raises:
         # Raw TCP: one byte of a TLS record header, then silence.
         var stalled = _connect_loopback(port)
         var one = stack_allocation[1, UInt8]()
-        one[0] = UInt8(0x16)  # TLS handshake content type
+        one[unsafe_offset=0] = UInt8(0x16)  # TLS handshake content type
         _ = _send(stalled, one, c_size_t(1), c_int(MSG_NOSIGNAL))
 
         # A real client on the same server still completes.

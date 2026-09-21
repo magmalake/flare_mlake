@@ -19,7 +19,7 @@ from flare.testing import H2cTestClient
 
 
 @fieldwise_init
-struct EchoMethodHandler(Copyable, Handler, Movable):
+struct EchoMethodHandler(Copyable, Handler):
     """Returns the request method + path in the body, echoes body
     length and a custom header, so the h2c round trip can be asserted."""
 
@@ -43,7 +43,7 @@ def _bytes_of(s: String) -> List[UInt8]:
     var out = List[UInt8]()
     var p = s.unsafe_ptr()
     for i in range(s.byte_length()):
-        out.append(p[i])
+        out.append(p[unsafe_offset=i])
     return out^
 
 

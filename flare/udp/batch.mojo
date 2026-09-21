@@ -37,7 +37,7 @@ run on):
                      int flags; (pad) }                      // 48  -> 56 B
     struct mmsghdr { struct msghdr hdr; unsigned len; (pad)} // 56  -> 64 B
 
-The arrays are modeled as flat ``UnsafePointer[UInt8]`` regions with
+The arrays are modeled as flat ``Pointer[UInt8]`` regions with
 the fields poked at fixed offsets, mirroring
 ``flare.runtime.iovec.IoVecBuf``.
 
@@ -48,7 +48,7 @@ different offsets, branching the comptime offsets on pointer width.
 """
 
 from std.ffi import c_int, c_uint, get_errno, ErrNo
-from std.memory import Layout, UnsafePointer, alloc
+from std.memory import Layout, Pointer, alloc
 from std.sys.info import CompilationTarget
 from std.format import Writable, Writer
 
@@ -105,7 +105,7 @@ def udp_batch_supported() -> Bool:
     return CompilationTarget.is_linux()
 
 
-struct UdpBatchUnsupported(Copyable, Movable, Writable):
+struct UdpBatchUnsupported(Copyable, Writable):
     """Raised when the running kernel lacks ``recvmmsg`` / ``sendmmsg``
     (``ENOSYS``). The caller falls back to per-datagram I/O."""
 

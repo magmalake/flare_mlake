@@ -1,0 +1,12 @@
+{
+  "outdir": "./target/conformance/autobahn",
+  "servers": [
+    {
+      "agent": "flare",
+      "url": "ws://127.0.0.1:19001"
+    }
+  ],
+  "cases": ["*"],
+  "exclude-cases": ["12.*", "13.*"],
+  "exclude-agent-cases": {}
+}

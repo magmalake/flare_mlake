@@ -66,7 +66,7 @@ def _parse_bool_param(s: String) raises -> Bool:
     var n = s.byte_length()
     if n == 0:
         raise Error("expected bool, got empty string")
-    var lower = String(capacity=n)
+    var lower = String(capacity_bytes=n)
     var p = s.unsafe_ptr()
     for i in range(n):
         var c = p[unsafe_offset=i]
@@ -83,7 +83,7 @@ def _parse_bool_param(s: String) raises -> Bool:
 # ── Extractor trait ─────────────────────────────────────────────────────────
 
 
-trait Extractor(Copyable, Defaultable, Deinitable, Movable):
+trait Extractor(Copyable, Defaultable, Deinitable):
     """Anything that can extract itself from a ``Request`` in place.
 
     ``Extracted[H]`` default-constructs the handler struct ``H`` and then

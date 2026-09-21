@@ -48,7 +48,8 @@ def _decode_all(body: List[UInt8]) raises -> List[List[UInt8]]:
     var pos = 0
     while pos + 5 <= len(body):
         var sub = Span[UInt8, _](
-            unsafe_ptr=body.unsafe_ptr() + pos, length=len(body) - pos
+            unsafe_ptr=body.unsafe_ptr().unsafe_offset(pos),
+            length=len(body) - pos,
         )
         var dec = decode_grpc_message(sub)
         if dec.needs_more:
@@ -102,7 +103,7 @@ def _stream_handler(req: Request) raises -> Response:
 
 
 @fieldwise_init
-struct _CountStreamHandler(Copyable, GrpcServerStreaming, Movable):
+struct _CountStreamHandler(Copyable, GrpcServerStreaming):
     """Yields ``msg-0`` .. ``msg-(N-1)`` where N is the ASCII request."""
 
     var _seed: Int
@@ -126,7 +127,7 @@ struct _CountStreamHandler(Copyable, GrpcServerStreaming, Movable):
 
 
 @fieldwise_init
-struct _CountClientHandler(Copyable, GrpcClientStreaming, Movable):
+struct _CountClientHandler(Copyable, GrpcClientStreaming):
     """Replies with the decimal count of request messages received."""
 
     var _seed: Int
@@ -144,7 +145,7 @@ struct _CountClientHandler(Copyable, GrpcClientStreaming, Movable):
 
 
 @fieldwise_init
-struct _EchoBidiHandler(Copyable, GrpcBidiStreaming, Movable):
+struct _EchoBidiHandler(Copyable, GrpcBidiStreaming):
     """Echoes each request message back as a response message."""
 
     var _seed: Int
