@@ -50,8 +50,9 @@ from flare.net._libc import (
     _send,
     _fill_sockaddr_in,
 )
+from flare.runtime._libc_time import monotonic_now_ms
 from flare.runtime.io_uring import is_io_uring_available
-from flare.runtime.io_uring_sqe import POLLIN, POLLRDHUP
+from flare.runtime.io_uring_sqe import POLLIN, POLLRDHUP, prep_nop
 from flare.runtime.uring_reactor import (
     URING_OP_ACCEPT,
     URING_OP_RECV,
@@ -136,6 +137,26 @@ def test_idle_poll_returns_zero() raises:
     # surface returns 0 (wakeup CQEs are filtered out).
     assert_equal(n, 0)
     assert_equal(len(out), 0)
+
+
+def test_blocking_poll_with_a_timeout_returns_on_its_own() raises:
+    # CONC-07: with min_complete=1 and nothing ever completing, a bounded
+    # poll must come back after about timeout_ms (it used to block
+    # forever), so an idle loop can re-read its stop flag.
+    if not is_io_uring_available():
+        print("test_blocking_poll_with_a_timeout: skipped (no io_uring)")
+        return
+    var r = UringReactor(16, enable_wakeup=False)
+    var out = List[UringCompletion]()
+    var t0 = monotonic_now_ms()
+    var n = r.poll(1, out, 64, 50)
+    var waited = monotonic_now_ms() - t0
+    assert_equal(n, 0)
+    assert_equal(len(out), 0)
+    assert_true(waited >= 40, "returned early: " + String(waited) + " ms")
+    assert_true(waited < 1000, "waited too long: " + String(waited) + " ms")
+    # The ring is still usable after a timed-out wait.
+    assert_equal(r.poll(0, out), 0)
 
 
 # ── live multishot accept via UringReactor ──────────────────────────────────
@@ -373,6 +394,36 @@ def test_wakeup_releases_blocking_poll() raises:
     # filtered out, returning 0 surfaced completions.
     var n = r.poll(1, out)
     assert_equal(n, 0)
+
+
+def test_wakeup_rearmed_after_full_sq_flushed() raises:
+    """RT-03: when the SQ is full, the lazy wakeup arm in ``poll`` fails
+    (no SQE slot). Phase 1 then flushes the SQ; the read on the eventfd
+    must be armed again before phase 3 may block, otherwise a
+    cross-thread ``wakeup()`` cannot release the blocked poll."""
+    if not is_io_uring_available():
+        print(
+            "test_wakeup_rearmed_after_full_sq_flushed: skipped (io_uring"
+            " not available)"
+        )
+        return
+    var r = UringReactor(8)
+    var filled = 0
+    while True:
+        var slot = r._driver.next_sqe()
+        if Int(slot) == 0:
+            break
+        prep_nop(slot, UInt64(1000 + filled))
+        r._driver.commit_sqe()
+        filled += 1
+    assert_true(filled > 0)
+    var out = List[UringCompletion]()
+    _ = r.poll(0, out)
+    assert_true(r._wake_armed)
+    # The re-armed read is live: a wakeup now releases a blocking poll
+    # (the NOP completions are surfaced, the wakeup CQE is absorbed).
+    r.wakeup()
+    _ = r.poll(1, out)
 
 
 def test_arm_poll_readable_multishot_round_trip() raises:
@@ -965,12 +1016,16 @@ def main() raises:
     print("    PASS test_construction_succeeds")
     test_idle_poll_returns_zero()
     print("    PASS test_idle_poll_returns_zero")
+    test_blocking_poll_with_a_timeout_returns_on_its_own()
+    print("    PASS test_blocking_poll_with_a_timeout_returns_on_its_own")
     test_arm_listener_multishot_round_trip()
     print("    PASS test_arm_listener_multishot_round_trip")
     test_submit_send_round_trip()
     print("    PASS test_submit_send_round_trip")
     test_wakeup_releases_blocking_poll()
     print("    PASS test_wakeup_releases_blocking_poll")
+    test_wakeup_rearmed_after_full_sq_flushed()
+    print("    PASS test_wakeup_rearmed_after_full_sq_flushed")
     test_arm_poll_readable_multishot_round_trip()
     print("    PASS test_arm_poll_readable_multishot_round_trip")
     test_cancel_poll_terminates_multishot()
@@ -985,4 +1040,4 @@ def main() raises:
     print("    PASS test_register_pbuf_ring_recv_round_trip")
     test_register_pbuf_ring_multishot_continues()
     print("    PASS test_register_pbuf_ring_multishot_continues")
-    print("test_uring_reactor: 14/14 PASS")
+    print("test_uring_reactor: 15/15 PASS")

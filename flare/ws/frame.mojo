@@ -25,8 +25,9 @@ Masking (§5.3):
     This implementation uses SIMD-32 masking for payloads ≥ 64 bytes.
 """
 
+from flare.crypto.random import random_bytes
 from std.format import Writable, Writer
-from std.memory import Pointer
+from std.memory import Pointer, unsafe_memcpy
 
 # SIMD chunk width for XOR masking (matches bench_ws_mask.mojo)
 comptime _SIMD_W: Int = 32
@@ -75,6 +76,20 @@ struct WsCloseCode:
 
     comptime INTERNAL_ERROR: UInt16 = 1011
     """Server encountered an internal error."""
+
+
+comptime DEFAULT_MAX_FRAME_BYTES: Int = 16 * 1024 * 1024
+"""Largest frame payload a receiver accepts by default (16 MiB), the
+same bound :data:`DEFAULT_MAX_DECOMPRESSED_BYTES` puts on an inflated
+message. :meth:`WsFrame.decode_one` checks the declared length before
+any payload is buffered, so a header announcing a 4 GiB frame fails
+at once instead of having the reader grow its buffer towards it."""
+
+comptime WS_TOO_BIG_MARKER: String = "frame too big"
+"""Text in the :class:`WsProtocolError` that :meth:`WsFrame.decode_one`
+raises for a frame over its ``max_payload``. Readers look for it to
+answer with CLOSE :data:`WsCloseCode.MESSAGE_TOO_BIG` (1009) before
+they drop the connection."""
 
 
 struct WsProtocolError(Copyable, Writable):
@@ -214,20 +229,23 @@ struct WsFrame(Movable, Writable):
         payload.append(UInt8(code & 0xFF))
         for b in reason.as_bytes():
             payload.append(b)
-        return WsFrame(opcode=WsOpcode.CLOSE, payload=payload^)
+        return WsFrame(opcode=WsOpcode.CLOSE, payload=payload)
 
     # ── Wire encoding ─────────────────────────────────────────────────────────
 
     def encode(self, mask: Bool = False) raises -> List[UInt8]:
         """Encode this frame to its RFC 6455 wire representation.
 
-        Masking is applied with a deterministic all-zero key when ``mask=True``
-        in test builds; production code should pass a cryptographically random
-        4-byte key via ``encode_with_key``.
+        With ``mask=True`` the frame is masked with a fresh 4-byte key from
+        the OS CSPRNG, as RFC 6455 sec 5.3 requires of every client frame.
+        This used to be an all-zero key "for testing", and every client
+        frame flare sent went out that way: masking with zeros leaves the
+        payload unchanged on the wire, which is exactly what the mask exists
+        to prevent (intermediary cache poisoning). Tests that need fixed
+        bytes call ``encode_with_key``.
 
         Args:
-            mask: True to apply a zero mask key (for testing; use
-                  ``encode_with_key`` for real client→server frames).
+            mask: True for a client-to-server frame.
 
         Returns:
             The complete frame bytes ready to write to the socket.
@@ -248,6 +266,9 @@ struct WsFrame(Movable, Writable):
                 + ")"
             )
         var key = SIMD[DType.uint8, 4](0, 0, 0, 0)
+        if mask:
+            var r = random_bytes(4)
+            key = SIMD[DType.uint8, 4](r[0], r[1], r[2], r[3])
         return self.encode_with_key(mask, key)
 
     def encode_with_key(
@@ -338,7 +359,9 @@ struct WsFrame(Movable, Writable):
 
     @staticmethod
     def decode_one(
-        data: Span[UInt8, _], allow_rsv1: Bool = False
+        data: Span[UInt8, _],
+        allow_rsv1: Bool = False,
+        max_payload: Int = DEFAULT_MAX_FRAME_BYTES,
     ) raises -> _DecodeResult:
         """Parse one frame from ``data``.
 
@@ -350,13 +373,17 @@ struct WsFrame(Movable, Writable):
                 per RFC 6455 sec 5.2, which requires a receiver to fail
                 the connection on a reserved bit no negotiated extension
                 gives meaning to.
+            max_payload: Largest payload accepted, checked against the
+                declared length as soon as it is parsed, before the
+                payload has arrived.
 
         Returns:
             A ``_DecodeResult`` with the parsed frame and bytes consumed.
 
         Raises:
             WsProtocolError: If the frame violates RFC 6455 (bad RSV bits,
-                             fragmented control frame, etc.).
+                             a reserved opcode, fragmented control frame,
+                             etc.).
             Error: If ``data`` is too short to contain a complete frame.
         """
         var n = len(data)
@@ -382,6 +409,14 @@ struct WsFrame(Movable, Writable):
             raise WsProtocolError(
                 "RSV1 must be zero without a negotiated extension (RFC 6455"
                 " sec 5.2)"
+            )
+        # RFC 6455 sec 5.2: opcodes 0x3-0x7 and 0xB-0xF are reserved, and a
+        # receiver of an unknown opcode MUST fail the connection.
+        if (
+            opcode > WsOpcode.BINARY and opcode < WsOpcode.CLOSE
+        ) or opcode > WsOpcode.PONG:
+            raise WsProtocolError(
+                "reserved WebSocket opcode " + String(Int(opcode))
             )
 
         # ── Parse extended payload length ─────────────────────────────────────
@@ -422,6 +457,18 @@ struct WsFrame(Movable, Writable):
             )
             pos += 8
 
+        # Checked from the header alone: the readers loop on "need more
+        # bytes", so without this a declared 4 GiB length had them
+        # buffer the whole thing before anything looked at it.
+        if plen > max_payload:
+            raise WsProtocolError(
+                WS_TOO_BIG_MARKER
+                + ": "
+                + String(plen)
+                + " bytes declared, limit "
+                + String(max_payload)
+            )
+
         # ── Parse masking key ─────────────────────────────────────────────────
         var key = SIMD[DType.uint8, 4](0, 0, 0, 0)
         if is_masked:
@@ -452,17 +499,29 @@ struct WsFrame(Movable, Writable):
 
         # ── Extract and unmask payload ────────────────────────────────────────
         var payload = List[UInt8](capacity=plen)
+        payload.resize(unsafe_uninit_length=plen)
+        var src = data.unsafe_ptr().unsafe_offset(pos)
+        var dst = payload.unsafe_ptr()
         if is_masked:
-            for i in range(plen):
-                payload.append(data[pos + i] ^ key[i & 3])
-        else:
-            for i in range(plen):
-                payload.append(data[pos + i])
+            var tiled = SIMD[DType.uint8, _SIMD_W]()
+            comptime for t in range(_SIMD_W):
+                tiled[t] = key[t & 3]
+            var i = 0
+            while i + _SIMD_W <= plen:
+                dst.unsafe_offset(i).unsafe_store(
+                    src.unsafe_offset(i).unsafe_load[width=_SIMD_W]() ^ tiled
+                )
+                i += _SIMD_W
+            while i < plen:
+                dst[unsafe_offset=i] = src[unsafe_offset=i] ^ key[i & 3]
+                i += 1
+        elif plen > 0:
+            unsafe_memcpy(dest=dst, src=src, count=plen)
 
         var consumed = pos + plen
         var frame = WsFrame(
             opcode=opcode,
-            payload=payload^,
+            payload=payload,
             fin=fin,
             rsv1=rsv1,
             masked=is_masked,
@@ -566,6 +625,35 @@ def _is_valid_utf8(data: List[UInt8]) -> Bool:
         else:
             return False
     return True
+
+
+def ws_frame_length(data: Span[UInt8, _]) -> Int:
+    """Total length of the frame starting at ``data[0]`` once its header
+    is in ``data``, or -1 while the header is still incomplete.
+
+    Reads only the length fields; :meth:`WsFrame.decode_one` validates
+    the frame. A receive loop reads until this many bytes are buffered
+    instead of attempting a decode that raises on every short read.
+    """
+    var n = len(data)
+    if n < 2:
+        return -1
+    var plen7 = Int(data[1] & 0x7F)
+    var mask = 4 if (data[1] & 0x80) != 0 else 0
+    if plen7 < 126:
+        return 2 + mask + plen7
+    if plen7 == 126:
+        if n < 4:
+            return -1
+        return 4 + mask + ((Int(data[2]) << 8) | Int(data[3]))
+    if n < 10:
+        return -1
+    var plen = 0
+    for i in range(2, 10):
+        plen = (plen << 8) | Int(data[i])
+        if plen > (1 << 40):
+            return Int.MAX
+    return 10 + mask + plen
 
 
 # ── SIMD masking helper ───────────────────────────────────────────────────────

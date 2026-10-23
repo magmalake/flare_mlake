@@ -117,7 +117,10 @@ def read_path_from_sockaddr_un(
 
     The path is read from offset 2 (past the family-prefix bytes
     on both Linux + macOS) up to the first NUL byte or
-    ``used_len - 2``, whichever comes first.
+    ``used_len - 2``, whichever comes first. The bytes are taken as
+    UTF-8 (what :func:`fill_sockaddr_un` wrote), so a non-ASCII path
+    round-trips exactly. Meant for addresses flare bound itself; a
+    foreign socket name that is not valid UTF-8 is not validated.
     """
     var path_offset: Int = 2
     var max_len = Int(used_len) - path_offset
@@ -125,13 +128,16 @@ def read_path_from_sockaddr_un(
         return String("")
     if max_len > SUN_PATH_MAX:
         max_len = SUN_PATH_MAX
-    var out = String(capacity_bytes=max_len + 1)
+    # Collect the raw bytes and build the String from them as UTF-8, the
+    # encoding ``fill_sockaddr_un`` wrote (``chr(b)`` per byte would decode
+    # Latin-1 and re-encode every byte >= 0x80 as two bytes).
+    var out = List[UInt8](capacity=max_len)
     for i in range(max_len):
         var b = buf.unsafe_offset(path_offset + i).unsafe_load()
         if b == 0:
             break
-        out += chr(Int(b))
-    return out^
+        out.append(b)
+    return String(unsafe_from_utf8=Span[UInt8, _](out))
 
 
 def unlink_path(var path: String) -> c_int:
@@ -141,3 +147,44 @@ def unlink_path(var path: String) -> c_int:
     ``as_c_string_span`` is mutating, so we ask for an owning
     ``var`` to avoid silently mutating the caller's string."""
     return external_call["unlink", c_int](path.as_c_string_span())
+
+
+comptime PATH_NONE: Int = 0
+comptime PATH_SOCKET: Int = 1
+comptime PATH_OTHER: Int = 2
+
+
+def lstat_kind(path: String) raises -> Tuple[Int, UInt64, UInt64]:
+    """``(kind, dev, ino)`` for ``path`` without following a final
+    symlink. ``kind`` is :data:`PATH_NONE`, :data:`PATH_SOCKET` or
+    :data:`PATH_OTHER`; ``dev`` / ``ino`` are set for a socket.
+
+    Raises:
+        Error: When ``lstat(2)`` fails for a reason other than ENOENT.
+    """
+    from std.ffi import OwnedDLHandle
+    from ..utils.dylib import dl_sym, find_flare_lib
+
+    var lib = OwnedDLHandle(find_flare_lib("fs"))
+    var f = dl_sym[def(Int, Int, Int) thin abi("C") -> c_int](
+        lib, "flare_fs_lstat_kind"
+    )
+    var bytes = path.as_bytes()
+    var cpath = List[UInt8](length=len(bytes) + 1, fill=UInt8(0))
+    for i in range(len(bytes)):
+        cpath[i] = bytes[i]
+    var out = List[UInt64](length=2, fill=UInt64(0))
+    var rc = Int(
+        f(
+            Int(cpath.unsafe_ptr()),
+            Int(out.unsafe_ptr()),
+            Int(out.unsafe_ptr().unsafe_offset(1)),
+        )
+    )
+    # Both held past the call: an OwnedDLHandle dropped after its last
+    # use closes the library before f runs.
+    _ = cpath^
+    _ = lib^
+    if rc < 0:
+        raise Error("lstat failed for " + path)
+    return (rc, out[0], out[1])

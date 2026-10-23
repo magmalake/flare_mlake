@@ -1,4 +1,4 @@
-"""gRPC unary client over the HTTP/2 ``HttpClient`` path.
+"""The gRPC unary client over the HTTP/2 ``HttpClient`` path.
 
 Composes on the existing :class:`flare.http.HttpClient` HTTP/2 surface
 rather than introducing a new transport: a unary call is one POST whose
@@ -38,7 +38,12 @@ from ..tls import TlsStream
 from ..tls.config import TlsConfig
 from .framing import decode_grpc_message, encode_grpc_message
 from .metadata import GrpcMetadata
-from .status import GRPC_STATUS_OK, GRPC_STATUS_UNKNOWN, GrpcStatus
+from .status import (
+    GRPC_STATUS_OK,
+    GRPC_STATUS_UNKNOWN,
+    GrpcStatus,
+    grpc_message_decode,
+)
 from .streaming import (
     GrpcBidiStream,
     GrpcServerStream,
@@ -117,16 +122,16 @@ struct GrpcClient(Movable):
         """Invoke a unary RPC.
 
         Args:
-            service_method: the fully-qualified method path
+            service_method: The fully-qualified method path
                 (``/package.Service/Method``); a leading ``/`` is added
                 if missing.
-            request: the serialised request message bytes (LPM-wrapped
+            request: The serialised request message bytes (LPM-wrapped
                 here; the caller passes raw protobuf / codec bytes).
-            metadata: optional initial metadata. Text entries become
+            metadata: Optional initial metadata. Text entries become
                 request headers verbatim; binary ``-bin`` entries are
                 base64-encoded onto their ``-bin`` header per the gRPC
                 wire format.
-            timeout_ms: optional call deadline in milliseconds. When
+            timeout_ms: Optional call deadline in milliseconds. When
                 ``> 0`` it is emitted as the ``grpc-timeout`` header
                 (``<n>m`` millisecond form) so a deadline-aware server
                 can abort the RPC and reply ``DEADLINE_EXCEEDED``.
@@ -146,7 +151,7 @@ struct GrpcClient(Movable):
         ] != UInt8(ord("/")):
             path = String("/") + path
         var req = Request(
-            method=Method.POST, url=self._base_url + path, body=body^
+            method=Method.POST, url=self._base_url + path, body=body
         )
         req.headers.set("content-type", "application/grpc+proto")
         req.headers.set("te", "trailers")
@@ -177,7 +182,7 @@ struct GrpcClient(Movable):
                 payload = dec.message.payload.copy()
 
         var status_str = resp.headers.get("grpc-status")
-        var msg = resp.headers.get("grpc-message")
+        var msg = grpc_message_decode(resp.headers.get("grpc-message"))
         var code = GRPC_STATUS_UNKNOWN
         if status_str.byte_length() > 0:
             try:
@@ -216,7 +221,7 @@ struct GrpcClient(Movable):
         cfg.alpn = List[String]()
         cfg.alpn.append("h2")
         var tls = TlsStream.connect_timeout(
-            u.host, u.port, cfg^, _GRPC_DIAL_TIMEOUT_MS
+            u.host, u.port, cfg, _GRPC_DIAL_TIMEOUT_MS
         )
         return _H2Transport.from_tls(tls^)
 
@@ -239,8 +244,8 @@ struct GrpcClient(Movable):
         Args:
             service_method: ``/package.Service/Method`` (leading ``/``
                 added if missing).
-            request: the single request message bytes (LPM-framed here).
-            metadata: optional initial metadata (text entries only).
+            request: The single request message bytes (LPM-framed here).
+            metadata: Optional initial metadata (text entries only).
         """
         var path = self._normalize_path(service_method)
         var u = Url.parse(self._base_url + path)
@@ -296,7 +301,7 @@ struct GrpcClient(Movable):
         Args:
             service_method: ``/package.Service/Method`` (leading ``/``
                 added if missing).
-            metadata: optional initial metadata (text entries only).
+            metadata: Optional initial metadata (text entries only).
         """
         var path = self._normalize_path(service_method)
         var u = Url.parse(self._base_url + path)

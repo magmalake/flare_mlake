@@ -3,8 +3,8 @@
 The reactor's hot path is single-threaded per worker; any
 blocking syscall (synchronous DB query, libc ``getaddrinfo``,
 file I/O on a slow disk, CPU-heavy compute) freezes the worker
-for the duration. The fix is to offload the blocking work to a
-fresh kernel thread:
+for the duration. The fix is to offload the blocking work to
+another thread:
 
     var rows = block_in_pool[List[Row]](
         lambda: db.query("SELECT ..."),
@@ -14,49 +14,44 @@ fresh kernel thread:
 The handler stays in straight-line code; ``cancel`` short-
 circuits if the request is cancelled mid-blocking-call.
 
-Implementation: per-call detached pthread.
+Implementation: one AsyncRT task per call.
 
-Each ``block_in_pool[T]`` call spawns a fresh kernel thread via
-``pthread_create``, runs ``work()`` on it, and surfaces the
-result back through a heap-allocated task struct. The submitter
-(the reactor-thread handler) polls a ``done_flag`` in a 1 ms
-sleep loop, also polling ``cancel`` so a flip surfaces
-immediately.
+Each ``block_in_pool[T]`` call runs ``work()`` as a task on the
+AsyncRT pool (``ThreadHandle.spawn``), surfaces the result back
+through a heap-allocated task struct, and joins the task. A
+reactor worker is itself a pool task, so its join donates: while
+it waits it runs queued pool tasks, its own ``work()`` included
+if no other worker has taken it. In a forked child, which has no
+pool, the task is a fresh OS thread instead.
 
-Why per-call rather than a singleton pool:
+Notes on the design:
 
-1. Mojo does not allow module-level mutable ``var``s
-   (``error: global variables are not supported``). Without
-   that, a process-global pool needs either a libc mmap-backed
-   flag-byte indirection or an
-   API change that threads pool-state through every call site.
-2. Per-call ``pthread_create`` overhead is ~30-50 µs on Linux
-   x86_64. The API targets millisecond-scale blocking work
-   (DB queries, disk I/O); the overhead is < 5 % of any
-   workload that needs ``block_in_pool`` in the first place.
+1. The pool is shared with the stdlib, so there is no flare-side
+   pool to size or keep alive, and a task costs an enqueue rather
+   than a ``pthread_create`` (~30-50 µs on Linux x86_64).
+2. A ``work()`` that blocks holds its pool worker for as long as
+   it blocks. A reactor that donates while joining can also pick
+   up someone else's queued ``work()`` before it returns to its
+   own connections.
 3. The MAX_POOL_SIZE cap (32) is enforced process-wide via a
    kernel-backed POSIX named semaphore shared by ``block_in_pool``
    and ``resolve_async``: a call that would exceed the cap raises
    "pool saturated" instead of spawning the over-limit thread, so a
    fan-out burst cannot thread-bomb the process. The mechanism is
-   fail-open (an unsupported platform skips the cap rather than
-   blocking work) and per-process (keyed by pid, since Mojo has no
+   fail-closed (if the semaphore cannot be opened, e.g. under fd
+   exhaustion, the call is refused with the same error rather than
+   running uncapped) and per-process (keyed by pid, since Mojo has no
    module-level mutable globals).
 
-What the kernel-thread split actually buys:
+What the split actually buys:
 
-- Blocking syscalls inside ``work()`` only block the work's
-  pthread, not the reactor's pthread structure. The kernel can
-  schedule other reactor workers onto the freed CPU while the
-  syscall is waiting.
-- A crash in ``work()`` (segfault, abort) kills its own pthread,
-  not the reactor's; the submitter sees ``pthread_join`` return
-  non-zero or ``done_flag`` never flipping (caught by an outer
-  timeout if the user wires one in).
+- Blocking syscalls inside ``work()`` run on another pool worker
+  when one is free, so the kernel can schedule other reactor
+  workers onto the freed CPU while the syscall is waiting.
 - Multi-worker parallelism: N concurrent connections on N
-  reactor workers each calling ``block_in_pool`` get N parallel
-  ``work()`` executions on N pthreads, instead of being
-  serialised inside each reactor worker's thread.
+  reactor workers each calling ``block_in_pool`` get up to N
+  parallel ``work()`` executions, instead of being serialised
+  inside each reactor worker.
 
 What it does NOT buy (and why):
 
@@ -74,17 +69,17 @@ Cancel contract (unchanged from the in-thread fallback):
   raise immediately without spawning anything.
 - **In-flight:** the user's ``work()`` is responsible for
   polling ``cancel`` if it wants to short-circuit mid-call
-  (the work runs on a kernel thread that can read the cancel
+  (the work runs on another thread that can read the cancel
   cell directly). The library cannot preempt — Mojo doesn't
-  expose preemption and pthread cancellation is unsafe under
+  expose preemption and thread cancellation is unsafe under
   the borrow checker.
-- **Post-flight:** the submitter blocks on ``pthread_join``
-  until ``work()`` returns; on join it checks the cancel cell
+- **Post-flight:** the submitter joins the task until
+  ``work()`` returns; on join it checks the cancel cell
   one more time. If the cell flipped while ``work()`` ran,
   raise with a "cancelled mid-flight (<reason>)" message
   instead of returning a now-stale result.
 
-Why pthread_join rather than poll-on-done-flag:
+Why join rather than poll-on-done-flag:
 
 A previous iteration of this implementation polled a heap
 ``done_flag`` byte with a 1 ms ``libc_usleep`` between checks
@@ -92,11 +87,10 @@ to surface mid-flight cancel without waiting for ``work()``
 to complete. ``libc_usleep`` hits the documented 1000-1500x
 multiplier when the calling thread
 participates in multi-threaded contexts (and a ``block_in_pool``
-caller is, by construction, multi-threaded — the worker pthread
-exists). That made the 1 ms poll behave like a 1 second poll
-and dragged the per-call latency from ~50 µs to ~1.1 s. Joining
-on the worker thread sidesteps the libc-time path entirely and
-restores per-call latency to the pthread create + work + join
+caller is, by construction, multi-threaded). That made the 1 ms
+poll behave like a 1 second poll and dragged the per-call
+latency from ~50 µs to ~1.1 s. Joining sidesteps the libc-time
+path entirely, so per-call latency is the spawn + work + join
 cost.
 
 The trade-off is that mid-flight cancel no longer raises
@@ -128,8 +122,10 @@ comptime MAX_POOL_SIZE: Int = 32
 # kernel object keyed by a per-pid name. ``sem_open(O_CREAT)`` sets the
 # initial value only on first creation; later opens reuse the existing
 # object, so the count persists across calls. The mechanism is
-# fail-open: if the semaphore cannot be created (unsupported platform,
-# /dev/shm full) the cap is skipped rather than blocking real work.
+# fail-closed: if the semaphore cannot be opened (fd exhaustion,
+# /dev/shm full) the acquire is refused, because a fail-open acquire that
+# did not decrement would let its paired release raise the cap by one for
+# the rest of the process (RT-07).
 #
 # ponytail: kernel-name-keyed cap. Ceiling: a prior process with the
 # SAME pid that crashed while holding slots can leave the cap reduced
@@ -175,19 +171,71 @@ def _pool_reset():
 
 
 @always_inline
+def _pool_sem_open(name: String) -> Pointer[UInt8, MutUntrackedOrigin]:
+    """Open (creating at ``MAX_POOL_SIZE`` on first use) the pool semaphore.
+
+    ``sem_open`` is variadic: ``mode`` and ``value`` are read from the
+    variadic area. On Apple arm64 that area is the stack, while
+    ``external_call`` passes every argument in registers (x2, x3), so
+    the callee read garbage and failed with ``EINVAL`` every time --
+    which, being fail-open, silently disabled the cap (RT-06). There six
+    dummy register arguments (x2..x7) push ``mode`` and ``value`` into
+    the first two 8-byte stack slots, as the callee expects; they are
+    passed as 64-bit values so each fills a whole slot (the same ABI
+    issue ``tcp/stream.mojo`` works around for ``fcntl``). Linux passes
+    variadic arguments in registers like any other, so no padding there.
+    """
+    comptime if CompilationTarget.is_macos():
+        return external_call["sem_open", Pointer[UInt8, MutUntrackedOrigin]](
+            name.unsafe_ptr(),
+            _o_creat(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Int(_SEM_MODE),
+            Int(MAX_POOL_SIZE),
+        )
+    else:
+        return external_call["sem_open", Pointer[UInt8, MutUntrackedOrigin]](
+            name.unsafe_ptr(), _o_creat(), _SEM_MODE, Int32(MAX_POOL_SIZE)
+        )
+
+
+@always_inline
+def _sem_open_failed(sem: Pointer[UInt8, MutUntrackedOrigin]) -> Bool:
+    """True when ``sem_open`` returned ``SEM_FAILED``.
+
+    ``SEM_FAILED`` is ``(sem_t *)-1`` on Darwin but ``(sem_t *)0`` on
+    glibc / musl. Testing only -1 let a failed open on Linux (for
+    example EMFILE once the fd table is full) through, and NULL then
+    reached ``sem_trywait`` / ``sem_post``: SIGSEGV (RT-08). Both values
+    are rejected; neither is ever a valid ``sem_t *``.
+    """
+    var addr = Int(sem)
+    return addr == -1 or addr == 0
+
+
+@always_inline
 def _pool_try_acquire() -> Bool:
     """Try to claim one pool slot. Returns True on success, False when
     the process is already at ``MAX_POOL_SIZE`` concurrent pool threads.
 
-    Fail-open: if the semaphore cannot be opened, returns True so work
-    still runs (the cap is best-effort, never a hard dependency).
+    Fail-closed: if the semaphore cannot be opened (for example EMFILE
+    under fd exhaustion, the overload the cap exists for), no slot is
+    claimed and the result is False. A True result therefore always means
+    the semaphore was decremented, so every paired ``_pool_release``
+    returns a slot that was really taken and the count stays within
+    ``[0, MAX_POOL_SIZE]``. Returning True without decrementing (the old
+    fail-open behaviour) made the matching release raise the cap by one
+    for the rest of the process (RT-07).
     """
     var name = _pool_sem_name()
-    var sem = external_call["sem_open", Pointer[UInt8, MutUntrackedOrigin]](
-        name.unsafe_ptr(), _o_creat(), _SEM_MODE, Int32(MAX_POOL_SIZE)
-    )
-    if Int(sem) == -1:
-        return True
+    var sem = _pool_sem_open(name)
+    if _sem_open_failed(sem):
+        return False
     var rc = external_call["sem_trywait", Int32](sem)
     _ = external_call["sem_close", Int32](sem)
     return rc == Int32(0)
@@ -195,12 +243,14 @@ def _pool_try_acquire() -> Bool:
 
 @always_inline
 def _pool_release():
-    """Return one pool slot claimed by ``_pool_try_acquire``."""
+    """Return one pool slot claimed by ``_pool_try_acquire``.
+
+    If the semaphore cannot be opened the slot is not returned; that can
+    only tighten the cap (never raise it), see RT-07.
+    """
     var name = _pool_sem_name()
-    var sem = external_call["sem_open", Pointer[UInt8, MutUntrackedOrigin]](
-        name.unsafe_ptr(), _o_creat(), _SEM_MODE, Int32(MAX_POOL_SIZE)
-    )
-    if Int(sem) == -1:
+    var sem = _pool_sem_open(name)
+    if _sem_open_failed(sem):
         return
     _ = external_call["sem_post", Int32](sem)
     _ = external_call["sem_close", Int32](sem)
@@ -215,7 +265,7 @@ comptime _ERR_BUF_CAP: Int = 256
 
 @fieldwise_init
 struct _Task[T: Deinitable & Movable](Movable):
-    """Heap-allocated task delivered to the worker pthread.
+    """Heap-allocated task delivered to the worker.
 
     Address fields are stored as ``Int`` rather than typed
     pointers because ``Pointer[T, MutUntrackedOrigin]``
@@ -228,7 +278,7 @@ struct _Task[T: Deinitable & Movable](Movable):
     """
 
     var work: def() raises thin -> Self.T
-    """User-supplied work function. Runs on the worker pthread."""
+    """User-supplied work function. Runs on the worker."""
 
     var result_addr: Int
     """Address of the heap slot the worker writes the success
@@ -257,7 +307,7 @@ def _block_thunk[
 ](arg: Pointer[UInt8, MutUntrackedOrigin]) -> Pointer[
     UInt8, MutUntrackedOrigin
 ]:
-    """pthread start routine. Per-T monomorphisation.
+    """Task start routine. Per-T monomorphisation.
 
     1. Reconstruct ``_Task[T]`` from the opaque arg pointer.
     2. Call ``task.work()``; capture result OR error.
@@ -305,7 +355,7 @@ def _block_thunk[
         success_ptr[unsafe_offset=0] = UInt8(0)
 
     # The submitter owns the result / err / success buffers; it
-    # frees them after pthread_join returns. We only own the
+    # frees them after the join returns. We only own the
     # _Task allocation itself.
     task_ptr.unsafe_free()
 
@@ -337,8 +387,12 @@ def _raise_cancel(prefix: String, reason: Int) raises:
 def block_in_pool[
     T: Deinitable & Movable
 ](work: def() raises thin -> T, cancel: Cancel) raises -> T:
-    """Run ``work()`` on a fresh kernel thread; wait for its
-    result on the calling thread.
+    """Run ``work()`` as an AsyncRT task; wait for its result on the
+    calling thread.
+
+    The task holds a pool worker for as long as ``work()`` blocks
+    (see ``flare.runtime._asyncrt``). In a forked child it runs on a
+    fresh OS thread.
 
     Pre-flight: if ``cancel`` is already flipped at entry, raise
     without spawning anything.
@@ -410,8 +464,8 @@ def block_in_pool[
         )
     )
 
-    # ── Spawn worker pthread + block on join ────────────────────────────────
-    # pthread_join is the right primitive here: the user-visible API
+    # ── Spawn worker task + block on join ───────────────────────────────────
+    # Joining is the right primitive here: the user-visible API
     # is synchronous, so the submitter needs to wait until the worker
     # has finished writing the result/error buffers anyway. Polling
     # would mean either burning CPU (busy-wait) or going through

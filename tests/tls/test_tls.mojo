@@ -19,7 +19,7 @@ Test certificates (tests/certs/):
 """
 
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
-from std.ffi import OwnedDLHandle, c_int, CStringSpan
+from std.ffi import OwnedDLHandle, c_char, c_int, CStringSpan
 from std.memory import Pointer, stack_allocation
 
 
@@ -62,7 +62,7 @@ def _tls_err(lib: OwnedDLHandle) raises -> String:
     return String(
         StringSlice(
             unsafe_from_utf8=CStringSpan(
-                unsafe_from_ptr=p.unsafe_bitcast[Int8]()
+                unsafe_from_ptr=p.unsafe_bitcast[c_char]()
             )
         )
     )
@@ -395,6 +395,34 @@ def test_tls_close_idempotent() raises:
     except e:
         assert_true(False, "close() idempotency error: " + String(e))
 
+    waitpid(pid)
+
+
+def test_tls_use_after_close_raises() raises:
+    """``close()`` frees the SSL and zeroes the handle; read and write then
+    passed NULL into OpenSSL and crashed the process."""
+    var srv = _TlsTestServer(_SERVER_CRT, _SERVER_KEY)
+    var port = srv.port()
+    var pid = _spawn_echo_server(srv)
+    usleep(80000)
+    var cfg = TlsConfig(ca_bundle=_CA_CRT)
+    var stream = TlsStream.connect("localhost", UInt16(port), cfg)
+    stream.close()
+    var buf = List[UInt8](length=8, fill=UInt8(0))
+    var read_raised = False
+    try:
+        _ = stream.read(buf.unsafe_ptr(), 8)
+    except:
+        read_raised = True
+    var write_raised = False
+    try:
+        stream.write_all(String("x").as_bytes())
+    except:
+        write_raised = True
+    assert_true(read_raised, "read on a closed stream did not raise")
+    assert_true(write_raised, "write on a closed stream did not raise")
+    assert_equal(stream.tls_version(), "unknown")
+    assert_false(stream.was_session_reused())
     waitpid(pid)
 
 

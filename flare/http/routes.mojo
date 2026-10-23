@@ -56,7 +56,7 @@ from std.collections import Dict
 from .handler import Handler
 from .headers import HeaderMap
 from .proto.ascii import ascii_unchecked_string
-from .request import Request, Method
+from .request import Request, Method, _child_request
 from .response import Response, Status
 
 
@@ -218,20 +218,13 @@ struct ComptimeRouter[routes: List[ComptimeRoute]](Copyable, Handler):
             var params = Dict[String, String]()
             if _match_one(seg_in, rt_pat, params):
                 if r.method == req.method:
-                    var child = Request(
-                        method=req.method,
-                        url=req.url,
-                        body=req.body.copy(),
-                        version=req.version,
-                    )
-                    child.headers = req.headers.copy()
-                    if req.has_params():
-                        for kv in req._params.value()[].items():
-                            child.params_mut()[kv.key] = kv.value
+                    if len(params) == 0 and not req.has_params():
+                        return r.handler(req)
+                    var child = _child_request(req, req.url)
                     if len(params) > 0:
                         for kv in params.items():
                             child.params_mut()[kv.key] = kv.value
-                    return r.handler(child^)
+                    return r.handler(child)
                 else:
                     var m = String(r.method)
                     if not _contains(allowed, m):
@@ -253,13 +246,20 @@ def _match_one(
     """Attempt to match one request against one comptime-compiled pattern.
 
     Same semantics as the runtime Router's ``_match``: literal equality,
-    ``:name`` captures one segment, trailing ``*`` captures the rest.
+    ``:name`` captures one segment, trailing ``*`` captures the rest. A
+    ``*`` that is not the last segment never matches.
     """
     var i = 0
     var j = 0
     while j < len(pat_segs):
         var seg = pat_segs[j]
         if _seg_is_wildcard(seg):
+            # ``*`` captures the rest of the path, so it is only valid as
+            # the final pattern segment (the runtime ``Router`` rejects
+            # anything else at registration). A pattern with a non-final
+            # ``*`` is invalid and matches nothing (APP-10).
+            if j != len(pat_segs) - 1:
+                return False
             if i >= len(url_segs):
                 return False
             var tail = String("")

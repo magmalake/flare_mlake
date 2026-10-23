@@ -60,6 +60,13 @@ from flare.http3 import (
     encode_http3_frame,
     encode_http3_settings,
 )
+from flare.http3.server import (
+    H3_FRAME_ERROR,
+    H3_FRAME_UNEXPECTED,
+    H3_SETTINGS_ERROR,
+    H3_STREAM_CREATION_ERROR,
+    h3_error_code,
+)
 from flare.quic.varint import decode_varint, encode_varint
 
 
@@ -112,7 +119,7 @@ def test_peer_control_stream_settings_round_trip() raises:
             value=UInt64(1),
         )
     )
-    var bytes = _build_peer_control_prefix(settings^)
+    var bytes = _build_peer_control_prefix(settings)
     c.feed_uni_stream_chunk(3, bytes^)
     assert_true(c.peer_settings_received)
     assert_equal(c.peer_control_stream_id, 3)
@@ -139,7 +146,7 @@ def test_uni_stream_type_varint_split_across_chunks() raises:
             value=UInt64(8192),
         )
     )
-    c.feed_uni_stream_chunk(3, _build_peer_control_prefix(settings^))
+    c.feed_uni_stream_chunk(3, _build_peer_control_prefix(settings))
     assert_equal(c.peer_control_stream_id, 3)
     assert_true(c.peer_settings_received)
     assert_equal(c.peer_settings_max_field_section_size, UInt64(8192))
@@ -159,18 +166,47 @@ def test_qpack_uni_stream_kinds_are_recorded() raises:
     assert_equal(c.peer_qpack_decoder_stream_id, 11)
 
 
-def test_push_uni_stream_tolerated() raises:
-    """Push is deprecated but the type code is reserved; the
-    driver records the kind without raising so the reactor can
-    STOP_SENDING."""
+def test_client_push_stream_is_refused() raises:
+    """H3-05: a push stream (type 0x01) opened by a client was recorded
+    and its bytes dropped. A server that receives one MUST treat it as a
+    connection error of type H3_STREAM_CREATION_ERROR (RFC 9114 sec
+    6.2.2). This test used to assert the stream was tolerated."""
     var c = Http3Connection()
     var push = List[UInt8]()
     push.append(UInt8(0x01))
     push.append(UInt8(0xAA))
     push.append(UInt8(0xBB))
-    c.feed_uni_stream_chunk(15, push^)
-    assert_true(15 in c.peer_uni_kinds)
-    assert_equal(c.peer_uni_kinds[15], Http3StreamType.PUSH)
+    var msg = _raises_with(c, 15, push^)
+    assert_true("H3_STREAM_CREATION_ERROR" in msg, "push stream accepted")
+    assert_equal(Int(h3_error_code(msg)), Int(H3_STREAM_CREATION_ERROR))
+    assert_false(15 in c.peer_uni_kinds)
+
+
+def test_second_qpack_stream_of_either_type_is_refused() raises:
+    """H3-05: a second QPACK encoder (or decoder) stream overwrote the
+    recorded stream id. RFC 9204 sec 4.2: it MUST be a connection error of
+    type H3_STREAM_CREATION_ERROR."""
+    var c = Http3Connection()
+    var enc = List[UInt8]()
+    enc.append(UInt8(0x02))
+    c.feed_uni_stream_chunk(2, enc.copy())
+    var msg = _raises_with(c, 6, enc.copy())
+    assert_true("H3_STREAM_CREATION_ERROR" in msg, "second encoder accepted")
+    assert_equal(Int(h3_error_code(msg)), Int(H3_STREAM_CREATION_ERROR))
+    assert_equal(c.peer_qpack_encoder_stream_id, 2)
+
+    var d = Http3Connection()
+    var dec = List[UInt8]()
+    dec.append(UInt8(0x03))
+    d.feed_uni_stream_chunk(2, dec.copy())
+    var dmsg = _raises_with(d, 6, dec.copy())
+    assert_true("H3_STREAM_CREATION_ERROR" in dmsg, "second decoder accepted")
+    assert_equal(d.peer_qpack_decoder_stream_id, 2)
+    # More data on the first stream is not a second stream.
+    var more = List[UInt8]()
+    more.append(UInt8(0x00))
+    d.feed_uni_stream_chunk(2, more^)
+    assert_equal(d.peer_qpack_decoder_stream_id, 2)
 
 
 def test_grease_uni_stream_codepoint_tolerated() raises:
@@ -201,7 +237,7 @@ def test_settings_twice_is_frame_unexpected() raises:
     c.feed_uni_stream_chunk(3, _build_peer_control_prefix(settings))
     # Second SETTINGS on the *same* stream:
     var dup_payload = List[UInt8]()
-    encode_http3_settings(settings^, dup_payload)
+    encode_http3_settings(settings, dup_payload)
     var dup_frame = List[UInt8]()
     encode_http3_frame(
         H3_FRAME_TYPE_SETTINGS, Span[UInt8, _](dup_payload), dup_frame
@@ -241,7 +277,7 @@ def test_goaway_records_peer_max_stream_id() raises:
             value=UInt64(1024),
         )
     )
-    c.feed_uni_stream_chunk(3, _build_peer_control_prefix(settings^))
+    c.feed_uni_stream_chunk(3, _build_peer_control_prefix(settings))
     var goaway = _build_goaway_frame(UInt64(16))
     c.feed_uni_stream_chunk(3, goaway^)
     assert_equal(c.peer_goaway_max_stream_id, UInt64(16))
@@ -269,7 +305,7 @@ def test_second_peer_control_stream_raises() raises:
             value=UInt64(1024),
         )
     )
-    c.feed_uni_stream_chunk(3, _build_peer_control_prefix(settings^))
+    c.feed_uni_stream_chunk(3, _build_peer_control_prefix(settings))
     var second = List[UInt8]()
     second.append(UInt8(0x00))
     var raised = False
@@ -311,6 +347,37 @@ def test_emit_initial_settings_round_trips() raises:
     assert_true(saw_connect)
 
 
+def test_take_control_stream_start_is_once_and_decodes_at_the_peer() raises:
+    """H3-07: the server initiates its control stream (stream 3) and
+    sends type 0x00 + SETTINGS first (RFC 9114 sec 6.2.1, 7.2.4). The
+    bytes are handed over once, and a peer driver reading them as stream 3
+    classifies it as the control stream and learns the settings."""
+    var cfg = Http3Config()
+    cfg.max_field_section_size = UInt64(4096)
+    cfg.qpack_max_table_capacity = UInt64(512)
+    cfg.qpack_blocked_streams = UInt64(7)
+    cfg.enable_connect_protocol = True
+    var server = Http3Connection.with_config(cfg)
+    assert_equal(server.control_stream_id, -1)
+    var start = server.take_control_stream_start()
+    assert_equal(server.control_stream_id, 3)
+    var expected = server.emit_initial_settings()
+    assert_equal(len(start), len(expected))
+    for i in range(len(start)):
+        assert_equal(Int(start[i]), Int(expected[i]))
+    assert_equal(Int(start[0]), 0x00)
+    assert_equal(len(server.take_control_stream_start()), 0)
+
+    var peer = Http3Connection()
+    peer.feed_uni_stream_chunk(3, start^)
+    assert_equal(peer.peer_control_stream_id, 3)
+    assert_true(peer.peer_settings_received)
+    assert_equal(peer.peer_settings_max_field_section_size, UInt64(4096))
+    assert_equal(peer.peer_settings_qpack_max_table_capacity, UInt64(512))
+    assert_equal(peer.peer_settings_qpack_blocked_streams, UInt64(7))
+    assert_true(peer.peer_settings_enable_connect_protocol)
+
+
 def test_emit_goaway_flips_flag_and_double_emit_raises() raises:
     var c = Http3Connection()
     assert_false(c.goaway_emitted)
@@ -326,11 +393,229 @@ def test_emit_goaway_flips_flag_and_double_emit_raises() raises:
     assert_true(raised, "double emit_goaway must raise")
 
 
+def _settings_prefix() raises -> List[UInt8]:
+    var settings = List[Http3Setting]()
+    settings.append(
+        Http3Setting(
+            identifier=H3_SETTINGS_MAX_FIELD_SECTION_SIZE,
+            value=UInt64(1024),
+        )
+    )
+    return _build_peer_control_prefix(settings)
+
+
+def test_control_frame_header_split_across_chunks() raises:
+    """A frame whose length varint straddled two chunks made
+    decode_varint raise out of the control-stream parser, ending the
+    connection. It now waits for the rest."""
+    var c = Http3Connection()
+    c.feed_uni_stream_chunk(3, _settings_prefix())
+    # A reserved (grease) frame type with a 100-byte payload: its length
+    # is a two-byte varint, 0x40 0x64.
+    var frame = List[UInt8]()
+    frame.append(UInt8(0x21))
+    frame.append(UInt8(0x40))
+    frame.append(UInt8(0x64))
+    for _ in range(100):
+        frame.append(UInt8(0))
+    var head = List[UInt8](Span[UInt8, _](frame)[:2])  # splits the length
+    var tail = List[UInt8](Span[UInt8, _](frame)[2:])
+    c.feed_uni_stream_chunk(3, head^)
+    c.feed_uni_stream_chunk(3, tail^)
+    c.feed_uni_stream_chunk(3, _build_goaway_frame(UInt64(16)))
+    assert_equal(c.peer_goaway_max_stream_id, UInt64(16))
+
+
+def test_oversized_control_frame_is_refused_from_its_header() raises:
+    """The control-stream carry grew for as long as a declared frame
+    length stayed unmet."""
+    var c = Http3Connection()
+    c.feed_uni_stream_chunk(3, _settings_prefix())
+    var frame = List[UInt8]()
+    frame.append(UInt8(0x21))
+    var ln = encode_varint(UInt64(1 << 30))
+    for b in ln:
+        frame.append(b)
+    var raised = False
+    try:
+        c.feed_uni_stream_chunk(3, frame^)
+    except:
+        raised = True
+    assert_true(raised, "a 1 GiB control frame header was accepted")
+
+
+def _raises_with(
+    mut c: Http3Connection, stream_id: Int, var chunk: List[UInt8]
+) -> String:
+    """The error text ``feed_uni_stream_chunk`` raised, or ""."""
+    try:
+        c.feed_uni_stream_chunk(stream_id, chunk^)
+    except e:
+        return String(e)
+    return String("")
+
+
+def test_forbidden_frame_types_on_the_control_stream_are_refused() raises:
+    """H3-03: after SETTINGS, DATA (0x00), HEADERS (0x01), PUSH_PROMISE
+    (0x05) and the HTTP/2-reserved types 0x02 / 0x06 / 0x08 / 0x09 were
+    silently dropped. Each is a connection error of type
+    H3_FRAME_UNEXPECTED (RFC 9114 sec 7.2.1, 7.2.2, 7.2.5, 7.2.8)."""
+    var forbidden = _bytes_from_list([0x00, 0x01, 0x05, 0x02, 0x06, 0x08, 0x09])
+    for i in range(len(forbidden)):
+        var c = Http3Connection()
+        c.feed_uni_stream_chunk(3, _settings_prefix())
+        var frame = List[UInt8]()
+        frame.append(forbidden[i])
+        frame.append(UInt8(0))  # empty payload
+        var msg = _raises_with(c, 3, frame^)
+        assert_true(
+            "H3_FRAME_UNEXPECTED" in msg,
+            "forbidden control frame type " + String(Int(forbidden[i])),
+        )
+        assert_equal(Int(h3_error_code(msg)), Int(H3_FRAME_UNEXPECTED))
+
+
+def test_allowed_control_frames_are_still_accepted() raises:
+    """The H3-03 check is not a blanket rejection: CANCEL_PUSH, MAX_PUSH_ID,
+    GOAWAY and unknown / grease types stay legal on the control stream."""
+    var c = Http3Connection()
+    c.feed_uni_stream_chunk(3, _settings_prefix())
+    var frames = List[UInt8]()
+    frames.append(UInt8(0x03))  # CANCEL_PUSH, push id 0
+    frames.append(UInt8(1))
+    frames.append(UInt8(0))
+    frames.append(UInt8(0x0D))  # MAX_PUSH_ID, id 4
+    frames.append(UInt8(1))
+    frames.append(UInt8(4))
+    frames.append(UInt8(0x21))  # grease, empty
+    frames.append(UInt8(0))
+    c.feed_uni_stream_chunk(3, frames^)
+    c.feed_uni_stream_chunk(3, _build_goaway_frame(UInt64(8)))
+    assert_equal(Int(c.peer_goaway_max_stream_id), 8)
+
+
+def test_http2_reserved_setting_identifiers_are_refused() raises:
+    """H3-04: SETTINGS identifiers 0x02..0x05 (HTTP/2 ENABLE_PUSH,
+    MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE) were
+    ignored like unknown ones. Their receipt is a connection error of
+    type H3_SETTINGS_ERROR (RFC 9114 sec 7.2.4.1, 11.2.2)."""
+    for sid in range(2, 6):
+        var c = Http3Connection()
+        var settings = List[Http3Setting]()
+        settings.append(
+            Http3Setting(
+                identifier=H3_SETTINGS_MAX_FIELD_SECTION_SIZE,
+                value=UInt64(1024),
+            )
+        )
+        settings.append(Http3Setting(identifier=UInt64(sid), value=UInt64(1)))
+        var msg = _raises_with(c, 3, _build_peer_control_prefix(settings))
+        assert_true(
+            "H3_SETTINGS_ERROR" in msg,
+            "reserved setting identifier " + String(sid) + " was accepted",
+        )
+        assert_equal(Int(h3_error_code(msg)), Int(H3_SETTINGS_ERROR))
+        assert_false(c.peer_settings_received)
+
+
+def test_unknown_and_known_setting_identifiers_are_still_accepted() raises:
+    """The H3-04 check is exactly 0x02..0x05: the neighbours 0x01 and 0x06,
+    greased identifiers and unknown ones keep working."""
+    var c = Http3Connection()
+    var settings = List[Http3Setting]()
+    settings.append(
+        Http3Setting(
+            identifier=H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY,
+            value=UInt64(256),
+        )
+    )
+    settings.append(
+        Http3Setting(
+            identifier=H3_SETTINGS_MAX_FIELD_SECTION_SIZE, value=UInt64(2048)
+        )
+    )
+    settings.append(Http3Setting(identifier=UInt64(0x0A), value=UInt64(9)))
+    settings.append(Http3Setting(identifier=UInt64(0x21), value=UInt64(7)))
+    c.feed_uni_stream_chunk(3, _build_peer_control_prefix(settings))
+    assert_true(c.peer_settings_received)
+    assert_equal(Int(c.peer_settings_qpack_max_table_capacity), 256)
+    assert_equal(Int(c.peer_settings_max_field_section_size), 2048)
+
+
+def _goaway_payload_frame(var payload: List[UInt8]) raises -> List[UInt8]:
+    var out = List[UInt8]()
+    encode_http3_frame(H3_FRAME_TYPE_GOAWAY, Span[UInt8, _](payload), out)
+    return out^
+
+
+def test_goaway_with_bytes_after_the_id_is_a_frame_error() raises:
+    """RFC 9114 §7.2.6 / §7.1: the GOAWAY payload is exactly one varint;
+    bytes after it, an empty payload and a truncated varint are all
+    ``H3_FRAME_ERROR`` (H3-06), and the recorded id is left alone."""
+    # id 0 followed by one byte, id 4 followed by two, a 2-byte varint
+    # (0x40 0x10 = 16) followed by one byte.
+    var cases = List[List[Int]]()
+    cases.append([0x00, 0xFF])
+    cases.append([0x04, 0x00, 0x00])
+    cases.append([0x40, 0x10, 0x00])
+    for i in range(len(cases)):
+        var c = Http3Connection()
+        c.feed_uni_stream_chunk(
+            3, _build_peer_control_prefix(List[Http3Setting]())
+        )
+        var msg = _raises_with(
+            c, 3, _goaway_payload_frame(_bytes_from_list(cases[i]))
+        )
+        assert_true(
+            msg.byte_length() > 0, "GOAWAY with trailing bytes must raise"
+        )
+        assert_equal(h3_error_code(msg), H3_FRAME_ERROR)
+        assert_equal(c.peer_goaway_max_stream_id, UInt64((1 << 63) - 1))
+    # Empty and truncated payloads.
+    var bad = List[List[Int]]()
+    bad.append([])
+    bad.append([0x40])
+    for i in range(len(bad)):
+        var c = Http3Connection()
+        c.feed_uni_stream_chunk(
+            3, _build_peer_control_prefix(List[Http3Setting]())
+        )
+        var msg = _raises_with(
+            c, 3, _goaway_payload_frame(_bytes_from_list(bad[i]))
+        )
+        assert_true(msg.byte_length() > 0, "malformed GOAWAY must raise")
+        assert_equal(h3_error_code(msg), H3_FRAME_ERROR)
+
+
+def test_goaway_exactly_one_varint_is_still_accepted() raises:
+    var one: List[Int] = [0x00]
+    var two: List[Int] = [0x40, 0x10]
+    var four: List[Int] = [0x80, 0x00, 0x01, 0x00]
+    var want = List[UInt64]()
+    want.append(UInt64(0))
+    want.append(UInt64(16))
+    want.append(UInt64(256))
+    var all = List[List[Int]]()
+    all.append(one^)
+    all.append(two^)
+    all.append(four^)
+    for i in range(len(all)):
+        var c = Http3Connection()
+        c.feed_uni_stream_chunk(
+            3, _build_peer_control_prefix(List[Http3Setting]())
+        )
+        c.feed_uni_stream_chunk(
+            3, _goaway_payload_frame(_bytes_from_list(all[i]))
+        )
+        assert_equal(c.peer_goaway_max_stream_id, want[i])
+
+
 def main() raises:
     test_peer_control_stream_settings_round_trip()
     test_uni_stream_type_varint_split_across_chunks()
     test_qpack_uni_stream_kinds_are_recorded()
-    test_push_uni_stream_tolerated()
+    test_client_push_stream_is_refused()
+    test_second_qpack_stream_of_either_type_is_refused()
     test_grease_uni_stream_codepoint_tolerated()
     test_settings_twice_is_frame_unexpected()
     test_non_settings_before_settings_is_missing_settings()
@@ -338,4 +623,13 @@ def main() raises:
     test_second_peer_control_stream_raises()
     test_emit_initial_settings_round_trips()
     test_emit_goaway_flips_flag_and_double_emit_raises()
-    print("test_h3_uni_streams: 11 passed")
+    test_control_frame_header_split_across_chunks()
+    test_oversized_control_frame_is_refused_from_its_header()
+    test_take_control_stream_start_is_once_and_decodes_at_the_peer()
+    test_forbidden_frame_types_on_the_control_stream_are_refused()
+    test_allowed_control_frames_are_still_accepted()
+    test_http2_reserved_setting_identifiers_are_refused()
+    test_unknown_and_known_setting_identifiers_are_still_accepted()
+    test_goaway_with_bytes_after_the_id_is_a_frame_error()
+    test_goaway_exactly_one_varint_is_still_accepted()
+    print("test_h3_uni_streams: 21 passed")

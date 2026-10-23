@@ -1,0 +1,1091 @@
+import Flare.Core
+/-!
+# The top-level network abstract machine (one reactor worker)
+
+This is the machine that composes the layers: the event loop of
+`_run_handler_loop_impl` (flare/http/_server_reactor_epoll.mojo) together
+with the bookkeeping in flare/http/_reactor/lifecycle.mojo (`_apply_step`,
+`_cleanup_conn`, `_arm_accept_timer`, `_accept_loop_fd`,
+`_collect_fired_timers`, `_expired_idle_conns`).
+
+A configuration holds
+
+* `conns`  : the worker's `conns: Dict[Int, Int]` (fd → `ConnHandle`), here
+  fd → the connection's state plus a ghost *incarnation* number `gen` that
+  tells apart two connections that reuse the same fd number;
+* `timers` : the worker's `timers: Dict[Int, UInt64]` (fd → timer id);
+* `wheel`  : the active timers of the `TimerWheel`, at the level of its spec
+  (`Flare.L2.TimerWheel`: `advance now` fires exactly the active timers with
+  `fire_at ≤ now`, and a cancelled timer never fires). Each timer carries the
+  fd it was scheduled with (flare passes `UInt64(fd)` as the payload) and, as
+  ghost state, the incarnation that armed it;
+* `fired`  : the `fired_fds` / `fired_ids` of the current iteration: each
+  timer that fired with the `timers` entry its fd had then (`none` for Mojo's
+  0; wheel ids start at 1), reaped after the batch;
+* `batch`  : the reactor tokens returned by the last `reactor.poll`, not yet
+  processed. The listener is registered with token `LISTENER_TOKEN`
+  (flare/runtime/event.mojo; `_server_reactor_epoll.mojo:155-158`, fixed,
+  MACH-01) and every client with token = its fd (`lifecycle.mojo:236`).
+
+Abstractions. `ListenerGate` (pausing the listener at `max_connections`) and
+the cap check in `_accept_loop_fd` only remove behaviours: a paused listener
+is a poll whose `toks` omit the listener token, a declined accept is an early
+`acceptDone`. This loop passes no `Balancer` to `_accept_loop_fd` (the
+default is disabled), so no connection arrives by hand-off; a handed-over
+connection (`_adopt_handed_off_h1`, static loop only) would be an `accept` of
+an fd that is open nowhere else, as in `Flare.MachineWorkers`.
+
+Per-connection behaviour is a parameter (`ConnModel`): its step function sees
+only the connection's own state and what the kernel shows it on this event,
+and returns a `StepResult` (conn_handle.mojo). `Flare.L4.ConnSM` is one
+instance; nothing here depends on which.
+
+Results:
+
+* `inv_reachable`, `no_stale_timer`: with `_cleanup_conn` cancelling the
+  timer (flare's code), an idle timer only ever closes the incarnation that
+  armed it, even when the kernel reuses the fd number.
+  `stale_timer_without_cancel` shows the cancel is necessary: without it a
+  timer armed by a closed connection closes the next connection on that fd.
+* `no_early_close`, `no_late_close`: idle closes happen for timers that fired
+  at a poll at or after the deadline, never before; every due timer fires at
+  that poll.
+* `conn_invariant_lifts`: any invariant of the per-connection model holds for
+  every live connection of every reachable machine state, so layer-4 theorems
+  about the connection state machine hold inside the server.
+* `dispatch_isolated`: an event for one fd changes no other connection and no
+  other `timers` entry.
+* `stale_event_redelivered`: the reap after the batch spares a connection
+  whose fd was closed and re-accepted after its old timer fired: the fired
+  timer closes nothing.
+* `routing_ok`: no client has the listener's token, so the accept drainer
+  only ever sees listener events. It holds because the listener token is
+  above every fd (MACH-01), whether or not stdin is open; `fd0_served`: a
+  client accepted on fd 0 has its events dispatched to it.
+  `HttpServer.serve` runs the same loop in `_unified_reactor_impl.mojo`.
+-/
+namespace Flare.Machine
+
+abbrev Fd := Nat
+
+/-- Every fd the kernel can hand out is below this (`int`, 2^31). -/
+def fdLimit : Nat := 2147483648
+
+/-- mirrors flare/runtime/event.mojo#LISTENER_TOKEN sha=bcfba1c5c115 at=7cdf6421 (fixed, MACH-01): 2^40,
+above every fd. -/
+def listenerToken : Nat := 1099511627776
+
+theorem fdLimit_le_listenerToken : fdLimit ≤ listenerToken := by decide
+
+/-- mirrors flare/http/_reactor/keepalive_scan.mojo#StepResult sha=3ddd08f88e14 at=59bda50f
+(`want_read`, `want_write`, `done`, `idle_timeout_ms`; `h2c_upgrade` is not
+modelled). `idleMs = 0` cancels the idle timer, `> 0` re-arms it, `< 0`
+leaves it alone (lifecycle.mojo:105-114). -/
+structure StepResult where
+  wantRead : Bool
+  wantWrite : Bool
+  done : Bool
+  idleMs : Int
+  deriving DecidableEq, Repr
+
+/-- Per-connection behaviour. `I` is what the kernel shows the connection on
+one event (bytes, send capacity, EOF, ...); `onEvent` covers the whole
+`on_readable` / `on_writable` fast path of one event, including the
+exception-to-`done` mapping (`_server_reactor_epoll.mojo:199-252`). -/
+structure ConnModel where
+  S : Type
+  I : Type
+  init : S
+  onEvent : S → I → S × StepResult
+  /-- `config.idle_timeout_ms`, armed at accept (`_arm_accept_timer`). -/
+  idleMs : Nat
+
+/-- Environment and code variants. -/
+structure Params where
+  /-- the listener's own fd -/
+  lfd : Fd
+  /-- fd 0 is in use (stdin open), so `accept` never returns it -/
+  stdinOpen : Bool
+  /-- `_cleanup_conn` cancels the connection's timer (flare: `true`) -/
+  cancelOnCleanup : Bool
+
+structure Timer where
+  id : Nat
+  tok : Fd
+  due : Nat
+  /-- ghost: incarnation that armed the timer -/
+  gen : Nat
+  deriving DecidableEq, Repr
+
+structure Live (S : Type) where
+  st : S
+  gen : Nat
+  interest : Nat
+
+/-- Ghost log entry: an idle timer closed connection `fd` (incarnation
+`victim`); the timer had been armed by incarnation `armer`, was due at `due`
+and fired in the poll at `time`. -/
+structure Kill where
+  fd : Fd
+  victim : Nat
+  armer : Nat
+  due : Nat
+  time : Nat
+  deriving DecidableEq, Repr
+
+/-- A fired timer, the `timers` entry its fd had when it fired, and the
+poll time (ghost). -/
+structure Fired where
+  t : Timer
+  snap : Option Nat
+  time : Nat
+  deriving DecidableEq, Repr
+
+structure Cfg (S : Type) where
+  now : Nat
+  conns : Fd → Option (Live S)
+  timers : Fd → Option Nat
+  wheel : List Timer
+  nextTid : Nat
+  nextGen : Nat
+  batch : List Fd
+  kills : List Kill
+  fired : List Fired
+
+def upd {α : Type} (f : Fd → α) (k : Fd) (v : α) : Fd → α :=
+  fun x => if x = k then v else f x
+
+@[simp] theorem upd_same {α : Type} (f : Fd → α) (k : Fd) (v : α) : upd f k v k = v := by
+  simp [upd]
+
+theorem upd_other {α : Type} (f : Fd → α) {k x : Fd} (v : α) (h : x ≠ k) : upd f k v x = f x := by
+  simp [upd, h]
+
+inductive Label (I : Type) where
+  /-- `reactor.poll` returns `toks`; then `wheel.advance(now)` and the fired loop -/
+  | poll (now : Nat) (toks : List Fd)
+  /-- one `listener.accept()` returning `fd`; `regOk`: `reactor.register` succeeded -/
+  | accept (fd : Fd) (regOk : Bool)
+  /-- the accept drain loop hits EAGAIN: the listener event is done -/
+  | acceptDone
+  /-- the head event has a client token; the kernel shows the connection `i` -/
+  | dispatch (i : I)
+
+section Defs
+variable {S : Type}
+
+def initCfg : Cfg S :=
+  { now := 0, conns := fun _ => none, timers := fun _ => none, wheel := [],
+    nextTid := 1, nextGen := 0, batch := [], kills := [], fired := [] }
+
+def setConn (c : Cfg S) (f : Fd) (v : Option (Live S)) : Cfg S :=
+  { c with conns := upd c.conns f v }
+
+/-- The cancel half of `_apply_step` / `_cleanup_conn`:
+`_ = wheel.cancel(timers[fd]); _ = timers.pop(fd)`. -/
+def cancelFd (c : Cfg S) (f : Fd) : Cfg S :=
+  match c.timers f with
+  | some tid => { c with wheel := c.wheel.filter (fun t => t.id ≠ tid), timers := upd c.timers f none }
+  | none => c
+
+/-- `timers[fd] = wheel.schedule(ms, UInt64(fd))`. -/
+def schedule (c : Cfg S) (f : Fd) (ms gen : Nat) : Cfg S :=
+  { c with wheel := c.wheel ++ [⟨c.nextTid, f, c.now + ms, gen⟩],
+           timers := upd c.timers f (some c.nextTid), nextTid := c.nextTid + 1 }
+
+/-- mirrors flare/http/_reactor/lifecycle.mojo#_cleanup_conn sha=cff33bcd82f3 at=59bda50f
+(`cancel = false` is the variant without the cancel at 129-137: the entry
+is popped from `timers` but the timer stays in the wheel). -/
+def cleanup (cancel : Bool) (c : Cfg S) (f : Fd) : Cfg S :=
+  setConn (if cancel then cancelFd c f else { c with timers := upd c.timers f none }) f none
+
+def interestOf (r : StepResult) (old : Nat) : Nat :=
+  if r.wantRead || r.wantWrite then
+    (if r.wantRead then 1 else 0) + (if r.wantWrite then 2 else 0)
+  else old
+
+def liveAfter (l : Live S) (st : S) (r : StepResult) : Live S :=
+  { l with st := st, interest := interestOf r l.interest }
+
+/-- mirrors flare/http/_reactor/lifecycle.mojo#_apply_step sha=be67fb7132af at=59bda50f -/
+def applyStep (c : Cfg S) (f : Fd) (l : Live S) (st : S) (r : StepResult) : Cfg S :=
+  if r.idleMs = 0 then cancelFd (setConn c f (some (liveAfter l st r))) f
+  else if 0 < r.idleMs then
+    schedule (cancelFd (setConn c f (some (liveAfter l st r))) f) f r.idleMs.toNat l.gen
+  else setConn c f (some (liveAfter l st r))
+
+def logKill (c : Cfg S) (k : Kill) : Cfg S := { c with kills := c.kills ++ [k] }
+
+/-- `_expired_idle_conns` then `_cleanup_conn` on each: a fired connection
+is closed iff it is live and its `timers` entry is still the one recorded
+when it fired. -/
+def reapList (cancel : Bool) : Cfg S → List Fired → Cfg S
+  | c, [] => c
+  | c, e :: es =>
+    match c.conns e.t.tok with
+    | some l =>
+      if c.timers e.t.tok = e.snap then
+        reapList cancel (cleanup cancel (logKill c ⟨e.t.tok, l.gen, e.t.gen, e.t.due, e.time⟩) e.t.tok) es
+      else reapList cancel c es
+    | none => reapList cancel c es
+
+/-- The end of the previous iteration and `_collect_fired_timers` of this
+one: the previous iteration's fired connections are reaped, then the timers
+`ts` that fire at `tm` are recorded with their fd's `timers` entry. The model
+records before it reaps; this is the same as Mojo's order because a reaped fd
+has no timer left in the wheel (its entry is the fired timer's id), so no
+timer firing now is on it. -/
+def fireAll (cancel : Bool) (tm : Nat) (c : Cfg S) (ts : List Timer) : Cfg S :=
+  reapList cancel { c with fired := ts.map (fun t => ⟨t, c.timers t.tok, tm⟩) } c.fired
+
+/-- The reap after the previous batch, then `reactor.poll` returned `toks`
+and `_collect_fired_timers` (`wheel.advance(now)`). The poll guard in `step`
+checks `toks` against the connections left after the reap.
+mirrors flare/http/_server_reactor_epoll.mojo#_run_handler_loop_impl sha=2f9bbe6a6bd1 at=c738a911 -/
+def pollStep (cancel : Bool) (c : Cfg S) (now : Nat) (toks : List Fd) : Cfg S :=
+  fireAll cancel now { c with now := now, batch := toks, wheel := c.wheel.filter (fun t => now < t.due) }
+    (c.wheel.filter (fun t => t.due ≤ now))
+
+end Defs
+
+/-- One iteration of `_accept_loop` that got a socket and registered it
+(lifecycle.mojo:214-244). -/
+def acceptStep (M : ConnModel) (c : Cfg M.S) (fd : Fd) : Cfg M.S :=
+  if 0 < M.idleMs then
+    schedule { setConn c fd (some ⟨M.init, c.nextGen, 1⟩) with nextGen := c.nextGen + 1 } fd M.idleMs c.nextGen
+  else { setConn c fd (some ⟨M.init, c.nextGen, 1⟩) with nextGen := c.nextGen + 1 }
+
+/-- `register` succeeded (`true`) or failed and the socket was dropped (`false`). -/
+def acceptOr (M : ConnModel) (c : Cfg M.S) (fd : Fd) : Bool → Cfg M.S
+  | true => acceptStep M c fd
+  | false => c
+
+/-- The per-event body of the loop (`_server_reactor_epoll.mojo:195-254`). -/
+def dispatchAt (M : ConnModel) (P : Params) (c : Cfg M.S) (f : Fd) (i : M.I) : Cfg M.S :=
+  match c.conns f with
+  | none => c
+  | some l =>
+    if (M.onEvent l.st i).2.done then cleanup P.cancelOnCleanup c f
+    else applyStep c f l (M.onEvent l.st i).1 (M.onEvent l.st i).2
+
+/-- One machine step. -/
+def step (M : ConnModel) (P : Params) (c : Cfg M.S) : Label M.I → Option (Cfg M.S)
+  | .poll now toks =>
+    if c.batch = [] ∧ c.now ≤ now ∧
+        toks.all (fun k => k = listenerToken || ((pollStep P.cancelOnCleanup c now toks).conns k).isSome) = true then
+      some (pollStep P.cancelOnCleanup c now toks)
+    else none
+  | .accept fd regOk =>
+    if c.batch.head? = some listenerToken ∧ (c.conns fd).isNone = true ∧ fd ≠ P.lfd ∧
+        (P.stdinOpen = true → fd ≠ 0) ∧ fd < fdLimit then
+      some (acceptOr M c fd regOk)
+    else none
+  | .acceptDone =>
+    if c.batch.head? = some listenerToken then some { c with batch := c.batch.tail } else none
+  | .dispatch i =>
+    match c.batch with
+    | f :: rest => if f = listenerToken then none else some (dispatchAt M P { c with batch := rest } f i)
+    | [] => none
+
+def lts (M : ConnModel) (P : Params) : LTS (Cfg M.S) (Label M.I) :=
+  LTS.ofFn (fun c => c = initCfg) (step M P)
+
+/-! ## Frame lemmas: what each helper touches -/
+
+section Frame
+variable {S : Type}
+
+@[simp] theorem cancelFd_conns (c : Cfg S) (f : Fd) : (cancelFd c f).conns = c.conns := by
+  unfold cancelFd; split <;> rfl
+
+@[simp] theorem cancelFd_kills (c : Cfg S) (f : Fd) : (cancelFd c f).kills = c.kills := by
+  unfold cancelFd; split <;> rfl
+
+theorem cancelFd_timers_other (c : Cfg S) {f x : Fd} (hx : x ≠ f) :
+    (cancelFd c f).timers x = c.timers x := by
+  unfold cancelFd; split
+  · exact upd_other _ _ hx
+  · rfl
+
+theorem cancelFd_wheel_sub (c : Cfg S) (f : Fd) : ∀ t ∈ (cancelFd c f).wheel, t ∈ c.wheel := by
+  unfold cancelFd; split
+  · intro t ht; exact (List.mem_filter.1 ht).1
+  · intro t ht; exact ht
+
+theorem cleanup_conns_self (b : Bool) (c : Cfg S) (f : Fd) : (cleanup b c f).conns f = none := by
+  simp [cleanup, setConn]
+
+theorem cleanup_conns_other {b : Bool} {c : Cfg S} {f x : Fd} (hx : x ≠ f) :
+    (cleanup b c f).conns x = c.conns x := by
+  cases b <;> simp [cleanup, setConn, upd, hx]
+
+theorem cleanup_timers_other {b : Bool} {c : Cfg S} {f x : Fd} (hx : x ≠ f) :
+    (cleanup b c f).timers x = c.timers x := by
+  cases b
+  · simp [cleanup, setConn, upd, hx]
+  · simp only [cleanup, setConn, if_true]; exact cancelFd_timers_other c hx
+
+theorem cleanup_wheel_sub {b : Bool} {c : Cfg S} {f : Fd} : ∀ t ∈ (cleanup b c f).wheel, t ∈ c.wheel := by
+  intro t ht
+  cases b
+  · exact ht
+  · exact cancelFd_wheel_sub c f t ht
+
+theorem applyStep_conns_self (c : Cfg S) (f : Fd) (l : Live S) (st : S) (r : StepResult) :
+    (applyStep c f l st r).conns f = some (liveAfter l st r) := by
+  unfold applyStep
+  split
+  · simp [setConn]
+  · split <;> simp [schedule, setConn]
+
+theorem applyStep_conns_other (c : Cfg S) {f x : Fd} (l : Live S) (st : S) (r : StepResult) (hx : x ≠ f) :
+    (applyStep c f l st r).conns x = c.conns x := by
+  unfold applyStep
+  split
+  · simp [setConn, upd, hx]
+  · split <;> simp [schedule, setConn, upd, hx]
+
+theorem applyStep_timers_other (c : Cfg S) {f x : Fd} (l : Live S) (st : S) (r : StepResult) (hx : x ≠ f) :
+    (applyStep c f l st r).timers x = c.timers x := by
+  unfold applyStep
+  split
+  · rw [cancelFd_timers_other _ hx]; rfl
+  · split
+    · simp only [schedule]; rw [upd_other _ _ hx, cancelFd_timers_other _ hx]; rfl
+    · rfl
+
+theorem reapList_wheel_sub (b : Bool) :
+    ∀ (es : List Fired) (c : Cfg S), ∀ t ∈ (reapList b c es).wheel, t ∈ c.wheel
+  | [], c => fun t ht => ht
+  | e :: es, c => by
+    intro t ht
+    cases hc : c.conns e.t.tok with
+    | none => simp only [reapList, hc] at ht; exact reapList_wheel_sub b es c t ht
+    | some l =>
+      simp only [reapList, hc] at ht
+      split at ht
+      · exact cleanup_wheel_sub (c := logKill c _) t (reapList_wheel_sub b es _ t ht)
+      · exact reapList_wheel_sub b es c t ht
+
+theorem reapList_conns_sub (b : Bool) :
+    ∀ (es : List Fired) (c : Cfg S) (x : Fd) (l : Live S),
+      (reapList b c es).conns x = some l → c.conns x = some l
+  | [], _, _, _, h => h
+  | e :: es, c, x, l, h => by
+    cases hc : c.conns e.t.tok with
+    | none => simp only [reapList, hc] at h; exact reapList_conns_sub b es c x l h
+    | some l0 =>
+      simp only [reapList, hc] at h
+      split at h
+      · have h1 := reapList_conns_sub b es _ x l h
+        by_cases hx : x = e.t.tok
+        · subst hx; rw [cleanup_conns_self] at h1; cases h1
+        · rw [cleanup_conns_other hx] at h1; exact h1
+      · exact reapList_conns_sub b es c x l h
+
+theorem fireAll_wheel_sub (b : Bool) (tm : Nat) :
+    ∀ (ts : List Timer) (c : Cfg S), ∀ t ∈ (fireAll b tm c ts).wheel, t ∈ c.wheel :=
+  by intro ts c t ht; unfold fireAll at ht; have := reapList_wheel_sub b c.fired _ t ht; exact this
+
+theorem fireAll_conns_sub (b : Bool) (tm : Nat) :
+    ∀ (ts : List Timer) (c : Cfg S) (x : Fd) (l : Live S),
+      (fireAll b tm c ts).conns x = some l → c.conns x = some l :=
+  by intro ts c x l h; unfold fireAll at h; have := reapList_conns_sub b c.fired _ x l h; exact this
+
+/-- The poll guard in terms of the connections before the reap. -/
+theorem pollGuard_pre (b : Bool) (c : Cfg S) (now : Nat) (toks : List Fd)
+    (h : toks.all (fun k => k = listenerToken || ((pollStep b c now toks).conns k).isSome) = true) :
+    toks.all (fun k => k = listenerToken || (c.conns k).isSome) = true := by
+  rw [List.all_eq_true] at h ⊢
+  intro k hk
+  have := h k hk
+  simp only [Bool.or_eq_true, decide_eq_true_eq] at this ⊢
+  rcases this with e | e
+  · exact .inl e
+  · right
+    cases hp : (pollStep b c now toks).conns k with
+    | none => rw [hp] at e; cases e
+    | some l => have := fireAll_conns_sub b now _ _ k l hp; simp only at this; rw [this]; rfl
+
+theorem dispatchAt_conns_other (M : ConnModel) (P : Params) (c : Cfg M.S) {f x : Fd} (i : M.I)
+    (hx : x ≠ f) : (dispatchAt M P c f i).conns x = c.conns x := by
+  cases e : c.conns f with
+  | none => simp only [dispatchAt, e]
+  | some l =>
+    simp only [dispatchAt, e]
+    split
+    · exact cleanup_conns_other hx
+    · exact applyStep_conns_other _ _ _ _ hx
+
+theorem dispatchAt_timers_other (M : ConnModel) (P : Params) (c : Cfg M.S) {f x : Fd} (i : M.I)
+    (hx : x ≠ f) : (dispatchAt M P c f i).timers x = c.timers x := by
+  cases e : c.conns f with
+  | none => simp only [dispatchAt, e]
+  | some l =>
+    simp only [dispatchAt, e]
+    split
+    · exact cleanup_timers_other hx
+    · exact applyStep_timers_other _ _ _ _ hx
+
+theorem acceptStep_conns_other (M : ConnModel) (c : Cfg M.S) {fd x : Fd} (hx : x ≠ fd) :
+    (acceptStep M c fd).conns x = c.conns x := by
+  unfold acceptStep; split <;> simp [schedule, setConn, upd, hx]
+
+end Frame
+
+/-! ## Bookkeeping invariant -/
+
+section Inv
+variable {S : Type}
+
+/-- A recorded fired timer that the reap may still act on: it was due when
+it fired, its snapshot is an issued id, and if that snapshot is still its
+fd's `timers` entry the live connection there is the one that armed it. -/
+structure Pend (c : Cfg S) (e : Fired) : Prop where
+  due : e.t.due ≤ e.time
+  snap : ∃ id, e.snap = some id ∧ id < c.nextTid
+  gen : ∀ l, c.conns e.t.tok = some l → c.timers e.t.tok = e.snap → l.gen = e.t.gen
+
+/-- Every active timer belongs to the live incarnation that armed it and is
+the one recorded in `timers`; timer ids are fresh and distinct; every idle
+close so far hit the incarnation that armed the timer, at or after the
+deadline; `timers` holds only issued ids and only for live fds; every
+recorded fired timer is `Pend`. -/
+theorem Pend.mv {c c' : Cfg S} {e : Fired} (h : Pend c e) (h1 : c'.nextTid = c.nextTid)
+    (h2 : c'.conns = c.conns) (h3 : c'.timers = c.timers) : Pend c' e :=
+  ⟨h.due, by rw [h1]; exact h.snap, by rw [h2, h3]; exact h.gen⟩
+
+structure Inv (c : Cfg S) : Prop where
+  own : ∀ t ∈ c.wheel, ∃ l, c.conns t.tok = some l ∧ l.gen = t.gen ∧ c.timers t.tok = some t.id
+  fresh : ∀ t ∈ c.wheel, t.id < c.nextTid
+  nodup : c.wheel.Pairwise (fun a b => a.id ≠ b.id)
+  kills : ∀ k ∈ c.kills, k.victim = k.armer ∧ k.due ≤ k.time
+  tfresh : ∀ f id, c.timers f = some id → id < c.nextTid
+  live : ∀ f, c.conns f = none → c.timers f = none
+  pend : ∀ e ∈ c.fired, Pend c e
+
+theorem inv_init : Inv (initCfg : Cfg S) where
+  own := by simp [initCfg]
+  fresh := by simp [initCfg]
+  nodup := by simp [initCfg]
+  kills := by simp [initCfg]
+  tfresh := by simp [initCfg]
+  live := by simp [initCfg]
+  pend := by simp [initCfg]
+
+/-- Two active timers on the same fd are the same timer. -/
+theorem Inv.tok_unique {c : Cfg S} (h : Inv c) {a b : Timer} (ha : a ∈ c.wheel) (hb : b ∈ c.wheel)
+    (hab : a.tok = b.tok) : a.id = b.id := by
+  obtain ⟨_, _, _, ta⟩ := h.own a ha
+  obtain ⟨_, _, _, tb⟩ := h.own b hb
+  rw [hab, tb] at ta
+  exact (Option.some.inj ta).symm
+
+theorem cancelFd_timers_self (c : Cfg S) (f : Fd) : (cancelFd c f).timers f = none := by
+  unfold cancelFd; split
+  · simp
+  · assumption
+
+theorem cancelFd_timers_sub (c : Cfg S) (f x : Fd) {id : Nat} (h : (cancelFd c f).timers x = some id) :
+    c.timers x = some id := by
+  by_cases hx : x = f
+  · subst hx; rw [cancelFd_timers_self] at h; cases h
+  · rwa [cancelFd_timers_other c hx] at h
+
+theorem pend_cancelFd {c : Cfg S} {e : Fired} (h : Pend c e) (f : Fd) : Pend (cancelFd c f) e := by
+  obtain ⟨id, hs, _⟩ := h.snap
+  refine ⟨h.due, ?_, ?_⟩
+  · unfold cancelFd; split <;> exact h.snap
+  · intro l hl ht
+    rw [cancelFd_conns] at hl
+    by_cases hx : e.t.tok = f
+    · rw [hx, cancelFd_timers_self, hs] at ht; cases ht
+    · rw [cancelFd_timers_other c hx] at ht; exact h.gen l hl ht
+
+theorem pend_setConn {c : Cfg S} {e : Fired} (h : Pend c e) {f : Fd} {l l' : Live S}
+    (hl : c.conns f = some l) (hg : l'.gen = l.gen) : Pend (setConn c f (some l')) e := by
+  refine ⟨h.due, h.snap, ?_⟩
+  intro l0 h0 ht
+  by_cases hx : e.t.tok = f
+  · simp only [setConn, hx, upd_same, Option.some.injEq] at h0
+    subst h0; rw [hg]; exact h.gen l (by rw [hx]; exact hl) ht
+  · simp only [setConn, upd_other _ _ hx] at h0; exact h.gen l0 h0 ht
+
+theorem pend_setNone {c : Cfg S} {e : Fired} (h : Pend c e) (f : Fd) : Pend (setConn c f none) e := by
+  refine ⟨h.due, h.snap, ?_⟩
+  intro l0 h0 ht
+  by_cases hx : e.t.tok = f
+  · simp [setConn, hx] at h0
+  · simp only [setConn, upd_other _ _ hx] at h0; exact h.gen l0 h0 ht
+
+theorem pend_schedule {c : Cfg S} {e : Fired} (h : Pend c e) (f : Fd) (ms g : Nat) :
+    Pend (schedule c f ms g) e := by
+  obtain ⟨id, hs, hlt⟩ := h.snap
+  refine ⟨h.due, ⟨id, hs, by simp only [schedule]; omega⟩, ?_⟩
+  intro l0 h0 ht
+  by_cases hx : e.t.tok = f
+  · simp only [schedule, hx, upd_same, hs, Option.some.injEq] at ht; omega
+  · simp only [schedule, upd_other _ _ hx] at ht; exact h.gen l0 h0 ht
+
+theorem Inv.logKill {c : Cfg S} (h : Inv c) (k : Kill) (hk : k.victim = k.armer ∧ k.due ≤ k.time) :
+    Inv (logKill c k) := by
+  refine ⟨h.own, h.fresh, h.nodup, ?_, h.tfresh, h.live, fun e he => (h.pend e he).mv rfl rfl rfl⟩
+  intro k' hk'
+  simp only [Flare.Machine.logKill, List.mem_append, List.mem_singleton] at hk'
+  rcases hk' with hk' | rfl
+  · exact h.kills k' hk'
+  · exact hk
+
+/-- After `cancelFd`, no active timer is on `f`. -/
+theorem cancelFd_clear {c : Cfg S} (h : Inv c) (f : Fd) : ∀ t ∈ (cancelFd c f).wheel, t.tok ≠ f := by
+  intro t ht htf
+  cases e : c.timers f with
+  | none =>
+    simp only [cancelFd, e] at ht
+    obtain ⟨_, _, _, d⟩ := h.own t ht
+    rw [htf, e] at d; cases d
+  | some tid =>
+    simp only [cancelFd, e] at ht
+    obtain ⟨hm, hne⟩ := List.mem_filter.1 ht
+    obtain ⟨_, _, _, d⟩ := h.own t hm
+    rw [htf, e] at d
+    simp at hne
+    exact hne (Option.some.inj d).symm
+
+theorem cancelFd_inv {c : Cfg S} (h : Inv c) (f : Fd) : Inv (cancelFd c f) := by
+  have htf : ∀ x id, (cancelFd c f).timers x = some id → id < (cancelFd c f).nextTid := by
+    intro x id hx
+    have := h.tfresh x id (cancelFd_timers_sub c f x hx)
+    unfold cancelFd; split <;> exact this
+  have hlive : ∀ x, (cancelFd c f).conns x = none → (cancelFd c f).timers x = none := by
+    intro x hx
+    rw [cancelFd_conns] at hx
+    by_cases e : x = f
+    · rw [e]; exact cancelFd_timers_self c f
+    · rw [cancelFd_timers_other c e]; exact h.live x hx
+  have hpend : ∀ e ∈ (cancelFd c f).fired, Pend (cancelFd c f) e := by
+    intro e he
+    have he' : e ∈ c.fired := by unfold cancelFd at he; split at he <;> exact he
+    exact pend_cancelFd (h.pend e he') f
+  cases e : c.timers f with
+  | none =>
+    have hc : cancelFd c f = c := by simp only [cancelFd, e]
+    rw [hc]; exact h
+  | some tid =>
+    have hw : (cancelFd c f).wheel = c.wheel.filter (fun t => t.id ≠ tid) := by simp only [cancelFd, e]
+    refine ⟨?_, ?_, ?_, ?_, htf, hlive, hpend⟩
+    · intro t ht
+      rw [hw] at ht
+      obtain ⟨hm, hne⟩ := List.mem_filter.1 ht
+      obtain ⟨l, a, b, d⟩ := h.own t hm
+      have htf : t.tok ≠ f := by
+        intro htf; rw [htf, e] at d; simp at hne; exact hne (Option.some.inj d).symm
+      exact ⟨l, by rw [cancelFd_conns]; exact a, b, by rw [cancelFd_timers_other c htf]; exact d⟩
+    · intro t ht; rw [hw] at ht; simp only [cancelFd, e]; exact h.fresh t (List.mem_filter.1 ht).1
+    · rw [hw]; exact h.nodup.sublist List.filter_sublist
+    · rw [cancelFd_kills]; exact h.kills
+
+theorem cleanup_inv {c : Cfg S} (h : Inv c) (f : Fd) : Inv (cleanup true c f) := by
+  have h1 := cancelFd_inv h f
+  have hcl := cancelFd_clear h f
+  refine ⟨?_, h1.fresh, h1.nodup, h1.kills, h1.tfresh, ?_, ?_⟩
+  · intro t ht
+    obtain ⟨l, a, b, d⟩ := h1.own t ht
+    refine ⟨l, ?_, b, d⟩
+    show upd (cancelFd c f).conns f none t.tok = some l
+    rw [upd_other _ _ (hcl t ht)]; exact a
+  · intro x hx
+    show (cancelFd c f).timers x = none
+    by_cases e : x = f
+    · rw [e]; exact cancelFd_timers_self c f
+    · exact h1.live x (by simpa [cleanup, setConn, upd, e] using hx)
+  · intro e he; exact pend_setNone (h1.pend e he) f
+
+/-- Scheduling a timer for a live connection with no active timer keeps the invariant. -/
+theorem schedule_inv {c : Cfg S} (h : Inv c) (f : Fd) (ms : Nat) (l : Live S)
+    (hl : c.conns f = some l) (hclear : ∀ t ∈ c.wheel, t.tok ≠ f) :
+    Inv (schedule c f ms l.gen) := by
+  refine ⟨?_, ?_, ?_, h.kills, ?_, ?_, fun e he => pend_schedule (h.pend e he) f ms l.gen⟩
+  · intro t ht
+    simp only [schedule, List.mem_append, List.mem_singleton] at ht
+    rcases ht with ht | rfl
+    · obtain ⟨l', a, b, d⟩ := h.own t ht
+      exact ⟨l', a, b, by simpa [schedule, upd, hclear t ht] using d⟩
+    · exact ⟨l, hl, rfl, by simp [schedule]⟩
+  · intro t ht
+    simp only [schedule, List.mem_append, List.mem_singleton] at ht
+    rcases ht with ht | rfl
+    · have := h.fresh t ht; simp only [schedule]; omega
+    · simp [schedule]
+  · simp only [schedule]
+    rw [List.pairwise_append]
+    refine ⟨h.nodup, by simp, ?_⟩
+    intro a ha b hb
+    simp only [List.mem_singleton] at hb
+    subst hb
+    have := h.fresh a ha
+    simp only [ne_eq]; omega
+  · intro x id hx
+    simp only [schedule] at hx ⊢
+    by_cases e : x = f
+    · rw [e, upd_same] at hx; cases hx; omega
+    · rw [upd_other _ _ e] at hx; have := h.tfresh x id hx; omega
+  · intro x hx
+    simp only [schedule] at hx ⊢
+    by_cases e : x = f
+    · rw [e, hl] at hx; cases hx
+    · rw [upd_other _ _ e]; exact h.live x hx
+
+theorem setConn_inv {c : Cfg S} (h : Inv c) (f : Fd) (l l' : Live S) (hl : c.conns f = some l)
+    (hg : l'.gen = l.gen) : Inv (setConn c f (some l')) := by
+  refine ⟨?_, h.fresh, h.nodup, h.kills, h.tfresh, ?_, fun e he => pend_setConn (h.pend e he) hl hg⟩
+  · intro t ht
+    obtain ⟨l0, a, b, d⟩ := h.own t ht
+    by_cases e : t.tok = f
+    · rw [e, hl] at a
+      have := Option.some.inj a; subst this
+      exact ⟨l', by simp [setConn, e], by rw [hg]; exact b, d⟩
+    · exact ⟨l0, by simpa [setConn, upd, e] using a, b, d⟩
+  · intro x hx
+    by_cases e : x = f
+    · simp [setConn, e] at hx
+    · exact h.live x (by simpa [setConn, upd, e] using hx)
+
+theorem applyStep_inv {c : Cfg S} (h : Inv c) (f : Fd) (l : Live S) (st : S) (r : StepResult)
+    (hl : c.conns f = some l) : Inv (applyStep c f l st r) := by
+  have h1 := setConn_inv h f l (liveAfter l st r) hl rfl
+  have hl1 : (setConn c f (some (liveAfter l st r))).conns f = some (liveAfter l st r) := by
+    simp [setConn]
+  unfold applyStep
+  split
+  · exact cancelFd_inv h1 f
+  · split
+    · exact schedule_inv (cancelFd_inv h1 f) f r.idleMs.toNat (liveAfter l st r)
+        (by rw [cancelFd_conns]; exact hl1) (cancelFd_clear h1 f)
+    · exact h1
+
+theorem pend_cleanup {c : Cfg S} {e : Fired} (h : Pend c e) (f : Fd) : Pend (cleanup true c f) e :=
+  pend_setNone (pend_cancelFd h f) f
+
+/-- The reap keeps the invariant and logs only correct kills. -/
+theorem reapList_inv :
+    ∀ (es : List Fired) (c : Cfg S), Inv c → (∀ e ∈ es, Pend c e) → Inv (reapList true c es)
+  | [], c, h, _ => h
+  | e :: es, c, h, hp => by
+    have hes : ∀ x ∈ es, Pend c x := fun x hx => hp x (List.mem_cons_of_mem _ hx)
+    have he := hp e (List.mem_cons_self ..)
+    cases hc : c.conns e.t.tok with
+    | none => simp only [reapList, hc]; exact reapList_inv es c h hes
+    | some l =>
+      simp only [reapList, hc]
+      split
+      · rename_i ht
+        exact reapList_inv es _
+          (cleanup_inv (h.logKill _ ⟨he.gen l hc ht, he.due⟩) _)
+          (fun x hx => pend_cleanup (c := logKill c _) ((hes x hx).mv rfl rfl rfl) _)
+      · exact reapList_inv es c h hes
+
+/-- The poll keeps the invariant and logs only correct kills, provided the
+timers firing now are due, each is owned by the live incarnation that armed
+it and is its fd's `timers` entry. -/
+theorem fireAll_inv (tm : Nat) :
+    ∀ (ts : List Timer) (c : Cfg S), Inv c →
+      (∀ t ∈ ts, t.due ≤ tm) →
+      (∀ t ∈ ts, ∃ l, c.conns t.tok = some l ∧ l.gen = t.gen) →
+      (∀ t ∈ ts, c.timers t.tok = some t.id) →
+      ts.Pairwise (fun a b => a.tok ≠ b.tok) →
+      Inv (fireAll true tm c ts) := by
+  intro ts c h hdue hown htm _
+  unfold fireAll
+  apply reapList_inv
+  · refine ⟨h.own, h.fresh, h.nodup, h.kills, h.tfresh, h.live, ?_⟩
+    intro e he
+    obtain ⟨t, ht, rfl⟩ := List.mem_map.1 he
+    refine ⟨hdue t ht, ⟨t.id, htm t ht, h.tfresh _ _ (htm t ht)⟩, ?_⟩
+    intro l hl _
+    obtain ⟨l', a, b⟩ := hown t ht
+    change c.conns t.tok = some l at hl
+    rw [a] at hl; cases hl; exact b
+  · intro e he; exact (h.pend e he).mv rfl rfl rfl
+
+theorem pollStep_inv {c : Cfg S} (h : Inv c) (now : Nat) (toks : List Fd) :
+    Inv (pollStep true c now toks) := by
+  unfold pollStep
+  have hsub : ∀ t ∈ c.wheel.filter (fun t => t.due ≤ now), t ∈ c.wheel :=
+    fun t ht => (List.mem_filter.1 ht).1
+  apply fireAll_inv
+  · exact ⟨fun t ht => h.own t (List.mem_filter.1 ht).1, fun t ht => h.fresh t (List.mem_filter.1 ht).1,
+      h.nodup.sublist List.filter_sublist, h.kills, h.tfresh, h.live, fun e he => (h.pend e he).mv rfl rfl rfl⟩
+  · intro t ht; simpa using (List.mem_filter.1 ht).2
+  · intro t ht
+    obtain ⟨l, a, b, _⟩ := h.own t (hsub t ht)
+    exact ⟨l, a, b⟩
+  · intro t ht
+    obtain ⟨_, _, _, d⟩ := h.own t (hsub t ht)
+    exact d
+  · have hn := h.nodup.sublist (List.filter_sublist (p := fun t => decide (t.due ≤ now)))
+    exact List.Pairwise.imp_of_mem (fun ha hb hab e => hab (h.tok_unique (hsub _ ha) (hsub _ hb) e)) hn
+
+theorem acceptStep_inv (M : ConnModel) {c : Cfg M.S} (h : Inv c) (fd : Fd) (hnone : c.conns fd = none) :
+    Inv (acceptStep M c fd) := by
+  have hclear : ∀ t ∈ c.wheel, t.tok ≠ fd := by
+    intro t ht e
+    obtain ⟨_, a, _, _⟩ := h.own t ht
+    rw [e, hnone] at a; cases a
+  have h1 : Inv { setConn c fd (some ⟨M.init, c.nextGen, 1⟩) with nextGen := c.nextGen + 1 } := by
+    refine ⟨?_, h.fresh, h.nodup, h.kills, h.tfresh, ?_, ?_⟩
+    · intro t ht
+      obtain ⟨l, a, b, d⟩ := h.own t ht
+      exact ⟨l, by simpa [setConn, upd, hclear t ht] using a, b, d⟩
+    · intro x hx
+      by_cases e : x = fd
+      · simp [setConn, e] at hx
+      · exact h.live x (by simpa [setConn, upd, e] using hx)
+    · intro e he
+      have hp := h.pend e he
+      refine ⟨hp.due, hp.snap, ?_⟩
+      intro l0 h0 ht
+      by_cases hx : e.t.tok = fd
+      · obtain ⟨id, hs, _⟩ := hp.snap
+        change c.timers e.t.tok = e.snap at ht
+        rw [hx, h.live fd hnone, hs] at ht; cases ht
+      · exact hp.gen l0 (by simpa [setConn, upd, hx] using h0) ht
+  unfold acceptStep
+  split
+  · exact schedule_inv h1 fd M.idleMs ⟨M.init, c.nextGen, 1⟩ (by simp [setConn]) hclear
+  · exact h1
+
+theorem dispatchAt_inv (M : ConnModel) (P : Params) (hP : P.cancelOnCleanup = true)
+    {c : Cfg M.S} (h : Inv c) (f : Fd) (i : M.I) : Inv (dispatchAt M P c f i) := by
+  cases e : c.conns f with
+  | none => simp only [dispatchAt, e]; exact h
+  | some l =>
+    simp only [dispatchAt, e]
+    split
+    · rw [hP]; exact cleanup_inv h f
+    · exact applyStep_inv h f l _ _ e
+
+theorem Inv.batch {c : Cfg S} (h : Inv c) (b : List Fd) : Inv { c with batch := b } :=
+  ⟨h.own, h.fresh, h.nodup, h.kills, h.tfresh, h.live, fun e he => (h.pend e he).mv rfl rfl rfl⟩
+
+theorem inv_step (M : ConnModel) (P : Params) (hP : P.cancelOnCleanup = true)
+    (c c' : Cfg M.S) (lab : Label M.I) (h : Inv c) (hs : step M P c lab = some c') : Inv c' := by
+  cases lab with
+  | poll now toks =>
+    simp only [step] at hs
+    split at hs
+    · cases hs; rw [hP]; exact pollStep_inv h now toks
+    · cases hs
+  | accept fd regOk =>
+    simp only [step] at hs
+    split at hs
+    · rename_i hc
+      cases hs
+      cases regOk
+      · exact h
+      · simp only [acceptOr]; exact acceptStep_inv M h fd (Option.isNone_iff_eq_none.1 hc.2.1)
+    · cases hs
+  | acceptDone =>
+    simp only [step] at hs
+    split at hs
+    · cases hs; exact h.batch _
+    · cases hs
+  | dispatch i =>
+    simp only [step] at hs
+    cases hb : c.batch with
+    | nil => simp [hb] at hs
+    | cons f rest =>
+      simp only [hb] at hs
+      split at hs
+      · cases hs
+      · cases hs
+        exact dispatchAt_inv M P hP (c := { c with batch := rest }) (h.batch rest) f i
+
+/-- **Bookkeeping invariant.** With flare's `_cleanup_conn` (timer cancelled),
+`Inv` is an inductive invariant of the worker. -/
+theorem inv_reachable (M : ConnModel) (P : Params) (hP : P.cancelOnCleanup = true) :
+    (lts M P).Inductive Inv :=
+  { init := fun s hs => by subst hs; exact inv_init
+    step := fun s l s' h hs => inv_step M P hP s s' l h hs }
+
+/-- **No stale timer.** In every reachable state of flare's worker, every
+connection an idle timer has closed was the incarnation that armed the timer,
+never a later connection that reused the fd number. -/
+theorem no_stale_timer (M : ConnModel) (P : Params) (hP : P.cancelOnCleanup = true)
+    (c : Cfg M.S) (hr : (lts M P).Reachable c) : ∀ k ∈ c.kills, k.victim = k.armer :=
+  fun k hk => (((inv_reachable M P hP).reachable c hr).kills k hk).1
+
+/-- **No early close.** Idle closes happen only once the deadline has passed. -/
+theorem no_early_close (M : ConnModel) (P : Params) (hP : P.cancelOnCleanup = true)
+    (c : Cfg M.S) (hr : (lts M P).Reachable c) : ∀ k ∈ c.kills, k.due ≤ k.time :=
+  fun k hk => (((inv_reachable M P hP).reachable c hr).kills k hk).2
+
+end Inv
+
+/-! ## Timing, isolation, and lifting connection invariants -/
+
+/-- **No late close.** Right after a poll at time `now`, no active timer is
+due at or before `now`: every due timer fired in that poll. -/
+theorem no_late_close (M : ConnModel) (P : Params) (c c' : Cfg M.S) (now : Nat) (toks : List Fd)
+    (hs : step M P c (.poll now toks) = some c') : ∀ t ∈ c'.wheel, now < t.due := by
+  simp only [step] at hs
+  split at hs
+  · cases hs
+    intro t ht
+    have := fireAll_wheel_sub _ _ _ _ t ht
+    simpa using (List.mem_filter.1 this).2
+  · cases hs
+
+/-- **Isolation.** Dispatching an event for fd `f` leaves every other
+connection and its `timers` entry unchanged. -/
+theorem dispatch_isolated (M : ConnModel) (P : Params) (c c' : Cfg M.S) (i : M.I)
+    (hs : step M P c (.dispatch i) = some c') (f : Fd) (hf : c.batch.head? = some f)
+    (g : Fd) (hg : g ≠ f) : c'.conns g = c.conns g ∧ c'.timers g = c.timers g := by
+  simp only [step] at hs
+  cases hb : c.batch with
+  | nil => simp [hb] at hs
+  | cons f' rest =>
+    rw [hb] at hf; simp at hf; subst hf
+    simp only [hb] at hs
+    split at hs
+    · cases hs
+    · cases hs
+      exact ⟨dispatchAt_conns_other M P _ i hg, dispatchAt_timers_other M P _ i hg⟩
+
+/-- States the connection model can reach from `init`. -/
+inductive ConnReach (M : ConnModel) : M.S → Prop
+  | init : ConnReach M M.init
+  | step {s : M.S} (i : M.I) : ConnReach M s → ConnReach M (M.onEvent s i).1
+
+/-- Every live connection's state is reachable in the connection model. -/
+def LiveReach (M : ConnModel) (c : Cfg M.S) : Prop := ∀ f l, c.conns f = some l → ConnReach M l.st
+
+section Lift
+variable {M : ConnModel}
+
+theorem liveReach_cleanup {c : Cfg M.S} (h : LiveReach M c) (b : Bool) (f : Fd) :
+    LiveReach M (cleanup b c f) := by
+  intro x l hx
+  by_cases e : x = f
+  · subst e; rw [cleanup_conns_self] at hx; cases hx
+  · rw [cleanup_conns_other e] at hx; exact h x l hx
+
+theorem liveReach_applyStep {c : Cfg M.S} (h : LiveReach M c) {f : Fd} {l : Live M.S} {st : M.S}
+    (r : StepResult) (hst : ConnReach M st) : LiveReach M (applyStep c f l st r) := by
+  intro x l' hx
+  by_cases e : x = f
+  · subst e; rw [applyStep_conns_self] at hx
+    have := Option.some.inj hx; subst this; exact hst
+  · rw [applyStep_conns_other _ _ _ _ e] at hx; exact h x l' hx
+
+theorem liveReach_fireAll (b : Bool) (tm : Nat) :
+    ∀ (ts : List Timer) (c : Cfg M.S), LiveReach M c → LiveReach M (fireAll b tm c ts) :=
+  fun ts c h x l hx => h x l (fireAll_conns_sub b tm ts c x l hx)
+
+theorem liveReach_step (P : Params) (c c' : Cfg M.S) (lab : Label M.I)
+    (h : LiveReach M c) (hs : step M P c lab = some c') : LiveReach M c' := by
+  cases lab with
+  | poll now toks =>
+    simp only [step] at hs; split at hs
+    · cases hs; exact liveReach_fireAll _ _ _ _ (fun x l hx => h x l hx)
+    · cases hs
+  | accept fd regOk =>
+    simp only [step] at hs; split at hs
+    · cases hs
+      cases regOk
+      · exact h
+      · intro x l hx
+        simp only [acceptOr] at hx
+        by_cases e : x = fd
+        · subst e
+          unfold acceptStep at hx
+          split at hx <;> simp [schedule, setConn] at hx <;> (subst hx; exact .init)
+        · rw [acceptStep_conns_other M c e] at hx; exact h x l hx
+    · cases hs
+  | acceptDone =>
+    simp only [step] at hs; split at hs
+    · cases hs; exact fun x l hx => h x l hx
+    · cases hs
+  | dispatch i =>
+    simp only [step] at hs
+    cases hb : c.batch with
+    | nil => simp [hb] at hs
+    | cons f rest =>
+      simp only [hb] at hs
+      split at hs
+      · cases hs
+      · cases hs
+        have h1 : LiveReach M { c with batch := rest } := fun x l hx => h x l hx
+        cases e : c.conns f with
+        | none => simp only [dispatchAt, e]; exact h1
+        | some l =>
+          simp only [dispatchAt, e]
+          split
+          · exact liveReach_cleanup h1 _ _
+          · exact liveReach_applyStep h1 _ (.step i (h f l e))
+
+end Lift
+
+/-- **Connection invariants lift to the server.** If `Q` is an invariant of
+the connection model, every live connection of every reachable machine state
+satisfies it. -/
+theorem conn_invariant_lifts (M : ConnModel) (P : Params) (Q : M.S → Prop)
+    (h0 : Q M.init) (hstep : ∀ s i, Q s → Q (M.onEvent s i).1)
+    (c : Cfg M.S) (hr : (lts M P).Reachable c) : ∀ f l, c.conns f = some l → Q l.st := by
+  have hind : (lts M P).Inductive (LiveReach M) :=
+    { init := fun s hs => by subst hs; intro f l h; simp [initCfg] at h
+      step := fun s l s' h hs => liveReach_step P s s' l h hs }
+  have key : ∀ s, ConnReach M s → Q s := by
+    intro s hs
+    induction hs with
+    | init => exact h0
+    | step i _ ih => exact hstep _ i ih
+  exact fun f l hf => key _ (hind.reachable c hr f l hf)
+
+/-! ## The listener token and a client on fd 0 -/
+
+/-- **Routing.** No live connection has the listener's token, so every
+listener-token event the loop hands to the accept drainer is the listener's.
+The token is above every fd, so this holds whether or not stdin is open. -/
+theorem routing_ok (M : ConnModel) (P : Params)
+    (c : Cfg M.S) (hr : (lts M P).Reachable c) : c.conns listenerToken = none := by
+  have hind : (lts M P).Inductive (fun c : Cfg M.S => c.conns listenerToken = none) := by
+    refine ⟨fun s hs => by subst hs; rfl, ?_⟩
+    intro s lab s' h hs
+    show s'.conns listenerToken = none
+    change step M P s lab = some s' at hs
+    cases lab with
+    | poll now toks =>
+      simp only [step] at hs; split at hs
+      · cases hs
+        cases e : (pollStep P.cancelOnCleanup s now toks).conns listenerToken with
+        | none => rfl
+        | some l =>
+          have := fireAll_conns_sub _ _ _ _ listenerToken l e
+          change s.conns listenerToken = some l at this
+          rw [h] at this; cases this
+      · cases hs
+    | accept fd regOk =>
+      simp only [step] at hs; split at hs
+      · rename_i hc
+        have hfd : listenerToken ≠ fd := by
+          intro e
+          have := hc.2.2.2.2
+          rw [← e] at this
+          exact absurd this (Nat.not_lt.2 fdLimit_le_listenerToken)
+        cases hs
+        cases regOk
+        · exact h
+        · simp only [acceptOr]; rw [acceptStep_conns_other M s hfd]; exact h
+      · cases hs
+    | acceptDone =>
+      simp only [step] at hs; split at hs
+      · cases hs; exact h
+      · cases hs
+    | dispatch i =>
+      simp only [step] at hs
+      cases hb : s.batch with
+      | nil => simp [hb] at hs
+      | cons f rest =>
+        simp only [hb] at hs
+        split at hs
+        · cases hs
+        · rename_i hf0
+          cases hs
+          rw [dispatchAt_conns_other M P _ i (Ne.symm hf0)]; exact h
+  exact hind.reachable c hr
+
+/-! ## Concrete traces -/
+
+/-- A toy connection: counts the events it has seen and keeps reading; the
+event payload says whether this event ends the connection (peer FIN or an
+error). Idle timeout 10 ms. -/
+abbrev counter : ConnModel where
+  S := Nat
+  I := Bool
+  init := 0
+  onEvent := fun s fin => (s + 1, ⟨true, false, fin, -1⟩)
+  idleMs := 10
+
+def flareP : Params := ⟨3, true, true⟩
+def noCancelP : Params := ⟨3, true, false⟩
+def stdinClosedP : Params := ⟨3, false, true⟩
+def runSteps (M : ConnModel) (P : Params) : Cfg M.S → List (Label M.I) → Option (Cfg M.S)
+  | c, [] => some c
+  | c, l :: ls => (step M P c l).bind (runSteps M P · ls)
+
+theorem runSteps_run (M : ConnModel) (P : Params) :
+    ∀ (ls : List (Label M.I)) (c c' : Cfg M.S), runSteps M P c ls = some c' → (lts M P).Run c ls c'
+  | [], c, c', h => by
+    simp only [runSteps, Option.some.injEq] at h; subst h; exact .nil _
+  | l :: ls, c, c', h => by
+    simp only [runSteps] at h
+    cases e : step M P c l with
+    | none => rw [e] at h; cases h
+    | some c1 => rw [e] at h; exact .cons e (runSteps_run M P ls c1 c' h)
+
+/-- Accept fd 5 at t=0 (timer due at 10), the peer closes at t=1, a new
+connection reuses fd 5 at t=5 (its timer is due at 15), then poll at t=10
+and t=11 (the reap after the t=10 batch). -/
+def reuseTrace : List (Label Bool) :=
+  [.poll 0 [listenerToken], .accept 5 true, .acceptDone,
+   .poll 1 [5], .dispatch true,
+   .poll 5 [listenerToken], .accept 5 true, .acceptDone,
+   .poll 10 [], .poll 11 []]
+
+/-- With flare's cancel-on-cleanup, nothing fires at t=10 and nothing is
+closed. -/
+theorem reuse_with_cancel :
+    (runSteps counter flareP initCfg reuseTrace).map (·.kills) = some [] := by decide
+
+/-- Without the cancel, the first connection's timer fires at t=10 while
+`timers[5]` holds the second connection's timer, so the reap closes the
+second connection (incarnation 1), 5 ms into its 10 ms idle budget. -/
+theorem stale_timer_trace :
+    (runSteps counter noCancelP initCfg reuseTrace).map (·.kills) = some [⟨5, 1, 0, 10, 10⟩] := by
+  decide
+
+/-- **The cancel is necessary**: the variant without it reaches a state
+where an idle timer closed a connection it was not armed for. -/
+theorem stale_timer_without_cancel :
+    ∃ c, (lts counter noCancelP).Reachable c ∧ ∃ k ∈ c.kills, k.victim ≠ k.armer := by
+  cases h : runSteps counter noCancelP initCfg reuseTrace with
+  | none => have := stale_timer_trace; rw [h] at this; cases this
+  | some c =>
+    have hk := stale_timer_trace
+    rw [h] at hk
+    simp only [Option.map_some, Option.some.injEq] at hk
+    exact ⟨c, ⟨initCfg, reuseTrace, rfl, runSteps_run _ _ _ _ _ h⟩, ⟨5, 1, 0, 10, 10⟩,
+      by rw [hk]; simp, by decide⟩
+
+/-- Incarnation 0 on fd 5 has its idle timer fire at t=10, in the same poll
+that harvests its peer's FIN and a new connection. The FIN closes it, the
+accept drainer gets fd 5 again for incarnation 1, and the reap after that
+batch (at the t=11 poll) finds `timers[5]` changed. -/
+def batchTrace : List (Label Bool) :=
+  [.poll 0 [listenerToken], .accept 5 true, .acceptDone,
+   .poll 10 [5, listenerToken], .dispatch true, .accept 5 true, .acceptDone,
+   .poll 11 []]
+
+/-- **The deferred reap spares a re-accepted fd**: the timer that fired for
+incarnation 0 closes nothing, and incarnation 1 stays live. -/
+theorem stale_event_redelivered :
+    (runSteps counter flareP initCfg batchTrace).map
+      (fun c => (c.kills, (c.conns 5).map (fun l => (l.gen, l.st)))) =
+      some ([], some (1, 0)) := by
+  decide
+
+/-- Stdin closed: the client accepted on fd 0 is registered under token 0,
+which is not the listener's, so its next event reaches it. -/
+def fd0Trace : List (Label Bool) :=
+  [.poll 0 [listenerToken], .accept 0 true, .acceptDone, .poll 1 [0], .dispatch false]
+
+/-- **A client on fd 0 is served**: after the accept, its event is
+dispatched and the connection's state changes (the toy connection counts the
+events it has seen). -/
+theorem fd0_served :
+    (runSteps counter stdinClosedP initCfg fd0Trace).map
+      (fun c => ((c.conns 0).map (·.st), c.batch)) = some (some 1, []) := by
+  decide
+
+end Flare.Machine

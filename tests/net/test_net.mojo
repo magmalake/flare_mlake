@@ -160,6 +160,39 @@ def test_ip_addr_v6_link_local() raises:
 # ── IpAddr: equality and comparison ───────────────────────────────────────────
 
 
+def test_ip_addr_multicast_v6_exact_ff00_8() raises:
+    """ENC-01: ``is_multicast`` tested ``startswith("ff")`` on the text, so
+    first groups 0x00ff and 0x0ff0..0x0fff (printed ``ff::``, ``fff::``)
+    were reported as multicast. Multicast is ``ff00::/8`` (RFC 4291 2.7)."""
+    # Real multicast: first byte 0xff.
+    assert_true(IpAddr.parse("ff02::1").is_multicast())
+    assert_true(IpAddr.parse("ff00::").is_multicast())
+    assert_true(IpAddr.parse("ffff::1").is_multicast())
+    assert_true(IpAddr.parse("ff0e:1:2:3:4:5:6:7").is_multicast())
+    # First group 0x00ff, stored as "ff::1".
+    var a = IpAddr.parse("00ff::1")
+    assert_equal(String(a), "ff::1")
+    assert_false(a.is_multicast())
+    # First groups 0x0ff0..0x0fff, stored with three digits.
+    assert_false(IpAddr.parse("fff::").is_multicast())
+    assert_false(IpAddr.parse("0ff0::1").is_multicast())
+    assert_false(IpAddr.parse("ff0:1::").is_multicast())
+    assert_false(IpAddr.parse("ff:0:0:0:0:0:0:1").is_multicast())
+    # Neighbours of ff00::/8 and the usual non-multicast shapes.
+    assert_false(IpAddr.parse("fe80::1").is_multicast())
+    assert_false(IpAddr.parse("fe00::1").is_multicast())
+    assert_false(IpAddr.parse("::1").is_multicast())
+    assert_false(IpAddr.parse("::ffff:1.2.3.4").is_multicast())
+    assert_false(IpAddr.parse("2001:db8::ff").is_multicast())
+
+
+def test_ip_addr_multicast_v4_unchanged() raises:
+    assert_true(IpAddr.parse("224.0.0.1").is_multicast())
+    assert_true(IpAddr.parse("239.255.255.255").is_multicast())
+    assert_false(IpAddr.parse("223.255.255.255").is_multicast())
+    assert_false(IpAddr.parse("240.0.0.1").is_multicast())
+
+
 def test_ip_addr_equality_v4() raises:
     """Two IpAddrs from the same string must be equal."""
     var a = IpAddr.parse("10.0.0.1")
@@ -418,6 +451,47 @@ def test_dns_error_zero_code() raises:
     var e = DnsError("bad.host", 0, "no addresses returned")
     assert_true(String(e).find("bad.host") != -1)
     assert_true(String(e).find("no addresses returned") != -1)
+
+
+def test_socketaddr_parse_rejects_ports_out_of_range() raises:
+    """``UInt16(atol(...))`` wrapped: 70000 became 4464, -1 became
+    65535."""
+    assert_equal(Int(SocketAddr.parse("127.0.0.1:65535").port), 65535)
+    assert_equal(Int(SocketAddr.parse("[::1]:0").port), 0)
+    for bad in [
+        "127.0.0.1:70000",
+        "127.0.0.1:-1",
+        "127.0.0.1:+80",
+        "127.0.0.1: 80",
+        "127.0.0.1:",
+        "127.0.0.1:080000",
+        "[::1]:65536",
+    ]:
+        var raised = False
+        try:
+            _ = SocketAddr.parse(String(bad))
+        except:
+            raised = True
+        assert_true(raised, "parsed " + String(bad))
+
+
+def test_sockets_are_close_on_exec() raises:
+    """Listeners and accepted connections were inherited across exec."""
+    from std.ffi import c_int, external_call
+    from flare.tcp import TcpListener, TcpStream
+
+    var lis = TcpListener.bind(SocketAddr.localhost(0))
+    var c = TcpStream.connect(SocketAddr.localhost(lis.local_addr().port))
+    var a = lis.accept()
+    for fd in [lis._socket.fd, c._socket.fd, a._socket.fd]:
+        var flags = external_call["fcntl", c_int](
+            fd, c_int(1), c_int(0)
+        )  # F_GETFD
+        assert_true(flags >= c_int(0))
+        assert_true((flags & c_int(1)) != c_int(0), "fd not close-on-exec")
+    _ = a^
+    _ = c^
+    _ = lis^
 
 
 def main() raises:

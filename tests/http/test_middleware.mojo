@@ -15,6 +15,7 @@ Covers:
 from std.testing import assert_equal, assert_false, assert_raises, assert_true
 
 from flare.http import (
+    AltSvc,
     CatchPanic,
     Compress,
     Handler,
@@ -100,6 +101,25 @@ struct _PreEncoded(Copyable, Defaultable, Handler):
         return resp^
 
 
+@fieldwise_init
+struct _Partial(Copyable, Defaultable, Handler):
+    """Returns what ``FileServer`` returns for ``Range: bytes=0-2047``: a 206
+    with 2048 identity bytes and the matching ``Content-Range``."""
+
+    var status: Int
+
+    def __init__(out self):
+        self.status = 206
+
+    def serve(self, req: Request) raises -> Response:
+        var resp = Response(status=self.status)
+        resp.body = List[UInt8](length=2048, fill=UInt8(65))
+        resp.headers.set("Content-Range", "bytes 0-2047/10000")
+        resp.headers.set("Content-Length", "2048")
+        resp.headers.set("Accept-Ranges", "bytes")
+        return resp^
+
+
 # ── negotiate_encoding ────────────────────────────────────────────────────
 
 
@@ -134,9 +154,53 @@ def test_negotiate_q_zero_rejects_encoding() raises:
     assert_equal(p.quality, 0)
 
 
-def test_negotiate_wildcard_falls_back_to_identity() raises:
+def test_negotiate_wildcard_alone_selects_best_available_coding() raises:
+    """``*`` gives every coding without its own entry the wildcard weight
+    (RFC 9110 sec 12.5.3), so a bare ``*`` is acceptable for gzip / br and
+    the usual tie-break (br > gzip > identity) picks the coding. It used to
+    be pinned to identity, which was the APP-20 wildcard bug (Decision:
+    expectation updated with the fix)."""
     var p = negotiate_encoding("*", False)
-    assert_equal(p.encoding, "identity")
+    assert_equal(p.encoding, "gzip")
+    assert_equal(p.quality, 1000)
+    var b = negotiate_encoding("*", True)
+    assert_equal(b.encoding, "br")
+
+
+def test_negotiate_wildcard_weight_applies_to_unlisted_codings() raises:
+    """APP-20: ``gzip;q=0.5, *`` gives br weight 1 through ``*``."""
+    var p = negotiate_encoding("gzip;q=0.5, *", True)
+    assert_equal(p.encoding, "br")
+    assert_equal(p.quality, 1000)
+    var g = negotiate_encoding("gzip;q=0.5, *;q=0.2", False)
+    assert_equal(g.encoding, "gzip")
+    assert_equal(g.quality, 500)
+
+
+def test_negotiate_wildcard_is_order_independent() raises:
+    """APP-20: the same entries in another order give the same pick."""
+    for brotli in [True, False]:
+        var a = negotiate_encoding("gzip;q=0.5, *", brotli)
+        var b = negotiate_encoding("*, gzip;q=0.5", brotli)
+        assert_equal(a.encoding, b.encoding)
+        assert_equal(a.quality, b.quality)
+    var c = negotiate_encoding("*;q=0.3, br;q=0.4, gzip;q=0.1", True)
+    var d = negotiate_encoding("gzip;q=0.1, *;q=0.3, br;q=0.4", True)
+    assert_equal(c.encoding, "br")
+    assert_equal(d.encoding, "br")
+
+
+def test_negotiate_identity_refused_with_wildcard() raises:
+    """APP-20: ``identity;q=0, *`` must not select the refused identity."""
+    var p = negotiate_encoding("identity;q=0, *", False)
+    assert_equal(p.encoding, "gzip")
+    assert_equal(p.quality, 1000)
+    var q = negotiate_encoding("*, identity;q=0", False)
+    assert_equal(q.encoding, "gzip")
+    var r = negotiate_encoding("*;q=0", True)
+    assert_equal(r.quality, 0)
+    var t = negotiate_encoding("gzip;q=0, identity;q=0, *;q=0.5", False)
+    assert_equal(t.quality, 0)
 
 
 # ── Logger / RequestId ────────────────────────────────────────────────────
@@ -173,6 +237,23 @@ def test_request_id_generates_when_absent() raises:
     var generated = resp.headers.get("x-request-id")
     assert_true(generated.byte_length() > 0)
     assert_true(generated.startswith("req-"))
+
+
+def test_alt_svc_advertises_h3_and_keeps_a_handler_value() raises:
+    var a = AltSvc(_Echo(status=200, body="hi"), 8443, max_age_s=3600)
+    var resp = a.serve(Request(method=Method.GET, url="/"))
+    assert_equal(resp.headers.get("alt-svc"), 'h3=":8443"; ma=3600')
+    var b = AltSvc(_AltSvcSet(), 8443)
+    var own = b.serve(Request(method=Method.GET, url="/"))
+    assert_equal(own.headers.get("alt-svc"), "clear")
+
+
+@fieldwise_init
+struct _AltSvcSet(Copyable, Handler):
+    def serve(self, req: Request) raises -> Response:
+        var r = ok("x")
+        r.headers.set("Alt-Svc", "clear")
+        return r^
 
 
 # ── Compress ──────────────────────────────────────────────────────────────
@@ -212,6 +293,96 @@ def test_compress_already_encoded_skipped() raises:
     req.headers.set("Accept-Encoding", "gzip")
     var resp = c.serve(req)
     assert_equal(resp.headers.get("content-encoding"), "br")
+
+
+def test_compress_partial_content_passthrough() raises:
+    """APP-26: a 206 keeps its identity body, Content-Range and
+    Content-Length; the offsets refer to the unencoded representation."""
+    var c = Compress(_Partial(), min_size_bytes=1024)
+    var req = Request(method=Method.GET, url="/big.bin")
+    req.headers.set("Range", "bytes=0-2047")
+    req.headers.set("Accept-Encoding", "gzip, br")
+    var resp = c.serve(req)
+    assert_equal(resp.status, 206)
+    assert_false(resp.headers.contains("content-encoding"))
+    assert_equal(len(resp.body), 2048)
+    assert_equal(resp.headers.get("content-range"), "bytes 0-2047/10000")
+    assert_equal(resp.headers.get("content-length"), "2048")
+
+
+def test_compress_content_range_header_passthrough() raises:
+    """APP-26: any response carrying Content-Range is passed through, even
+    when its status is not 206."""
+    var c = Compress(_Partial(status=200), min_size_bytes=1024)
+    var req = Request(method=Method.GET, url="/big.bin")
+    req.headers.set("Accept-Encoding", "gzip")
+    var resp = c.serve(req)
+    assert_false(resp.headers.contains("content-encoding"))
+    assert_equal(len(resp.body), 2048)
+    assert_equal(resp.headers.get("content-range"), "bytes 0-2047/10000")
+
+
+def _vary_has_accept_encoding(resp: Response) -> Bool:
+    var all = resp.headers.get_all("vary")
+    for i in range(len(all)):
+        if all[i].lower().find("accept-encoding") >= 0:
+            return True
+    return False
+
+
+def test_compress_identity_variant_has_vary() raises:
+    """APP-27: the identity response for a compressible body names
+    Accept-Encoding in Vary, so a shared cache cannot hand it to a gzip
+    client."""
+    var c = Compress(_BigEcho(), min_size_bytes=1024)
+    var gz = Request(method=Method.GET, url="/page")
+    gz.headers.set("Accept-Encoding", "gzip")
+    var r1 = c.serve(gz)
+    assert_equal(r1.headers.get("content-encoding"), "gzip")
+    assert_true(_vary_has_accept_encoding(r1))
+    var plain = Request(method=Method.GET, url="/page")
+    var r2 = c.serve(plain)
+    assert_false(r2.headers.contains("content-encoding"))
+    assert_equal(len(r2.body), 4096)
+    assert_true(_vary_has_accept_encoding(r2))
+
+
+def test_compress_vary_on_every_negotiated_outcome() raises:
+    """APP-27: no header, identity preferred, a refused coding and a
+    wildcard-less refusal all leave the body alone but still carry Vary,
+    exactly once."""
+    var c = Compress(_BigEcho(), min_size_bytes=1024)
+    var values = List[String]()
+    values.append("")
+    values.append("identity")
+    values.append("gzip;q=0")
+    values.append("gzip;q=0, br;q=0, identity;q=0.5")
+    values.append("deflate")
+    for i in range(len(values)):
+        var req = Request(method=Method.GET, url="/page")
+        if values[i].byte_length() > 0:
+            req.headers.set("Accept-Encoding", values[i])
+        var resp = c.serve(req)
+        assert_false(resp.headers.contains("content-encoding"))
+        assert_equal(len(resp.body), 4096)
+        assert_equal(len(resp.headers.get_all("vary")), 1)
+        assert_true(_vary_has_accept_encoding(resp))
+
+
+def test_compress_no_vary_when_passed_through() raises:
+    """APP-27: responses Compress never considers (small, already encoded,
+    partial) do not depend on Accept-Encoding and get no Vary."""
+    var small = Compress(_Echo(status=200, body="hi"), min_size_bytes=1024)
+    var req = Request(method=Method.GET, url="/")
+    req.headers.set("Accept-Encoding", "gzip")
+    assert_false(_vary_has_accept_encoding(small.serve(req)))
+    var enc = Compress(_PreEncoded(), min_size_bytes=1024)
+    assert_false(_vary_has_accept_encoding(enc.serve(req)))
+    var part = Compress(_Partial(), min_size_bytes=1024)
+    var preq = Request(method=Method.GET, url="/big.bin")
+    preq.headers.set("Range", "bytes=0-2047")
+    preq.headers.set("Accept-Encoding", "gzip")
+    assert_false(_vary_has_accept_encoding(part.serve(preq)))
 
 
 # ── CatchPanic ────────────────────────────────────────────────────────────
@@ -264,16 +435,25 @@ def main() raises:
     test_negotiate_brotli_unavailable_falls_back_to_gzip()
     test_negotiate_q_values()
     test_negotiate_q_zero_rejects_encoding()
-    test_negotiate_wildcard_falls_back_to_identity()
+    test_negotiate_wildcard_alone_selects_best_available_coding()
+    test_negotiate_wildcard_weight_applies_to_unlisted_codings()
+    test_negotiate_wildcard_is_order_independent()
+    test_negotiate_identity_refused_with_wildcard()
     test_logger_passthrough()
     test_logger_propagates_raise()
     test_request_id_echoes_inbound()
     test_request_id_generates_when_absent()
+    test_alt_svc_advertises_h3_and_keeps_a_handler_value()
     test_compress_small_body_passthrough()
     test_compress_large_body_gzipped()
     test_compress_no_acceptable_encoding_skips()
     test_compress_already_encoded_skipped()
+    test_compress_partial_content_passthrough()
+    test_compress_content_range_header_passthrough()
+    test_compress_identity_variant_has_vary()
+    test_compress_vary_on_every_negotiated_outcome()
+    test_compress_no_vary_when_passed_through()
     test_catch_panic_returns_500()
     test_catch_panic_passthrough_when_ok()
     test_middleware_wraps_a_handler_without_a_default()
-    print("test_middleware: 18 passed")
+    print("test_middleware: 27 passed")

@@ -20,8 +20,12 @@ from std.memory import stack_allocation
 from flare.http.proto.chunked import (
     CHUNKED_INCOMPLETE,
     CHUNKED_MALFORMED,
+    TE_UNSUPPORTED,
+    CHUNK_LINE_MAX,
     decode_chunked_body,
     header_says_chunked,
+    request_te_framing,
+    scan_chunked_resume,
     scan_chunked_end,
 )
 from flare.http import HttpServer, Request, Response, ok
@@ -96,6 +100,137 @@ def test_scan_accepts_chunk_extensions_and_trailers() raises:
     assert_equal(scan_chunked_end(Span[UInt8, _](buf), 0, 1024), len(buf))
 
 
+def _repeat(c: String, n: Int) -> String:
+    var out = String("")
+    for _ in range(n):
+        out += c
+    return out^
+
+
+def _poll(full: List[UInt8], split: Int, max_body: Int) -> Int:
+    """Reactor-style polling: scan the first ``split`` bytes, then resume
+    on the whole buffer if the first verdict was INCOMPLETE."""
+    var part = List[UInt8]()
+    for i in range(split):
+        part.append(full[i])
+    var cursor = 0
+    var total = 0
+    var r = scan_chunked_resume(Span[UInt8, _](part), cursor, total, max_body)
+    if r != CHUNKED_INCOMPLETE:
+        return r
+    return scan_chunked_resume(Span[UInt8, _](full), cursor, total, max_body)
+
+
+def _assert_segmentation_independent(
+    body: List[UInt8], lo: Int, hi: Int
+) raises:
+    """Polling split at every ``lo <= k < hi`` gives the one-shot verdict."""
+    var one_shot = scan_chunked_end(Span[UInt8, _](body), 0, 1 << 20)
+    for k in range(lo, min(hi, len(body) + 1)):
+        assert_equal(
+            _poll(body, k, 1 << 20),
+            one_shot,
+            "split at " + String(k) + " changed the verdict",
+        )
+
+
+def test_chunk_line_cap_is_independent_of_segmentation() raises:
+    """H1-01: the verdict must not depend on where TCP split the bytes.
+
+    A size line of exactly CHUNK_LINE_MAX bytes is accepted in one read, so
+    it must also be accepted when the first read ends right after its CR.
+    A trailer line over the cap is refused whole as well as in pieces.
+    """
+    # Size line "1;" + 4094 extension bytes = 4096 content bytes.
+    var ok_line = _b(
+        "1;" + _repeat("a", CHUNK_LINE_MAX - 2) + "\r\nZ\r\n0\r\n\r\n"
+    )
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](ok_line), 0, 1 << 20), len(ok_line)
+    )
+    _assert_segmentation_independent(
+        ok_line, CHUNK_LINE_MAX - 5, CHUNK_LINE_MAX + 12
+    )
+    # One byte more is over the cap in either delivery.
+    var long_line = _b(
+        "1;" + _repeat("a", CHUNK_LINE_MAX - 1) + "\r\nZ\r\n0\r\n\r\n"
+    )
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](long_line), 0, 1 << 20),
+        CHUNKED_MALFORMED,
+    )
+    _assert_segmentation_independent(
+        long_line, CHUNK_LINE_MAX - 5, CHUNK_LINE_MAX + 12
+    )
+    # Trailer line of exactly CHUNK_LINE_MAX bytes: accepted in both.
+    var ok_trailer = _b(
+        "0\r\nX: " + _repeat("b", CHUNK_LINE_MAX - 3) + "\r\n\r\n"
+    )
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](ok_trailer), 0, 1 << 20),
+        len(ok_trailer),
+    )
+    _assert_segmentation_independent(
+        ok_trailer, CHUNK_LINE_MAX - 5, CHUNK_LINE_MAX + 12
+    )
+    # A 5000-byte trailer line used to pass when it arrived whole.
+    var long_trailer = _b("0\r\nX: " + _repeat("b", 4997) + "\r\n\r\n")
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](long_trailer), 0, 1 << 20),
+        CHUNKED_MALFORMED,
+    )
+    _assert_segmentation_independent(long_trailer, 3, 4600)
+
+
+def test_scan_rejects_bare_lf_in_chunk_lines() raises:
+    """H1-02: LF inside a size line or trailer line is malformed.
+
+    An LF-splitting front end ends ``0;\\n`` at the LF and the body at
+    offset 5; flare used to read on to offset 13.
+    """
+    var ext = _b("0;\n\r\nX: y\r\n\r\n")
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](ext), 0, 1 << 20), CHUNKED_MALFORMED
+    )
+    # In a size line of a data chunk, before and after the ';'.
+    var data_ext = _b("5;a\nb\r\nhello\r\n0\r\n\r\n")
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](data_ext), 0, 1 << 20),
+        CHUNKED_MALFORMED,
+    )
+    var lead = _b("\n5\r\nhello\r\n0\r\n\r\n")
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](lead), 0, 1 << 20), CHUNKED_MALFORMED
+    )
+    # In a trailer line.
+    var trailer = _b("0\r\nX: a\nY: b\r\n\r\n")
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](trailer), 0, 1 << 20),
+        CHUNKED_MALFORMED,
+    )
+    # A bare LF where the trailer section should end.
+    var empty_lf = _b("0\r\n\n\r\n")
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](empty_lf), 0, 1 << 20),
+        CHUNKED_MALFORMED,
+    )
+    # The same verdict through the resumable scanner, one byte at a time.
+    var cursor = 0
+    var decoded = 0
+    var last = CHUNKED_INCOMPLETE
+    for cut in range(1, len(ext) + 1):
+        var part = List[UInt8](ext[:cut])
+        last = scan_chunked_resume(
+            Span[UInt8, _](part), cursor, decoded, 1 << 20
+        )
+    assert_equal(last, CHUNKED_MALFORMED)
+    # Well-formed bodies are unchanged.
+    var ok_body = _b("5;a=b\r\nhello\r\n0\r\nX: y\r\n\r\n")
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](ok_body), 0, 1 << 20), len(ok_body)
+    )
+
+
 def test_decode_concatenates_chunks() raises:
     var buf = _b("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
     var out = List[UInt8]()
@@ -108,12 +243,58 @@ def test_header_scan_detects_chunked() raises:
         "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
     )
     assert_true(header_says_chunked(Span[UInt8, _](h), len(h)))
+    # A coding before chunked is one flare cannot undo, so the request
+    # is refused (501) rather than handed over as gzip bytes.
     var mixed = _b(
         "POST / HTTP/1.1\r\ntransfer-encoding: gzip, chunked\r\n\r\n"
     )
-    assert_true(header_says_chunked(Span[UInt8, _](mixed), len(mixed)))
+    assert_true(not header_says_chunked(Span[UInt8, _](mixed), len(mixed)))
+    assert_equal(
+        request_te_framing(Span[UInt8, _](mixed), len(mixed)), TE_UNSUPPORTED
+    )
     var plain = _b("POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n")
     assert_true(not header_says_chunked(Span[UInt8, _](plain), len(plain)))
+
+
+def test_resume_skips_chunks_already_scanned() raises:
+    """Bytes arrive in pieces; each poll starts at the first chunk that
+    has not fully arrived, so the walk is linear in the body."""
+    var full = _b("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+    var cursor = 0
+    var decoded = 0
+    # First chunk complete, second partial.
+    var part = List[UInt8](full[:14])
+    assert_equal(
+        scan_chunked_resume(Span[UInt8, _](part), cursor, decoded, 1024),
+        CHUNKED_INCOMPLETE,
+    )
+    assert_equal(cursor, 10)
+    assert_equal(decoded, 5)
+    # Rest arrives: resuming from the cursor finds the end.
+    var end = scan_chunked_resume(Span[UInt8, _](full), cursor, decoded, 1024)
+    assert_equal(end, len(full))
+    assert_equal(decoded, 11)
+
+
+def test_resume_agrees_with_a_fresh_scan() raises:
+    var full = _b("3\r\nabc\r\n1;x=y\r\nd\r\n0\r\nT: v\r\n\r\n")
+    var cursor = 0
+    var decoded = 0
+    for cut in range(1, len(full) + 1):
+        var part = List[UInt8](full[:cut])
+        var r = scan_chunked_resume(Span[UInt8, _](part), cursor, decoded, 1024)
+        var fresh = scan_chunked_end(Span[UInt8, _](part), 0, 1024)
+        assert_equal(r, fresh)
+
+
+def test_endless_chunk_size_line_is_malformed() raises:
+    var s = String("5;ext=")
+    for _ in range(CHUNK_LINE_MAX):
+        s += "a"
+    var buf = _b(s)
+    assert_equal(
+        scan_chunked_end(Span[UInt8, _](buf), 0, 1 << 30), CHUNKED_MALFORMED
+    )
 
 
 # ── End to end through the reactor ──────────────────────────────────────────

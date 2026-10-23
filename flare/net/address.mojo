@@ -112,7 +112,7 @@ struct IpAddr(Copyable, Equatable, ImplicitlyCopyable, Writable):
                 String(
                     StringSlice(
                         unsafe_from_utf8=CStringSpan(
-                            unsafe_from_ptr=ntop.unsafe_bitcast[Int8]()
+                            unsafe_from_ptr=ntop.unsafe_bitcast[c_char]()
                         )
                     )
                 ),
@@ -139,7 +139,7 @@ struct IpAddr(Copyable, Equatable, ImplicitlyCopyable, Writable):
                 String(
                     StringSlice(
                         unsafe_from_utf8=CStringSpan(
-                            unsafe_from_ptr=ntop.unsafe_bitcast[Int8]()
+                            unsafe_from_ptr=ntop.unsafe_bitcast[c_char]()
                         )
                     )
                 ),
@@ -230,10 +230,18 @@ struct IpAddr(Copyable, Equatable, ImplicitlyCopyable, Writable):
         """Return ``True`` if this is a multicast address.
 
         IPv4 multicast: ``224.0.0.0/4`` (first octet 224–239).
-        IPv6 multicast: addresses starting with ``"ff"``.
+        IPv6 multicast: ``ff00::/8`` (RFC 4291 section 2.7), i.e. the
+        first byte is ``0xff``. The stored text is ``inet_ntop``'s
+        (RFC 5952), which drops leading zeros of a group, so first groups
+        ``0x00ff`` and ``0x0ff0``..``0x0fff`` print as ``ff...`` too; a
+        real multicast first group always has four digits, so the first
+        ``:`` must be at index 4.
         """
         if self._is_v6:
-            return self._addr.startswith("ff")
+            return (
+                self._addr.startswith("ff")
+                and _find_char(self._addr, UInt8(ord(":"))) == 4
+            )
         var dot = _find_char(self._addr, UInt8(ord(".")))
         if dot < 0:
             return False
@@ -424,18 +432,14 @@ struct SocketAddr(Copyable, Equatable, ImplicitlyCopyable, Writable):
             ):
                 raise AddressParseError(s)
             var ip = IpAddr.parse(String(unsafe_from_utf8=sbytes[1:close]))
-            return SocketAddr(
-                ip, UInt16(atol(String(unsafe_from_utf8=sbytes[close + 2 :])))
-            )
+            return SocketAddr(ip, _parse_port_strict(s, sbytes[close + 2 :]))
         else:
             var colon = _find_char(s, UInt8(ord(":")))
             if colon < 0:
                 raise AddressParseError(s)
             var sbytes = s.as_bytes()
             var ip = IpAddr.parse(String(unsafe_from_utf8=sbytes[:colon]))
-            return SocketAddr(
-                ip, UInt16(atol(String(unsafe_from_utf8=sbytes[colon + 1 :])))
-            )
+            return SocketAddr(ip, _parse_port_strict(s, sbytes[colon + 1 :]))
 
     # ── Equality ──────────────────────────────────────────────────────────────
 
@@ -467,3 +471,24 @@ struct SocketAddr(Copyable, Equatable, ImplicitlyCopyable, Writable):
             writer.write("[", self.ip, "]:", self.port)
         else:
             writer.write(self.ip, ":", self.port)
+
+
+def _parse_port_strict(whole: String, digits: Span[UInt8, _]) raises -> UInt16:
+    """Parse a port: one to five ASCII digits, at most 65535.
+
+    ``UInt16(atol(...))`` truncated instead: "70000" bound port 4464,
+    "-1" bound 65535, and atol's leading sign and whitespace were let
+    through as well.
+    """
+    from .error import AddressParseError
+
+    if len(digits) == 0 or len(digits) > 5:
+        raise AddressParseError(whole)
+    var v = 0
+    for b in digits:
+        if b < UInt8(ord("0")) or b > UInt8(ord("9")):
+            raise AddressParseError(whole)
+        v = v * 10 + Int(b - UInt8(ord("0")))
+    if v > 65535:
+        raise AddressParseError(whole)
+    return UInt16(v)

@@ -82,6 +82,11 @@ from flare.net._libc import (
     _pipe,
     FlareRawIO,
 )
+from std.ffi import OwnedDLHandle
+from flare.net import _find_flare_lib
+from flare.net._libc import _set_cloexec
+from flare.net._libc_event import EV_RECEIPT, _kevent_read_data
+from flare.net.socket import _do_flare_set_nonblocking
 from flare.net.error import NetworkError
 from flare.runtime.event import (
     Event,
@@ -241,6 +246,17 @@ struct Reactor(Movable):
                 raise e
             var r_end = pipe_fds.unsafe_load()
             var w_end = pipe_fds.unsafe_offset(1).unsafe_load()
+            # A blocking write end hung wakeup() once 64 KiB of unread
+            # wakeups filled the pipe. Both ends were also inherited
+            # across exec. Non-blocking goes through the C wrapper, as
+            # RawSocket.set_nonblocking does on macOS: fcntl is variadic
+            # and external_call corrupts its third argument there.
+            var nb_lib = OwnedDLHandle(_find_flare_lib())
+            for wfd in [r_end, w_end]:
+                _ = _do_flare_set_nonblocking(nb_lib, wfd, c_int(1))
+                _set_cloexec(wfd)
+            _ = nb_lib^
+            _set_cloexec(kq)
             self._fd = kq
             self._wake_read = r_end
             self._wake_write = w_end
@@ -318,6 +334,13 @@ struct Reactor(Movable):
         so the practical behaviour is similar minus the kernel-level
         fairness guarantee.
 
+        Registration uses ``EPOLLIN | EPOLLEXCLUSIVE`` and deliberately
+        omits the ``EPOLLRDHUP`` that ``register`` adds for read interest:
+        ``epoll_ctl(2)`` rejects that combination with ``EINVAL``. Wakeups
+        are exclusive, not balanced: the kernel wakes one waiting worker
+        per event, so a lightly loaded server may keep landing new
+        connections on the same worker.
+
         ``EPOLLEXCLUSIVE`` is only valid on the initial ``EPOLL_CTL_ADD``
         — modifying an existing registration to add it is rejected by
         the kernel. The shared-listener path therefore registers once
@@ -346,15 +369,23 @@ struct Reactor(Movable):
             var ev = stack_allocation[EPOLL_EVENT_SIZE, UInt8]()
             for i in range(EPOLL_EVENT_SIZE):
                 ev.unsafe_offset(i).unsafe_write(UInt8(0))
-            var bits = _interest_to_epoll(interest) | EPOLLEXCLUSIVE
+            # epoll_ctl(2): EPOLLEXCLUSIVE may only be combined with EPOLLIN,
+            # EPOLLOUT, EPOLLWAKEUP and EPOLLET. _interest_to_epoll adds
+            # EPOLLRDHUP for read interest, which makes the kernel answer
+            # EINVAL, so strip it. A listener never needs RDHUP.
+            var bits = (
+                _interest_to_epoll(interest) & ~EPOLLRDHUP
+            ) | EPOLLEXCLUSIVE
             _epoll_event_set(ev, bits, token)
             var rc = _epoll_ctl(self._fd, EPOLL_CTL_ADD, fd, ev)
             if rc < c_int(0):
-                # Some older kernels (<4.5) don't support EPOLLEXCLUSIVE
-                # and return EINVAL. Fall back to a plain register so
-                # the multi-worker scheduler still works (with
-                # thundering-herd accepts) instead of crashing on a
-                # registration error. Newer kernels accept it.
+                # Kernels before 4.5 don't know EPOLLEXCLUSIVE and return
+                # EINVAL. Fall back to a plain register so the multi-worker
+                # scheduler still works (with thundering-herd accepts)
+                # instead of crashing on a registration error. Any kernel
+                # that supports the flag accepts the mask built above, so
+                # reaching this on a modern kernel is a bug (it was, while
+                # the mask still carried EPOLLRDHUP).
                 var ev2 = stack_allocation[EPOLL_EVENT_SIZE, UInt8]()
                 for i in range(EPOLL_EVENT_SIZE):
                     ev2.unsafe_offset(i).unsafe_write(UInt8(0))
@@ -614,6 +645,15 @@ struct Reactor(Movable):
             b.unsafe_write(UInt8(1))
             _ = self._io.write(self._wake_write, b, c_size_t(1))
 
+    def wake_fd(self) -> Int:
+        """The fd another thread writes to make ``poll`` return.
+
+        Lets a peer wake this reactor without holding a reference to it
+        (``flare.runtime._balance`` publishes it for connection
+        hand-off). Write 8 bytes; ``poll`` drains them.
+        """
+        return Int(self._wake_write)
+
     # ── Introspection ─────────────────────────────────────────────────────────
 
     def registered_count(self) -> Int:
@@ -674,7 +714,7 @@ struct Reactor(Movable):
                 ch.unsafe_offset((n_changes * KEVENT_SIZE)),
                 ident=ident,
                 filter=EVFILT_READ,
-                flags=EV_ADD | EV_ENABLE,
+                flags=EV_ADD | EV_ENABLE | EV_RECEIPT,
                 fflags=UInt32(0),
                 data=Int64(0),
                 udata=token,
@@ -685,7 +725,7 @@ struct Reactor(Movable):
                 ch.unsafe_offset((n_changes * KEVENT_SIZE)),
                 ident=ident,
                 filter=EVFILT_READ,
-                flags=EV_DELETE,
+                flags=EV_DELETE | EV_RECEIPT,
                 fflags=UInt32(0),
                 data=Int64(0),
                 udata=UInt64(0),
@@ -696,7 +736,7 @@ struct Reactor(Movable):
                 ch.unsafe_offset((n_changes * KEVENT_SIZE)),
                 ident=ident,
                 filter=EVFILT_WRITE,
-                flags=EV_ADD | EV_ENABLE,
+                flags=EV_ADD | EV_ENABLE | EV_RECEIPT,
                 fflags=UInt32(0),
                 data=Int64(0),
                 udata=token,
@@ -707,7 +747,7 @@ struct Reactor(Movable):
                 ch.unsafe_offset((n_changes * KEVENT_SIZE)),
                 ident=ident,
                 filter=EVFILT_WRITE,
-                flags=EV_DELETE,
+                flags=EV_DELETE | EV_RECEIPT,
                 fflags=UInt32(0),
                 data=Int64(0),
                 udata=UInt64(0),
@@ -726,21 +766,20 @@ struct Reactor(Movable):
         )
         if rc < c_int(0):
             raise _os_error("kevent install")
-        # Inspect any returned events: EV_ERROR with data != 0 means a
-        # real failure; data == 0 means success acknowledgement.
-        # ENOENT (2) on DELETE is not a fatal error — the filter just
-        # wasn't there, which is fine.
+        # With EV_RECEIPT every change comes back as one EV_ERROR entry
+        # whose data is its errno. They used to be read without it, and
+        # the result was dropped even when a change failed: a failed
+        # EV_ADD left the fd registered in _registered but never
+        # reported by poll, so its connection stalled silently. ENOENT
+        # on a DELETE only means that filter was not there.
         for i in range(Int(rc)):
             var entry = out.unsafe_offset((i * KEVENT_SIZE))
             var flags = _kevent_read_flags(entry)
-            if (flags & EV_ERROR) != 0:
-                var data = _kevent_read_fflags(entry)
-                # ``data`` on an EV_ERROR kevent carries the errno; it's the
-                # ``data`` field on kqueue, which we store as Int64. But
-                # ``_kevent_read_fflags`` returns the fflags, not data. Here
-                # we actually want the data field — but we haven't exposed a
-                # helper yet. We'll treat any EV_ERROR with unknown errno
-                # conservatively: if there were legitimate ADDs in the same
-                # batch the ENOENT from DELETE shouldn't poison them since
-                # kqueue processes changes independently.
-                _ = data  # silence unused-var warning; see note above
+            if (flags & EV_ERROR) == 0:
+                continue
+            var err = _kevent_read_data(entry)
+            if err == 0 or err == 2:  # 2 = ENOENT
+                continue
+            raise Error(
+                "kevent install: change failed with errno " + String(err)
+            )

@@ -8,6 +8,8 @@ from std.time import perf_counter_ns
 from flare.http.handler import Handler
 from flare.http.reliability import (
     CircuitBreaker,
+    _cell_get,
+    _cell_set,
     RateLimit,
     Retry,
     RetryPolicy,
@@ -313,6 +315,42 @@ def test_ratelimit_allows_burst_then_429() raises:
     assert_equal(rl.serve(req).status, 429)
 
 
+def test_ratelimit_refills_under_a_steady_stream_of_requests() raises:
+    """Requests closer together than one milli-token of refill used to
+    reset the clock with nothing credited, so under load the bucket
+    never refilled. 100/s is one token per 10 ms; a 40 ms hot loop must
+    admit a few more after the burst."""
+    from std.time import perf_counter_ns
+
+    var rl = RateLimit(AlwaysOkHandler(), rate_per_sec=100, burst=1)
+    var req = Request(method=String("GET"), url=String("/"))
+    assert_equal(rl.serve(req).status, 200)
+    var admitted = 0
+    var start = perf_counter_ns()
+    while perf_counter_ns() - start < 40_000_000:
+        if rl.serve(req).status == 200:
+            admitted += 1
+    assert_true(admitted >= 2, "refills lost: admitted " + String(admitted))
+    assert_true(admitted <= 6, "over-admitted: " + String(admitted))
+
+
+def test_ratelimit_full_bucket_admits_after_a_long_idle_period() raises:
+    """``elapsed * rate`` wrapped Int64 after 9223 s idle at 1e6/s, so a
+    full bucket stored a negative token count and answered 429. The idle
+    gap is staged by rewinding the middleware's own last-refill slot."""
+    var rl = RateLimit(AlwaysOkHandler(), rate_per_sec=1_000_000)
+    var idle_ns = Int64(9_300) * 1_000_000_000
+    _cell_set(rl._cell, 1, Int64(perf_counter_ns()) - idle_ns)
+    var req = Request(method=String("GET"), url=String("/"))
+    assert_equal(rl.serve(req).status, 200)
+    # Full bucket (burst * 1000 milli-tokens) minus the one admitted.
+    assert_equal(Int(_cell_get(rl._cell, 0)), 1_000_000 * 1000 - 1000)
+    # Far beyond any idle time: still just a full bucket, never negative.
+    _cell_set(rl._cell, 1, Int64(perf_counter_ns()) - (Int64(1) << 62))
+    assert_equal(rl.serve(req).status, 200)
+    assert_true(_cell_get(rl._cell, 0) >= 0, "negative token count stored")
+
+
 def test_ratelimit_disabled_passthrough() raises:
     """Disabled when rate_per_sec <= 0 (pass-through)."""
     var rl = RateLimit(AlwaysOkHandler(), rate_per_sec=0)
@@ -331,6 +369,120 @@ def test_circuitbreaker_opens_after_threshold() raises:
     assert_equal(cb.serve(req).status, 500)
     assert_equal(cb.serve(req).status, 500)
     assert_equal(cb.serve(req).status, 503)
+
+
+struct SlowFailHandler(Copyable, Handler):
+    """Busy-waits ``hold_ms``, counts the call, returns 500."""
+
+    var calls_ptr: Int
+    var hold_ms: Int
+
+    def __init__(out self, calls_ptr: Int, hold_ms: Int):
+        self.calls_ptr = calls_ptr
+        self.hold_ms = hold_ms
+
+    def serve(self, req: Request) raises -> Response:
+        var p = Pointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=self.calls_ptr
+        )
+        p[] = p[] + 1
+        var t0 = perf_counter_ns()
+        while perf_counter_ns() - t0 < self.hold_ms * 1_000_000:
+            pass
+        return Response(status=500, reason=String("Internal Server Error"))
+
+
+def test_circuitbreaker_cooldown_counts_from_the_failure_not_the_request() raises:
+    """The opened-at stamp was the time the failing request *started*, so a
+    failure slower than ``cooldown_ms`` opened the breaker already expired
+    and the next call went straight to the inner handler."""
+    var calls = _new_counter()
+    var cb = CircuitBreaker(
+        SlowFailHandler(calls, 250), failure_threshold=1, cooldown_ms=200
+    )
+    var req = Request(method=String("GET"), url=String("/"))
+    assert_equal(cb.serve(req).status, 500)  # trips the breaker after 250 ms
+    assert_equal(cb.serve(req).status, 503)  # still inside the 200 ms cooldown
+    assert_equal(_read_counter(calls), 1)
+    _free_counter(calls)
+
+
+struct CountingOkHandler(Copyable, Handler):
+    """Counts the call and returns 200."""
+
+    var calls_ptr: Int
+
+    def __init__(out self, calls_ptr: Int):
+        self.calls_ptr = calls_ptr
+
+    def serve(self, req: Request) raises -> Response:
+        var p = Pointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=self.calls_ptr
+        )
+        p[] = p[] + 1
+        return ok(String("ok"))
+
+
+struct ProbeInnerHandler(Copyable, Handler):
+    """Worker 1's upstream. While ``phase`` (slot 0) is 0 it fails, which
+    trips the breaker. Once it is 1 the call is the half-open probe: while
+    it is in flight it serves one request through ``other``, a copy of the
+    breaker that shares the cell (another worker), and stores that status
+    in slot 1."""
+
+    var other: CircuitBreaker[CountingOkHandler]
+    var state_ptr: Int
+
+    def __init__(
+        out self,
+        var other: CircuitBreaker[CountingOkHandler],
+        state_ptr: Int,
+    ):
+        self.other = other^
+        self.state_ptr = state_ptr
+
+    def serve(self, req: Request) raises -> Response:
+        var p = Pointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=self.state_ptr
+        )
+        if p[] == 0:
+            return Response(status=500, reason=String("Internal Server Error"))
+        var q = Pointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=self.state_ptr + 8
+        )
+        q[] = self.other.serve(req).status
+        return ok(String("probe ok"))
+
+
+def test_circuitbreaker_half_open_admits_only_the_probe() raises:
+    """While the single half-open probe is in flight a request from another
+    worker (a copy sharing the cell) must fast-fail with 503 and not reach
+    the upstream; only the probe's own success closes the breaker."""
+    var upstream_calls = _new_counter()
+    var state = unsafe_alloc[Int](2)
+    state.unsafe_write(0)
+    state.unsafe_offset(1).unsafe_write(0)
+    var other = CircuitBreaker(
+        CountingOkHandler(upstream_calls), failure_threshold=1, cooldown_ms=0
+    )
+    var w1 = CircuitBreaker(
+        ProbeInnerHandler(other.copy(), Int(state)),
+        failure_threshold=1,
+        cooldown_ms=0,
+    )
+    w1._cell = other._cell  # worker copies share one cell
+    var req = Request(method=String("GET"), url=String("/"))
+    assert_equal(w1.serve(req).status, 500)  # opens the breaker
+    state.unsafe_write(1)
+    # cooldown_ms=0: the next call is the probe (OPEN -> HALF_OPEN).
+    assert_equal(w1.serve(req).status, 200)
+    assert_equal(state.unsafe_offset(1)[], 503)
+    assert_equal(_read_counter(upstream_calls), 0)
+    # The probe succeeded: the breaker is closed again for everyone.
+    assert_equal(other.serve(req).status, 200)
+    assert_equal(_read_counter(upstream_calls), 1)
+    state.unsafe_free()
+    _free_counter(upstream_calls)
 
 
 def test_circuitbreaker_disabled_passthrough() raises:
@@ -353,7 +505,11 @@ def main() raises:
     test_timeout_passes_through_fast_handler()
     test_timeout_returns_504_on_zero_budget()
     test_ratelimit_allows_burst_then_429()
+    test_ratelimit_refills_under_a_steady_stream_of_requests()
+    test_ratelimit_full_bucket_admits_after_a_long_idle_period()
     test_ratelimit_disabled_passthrough()
     test_circuitbreaker_opens_after_threshold()
+    test_circuitbreaker_cooldown_counts_from_the_failure_not_the_request()
+    test_circuitbreaker_half_open_admits_only_the_probe()
     test_circuitbreaker_disabled_passthrough()
     print("test_reliability: OK")

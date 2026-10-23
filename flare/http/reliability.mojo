@@ -78,6 +78,30 @@ def _cell_set(addr: Int, i: Int, v: Int64):
     Atomic[Int64].store[ordering=Ordering.RELEASE](slot, v)
 
 
+def _cell_lock(addr: Int, i: Int):
+    """Spin until slot ``i`` flips 0 -> 1. Held for a few loads and
+    stores only, so contention stays in the nanoseconds."""
+    var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+    var slot = (p.unsafe_offset(i)).unsafe_bitcast[Scalar[DType.int64]]()
+    while True:
+        var expected = Int64(0)
+        if Atomic[Int64].compare_exchange(slot, expected, Int64(1)):
+            return
+
+
+def _cell_cas(addr: Int, i: Int, expected: Int64, desired: Int64) -> Bool:
+    """Atomically set slot ``i`` to ``desired`` if it holds ``expected``;
+    True when this call made the change."""
+    var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+    var slot = (p.unsafe_offset(i)).unsafe_bitcast[Scalar[DType.int64]]()
+    var e = expected
+    return Atomic[Int64].compare_exchange(slot, e, desired)
+
+
+def _cell_unlock(addr: Int, i: Int):
+    _cell_set(addr, i, Int64(0))
+
+
 @fieldwise_init
 struct RetryPolicy(Copyable, Defaultable):
     """Tunable retry policy.
@@ -190,7 +214,13 @@ struct Retry[Inner: Handler & Copyable](Copyable, Handler):
     all attempts are exhausted.
 
     By default the middleware does NOT sleep between attempts and
-    retries fire as fast as the inner handler returns. Set
+    retries fire as fast as the inner handler returns.
+
+    **Backoff blocks the worker.** The inner handler runs on the
+    reactor thread, so the sleep between attempts does too: every
+    other connection on that worker waits it out. Keep
+    ``max_backoff_ms`` small on a server, or retry in the client that
+    calls the flaky dependency instead of around the handler. Set
     ``RetryPolicy.initial_backoff_ms`` to enable binary
     exponential backoff with full jitter (the AWS-recommended
     default for retry storms): the sleep before retry N is drawn
@@ -311,6 +341,9 @@ struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
     Many Requests`` without invoking the inner handler.
 
     ``rate_per_sec <= 0`` disables the limiter (pass-through). The
+    refill is exact for any idle time as long as ``burst * 1e9`` and
+    ``rate_per_sec`` stay below 2^62 (``burst`` under about 4.6e9
+    tokens). The
     bucket lives in a leaked atomic cell (see module docstring):
     worker copies share it, so the enforced rate is approximately
     global rather than strictly per-worker.
@@ -320,7 +353,8 @@ struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
     var rate_per_sec: Int
     var burst: Int
     var _cell: Int
-    """Leaked 2-slot cell: [0] = milli-tokens, [1] = last-refill ns."""
+    """Leaked 3-slot cell: [0] = milli-tokens, [1] = last-refill ns,
+    [2] = lock."""
 
     def __init__(
         out self, var inner: Self.Inner, rate_per_sec: Int, burst: Int = 0
@@ -328,7 +362,7 @@ struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
         self.inner = inner^
         self.rate_per_sec = rate_per_sec
         self.burst = burst if burst > 0 else rate_per_sec
-        self._cell = _alloc_cell(2)
+        self._cell = _alloc_cell(3)
         if self.rate_per_sec > 0:
             _cell_set(self._cell, 0, Int64(self.burst) * 1000)
             _cell_set(self._cell, 1, Int64(perf_counter_ns()))
@@ -336,6 +370,11 @@ struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
     def serve(self, req: Request) raises -> Response:
         if self.rate_per_sec <= 0:
             return self.inner.serve(req).lower()
+        # The bucket is shared by every worker copy, and the update is
+        # a read-modify-write of two slots, so it runs under the cell's
+        # lock; separate atomic loads and stores let two workers spend
+        # the same token.
+        _cell_lock(self._cell, 2)
         var now = Int64(perf_counter_ns())
         var last = _cell_get(self._cell, 1)
         var tokens = _cell_get(self._cell, 0)
@@ -343,16 +382,32 @@ struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
         if elapsed < 0:
             elapsed = 0
         # milli-tokens accrued: elapsed_ns * rate / 1e6 (1 token = 1000 milli).
-        var refill = (elapsed * Int64(self.rate_per_sec)) // 1_000_000
+        var rate = Int64(self.rate_per_sec)
+        # An empty bucket is full after ``burst * 1e9 / rate`` ns, so any
+        # longer idle time credits the same. Clamp before multiplying:
+        # ``elapsed * rate`` wrapped Int64 after 9223 s idle at 1e6/s and
+        # stored a negative token count that never recovered.
+        var max_elapsed = (Int64(self.burst) * 1000 * 1_000_000) // rate + 1
+        if elapsed > max_elapsed:
+            elapsed = max_elapsed
+        var refill = (elapsed * rate) // 1_000_000
+        # Advance the clock only by the time those whole milli-tokens
+        # took. Setting it to ``now`` threw away the remainder, so with
+        # requests arriving faster than one milli-token accrues (under
+        # load, at low rates) the bucket never refilled at all.
+        if refill > 0:
+            last += (refill * 1_000_000) // rate
         var cap = Int64(self.burst) * 1000
         var new_tokens = tokens + refill
-        if new_tokens > cap:
+        if new_tokens >= cap:
             new_tokens = cap
+            last = now
         var allow = new_tokens >= 1000
         if allow:
             new_tokens -= 1000
         _cell_set(self._cell, 0, new_tokens)
-        _cell_set(self._cell, 1, now)
+        _cell_set(self._cell, 1, last)
+        _cell_unlock(self._cell, 2)
         if not allow:
             return Response(status=429, reason=String("Too Many Requests"))
         return self.inner.serve(req).lower()
@@ -370,9 +425,12 @@ struct CircuitBreaker[Inner: Handler & Copyable](Copyable, Handler):
     Counts consecutive failures (a raised exception or a ``>= 500``
     response). After ``failure_threshold`` in a row the breaker
     opens: every call fast-fails with ``503 Service Unavailable``
-    for ``cooldown_ms``. The first call after cooldown is a probe
-    (half-open); success closes the breaker, another failure
-    re-opens it.
+    for ``cooldown_ms``, counted from the moment the failing call
+    returned (not from when it started, so a slow failure does not
+    use up the cooldown). The first call after cooldown is a probe
+    (half-open) and is the only call let through while it is in
+    flight: the others fast-fail with ``503``. Success closes the
+    breaker, another failure re-opens it.
 
     ``failure_threshold <= 0`` disables the breaker (pass-through).
     State lives in a leaked atomic cell (see module docstring).
@@ -419,15 +477,28 @@ struct CircuitBreaker[Inner: Handler & Copyable](Copyable, Handler):
                 return Response(
                     status=503, reason=String("Service Unavailable")
                 )
-            # Cooldown elapsed: let one probe through (half-open).
-            _cell_set(self._cell, 0, _CB_HALF_OPEN)
+            # Cooldown elapsed: let exactly one probe through (half-open).
+            # Claim OPEN -> HALF_OPEN atomically; a worker that loses the
+            # race sees the probe already in flight and fast-fails.
+            if not _cell_cas(self._cell, 0, _CB_OPEN, _CB_HALF_OPEN):
+                return Response(
+                    status=503, reason=String("Service Unavailable")
+                )
+        elif state == _CB_HALF_OPEN:
+            # The probe is in flight: every other call fast-fails until it
+            # closes or re-opens the breaker.
+            return Response(status=503, reason=String("Service Unavailable"))
         try:
             var resp = self.inner.serve(req).lower()
             if resp.status >= 500:
-                self._record_failure(now)
+                # Stamp the opening with the time of the failure, not the
+                # request's start: ``now`` is read before the inner call, so
+                # a failure slower than ``cooldown_ms`` opened the breaker
+                # already expired.
+                self._record_failure(Int64(perf_counter_ns()))
             else:
                 self._record_success()
             return resp^
         except e:
-            self._record_failure(now)
+            self._record_failure(Int64(perf_counter_ns()))
             raise e^

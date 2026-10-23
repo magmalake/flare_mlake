@@ -33,7 +33,9 @@ they help median.
 - The TLS layer uses the host's OpenSSL. Pin the openssl pixi
   package version with the same caution you'd apply to nginx.
 - Certificate reload without dropping connections:
-  ``TlsAcceptor.reload(...)`` swaps the certificate atomically.
+  ``TlsAcceptor.reload(...)`` swaps the certificate atomically (a failed
+  reload raises and keeps the old certificate). It also rotates the
+  session-ticket key: tickets issued before the reload no longer resume.
   Worked example: [`examples/advanced/cert_reload.mojo`](../examples/advanced/cert_reload.mojo).
 - Backend rationale + planned rustls-for-QUIC direction:
   [`tls-strategy.md`](tls-strategy.md).
@@ -72,11 +74,28 @@ the caller wires `signal(2)` and calls `drain`. See
 On `HttpServer.drain(timeout_ms)`:
 
 1. The listener is closed (no new accepts).
-2. The reactor flips `Cancel.SHUTDOWN` on every live connection before
-   closing it, so cancel-aware handlers and streaming bodies observe
-   the shutdown at their next poll instead of losing the socket
-   mid-chunk.
-3. `ServerConfig.shutdown_timeout_ms` (default 5 s) bounds the wait.
+2. The call blocks for the whole `timeout_ms` while the reactor keeps
+   serving the connections already open, so a response that is still
+   being written finishes. `drain(0)` skips the wait and is equivalent
+   to `close()`. The single-worker path publishes no live-connection
+   count, so it cannot return early when the last connection ends: pass
+   the longest wait you can tolerate. Call it from a thread other than
+   the one running `serve()`.
+3. When the window ends the reactor flips `Cancel.SHUTDOWN` on every
+   live connection before closing it, so cancel-aware handlers and
+   streaming bodies observe the shutdown at their next poll instead of
+   losing the socket mid-chunk.
+4. `ServerConfig.shutdown_timeout_ms` (default 5 s) is the value to pass.
+
+A `serve_http3` loop drains the same call (RFC 9114 sec 5.2): every
+QUIC connection is sent GOAWAY naming the next request stream it may
+not open, new connections are refused, and each connection is closed
+with `H3_NO_ERROR` as soon as its in-flight requests are answered, or
+when `timeout_ms` passes. The loop returns once none is left. The h3
+client reads the GOAWAY, finishes what is in flight, and no longer
+reuses that connection from its pool. A program driving a
+`QuicListener` directly calls `begin_drain(timeout_ms)` and then
+`drain_step()` each turn until it returns `True`.
 
 Multi-worker `Scheduler.drain(timeout_ms)` returns one
 `ShutdownReport` per worker. `in_flight_at_deadline` and `timed_out`
@@ -86,6 +105,12 @@ after the worker joins), not a fabricated 0/1. `Scheduler.crashed_worker_count()
 reports how many workers exited on a reactor poll failure rather than
 a clean stop -- `is_running()` only tracks join state and cannot make
 that distinction.
+
+Every worker re-reads the stop flag at least every 100 ms, whichever
+reactor it runs on. The io_uring buffer-ring workers (`FLARE_BUFRING_HANDLER=1`)
+have no wakeup channel, so they bound their `io_uring_enter` wait with a
+100 ms timeout (Linux 5.11+); an idle server therefore joins in about that
+time on `shutdown()` and `drain`, without waiting for a client to connect.
 
 For zero-downtime deploys behind a load balancer:
 
@@ -126,7 +151,7 @@ auditing the buffering chain.
 | `max_body_bytes` | 10 MiB | You're accepting file uploads. Use multipart streaming, not in-memory. |
 | `max_uri_bytes` | 8 KiB | Almost never. URLs longer than 8 KiB are usually a bug. |
 | `keep_alive_idle_ms` | 60 s | Keep-alive-heavy clients (browsers) -- consider 120 s; CDN -- 300 s; never above 600 s. |
-| `max_connections` | 0 (unlimited) | Per-worker accept-path cap. Set it to bound the file-descriptor / connection-flood surface; at the cap the worker stops accepting (surplus waits in the listen backlog) until a slot frees. |
+| `max_connections` | 0 (unlimited) | Per-worker accept-path cap. Set it to bound the file-descriptor / connection-flood surface; at the cap the worker takes its listener out of the reactor, so it sleeps instead of spinning, and the surplus waits in the listen backlog until a slot frees and the listener is put back. With per-worker `SO_REUSEPORT` listeners the kernel assigns each connection to a worker, so one worker can be at its cap while another has room. |
 
 The corresponding HTTP/2 limits live on `Http2ServerConfig`:
 
@@ -158,7 +183,7 @@ The corresponding HTTP/2 limits live on `Http2ServerConfig`:
 | p99 latency creeps up over hours, no traffic-shape change. | Per-connection state leak (typically `PermessageDeflateContext` not closing on hung WS clients). | Look at `/metrics` for `flare_active_connections{transport="ws"}`. If it monotonically grows, set `WsServer.with_idle_timeout(60_000)`. |
 | 5xx spike after deploy, no traceback. | Sanitised-error policy is hiding the root cause. | Tail logs for `request_id=<X>` to recover the full error message; the response body is intentionally generic (see `security.md`). |
 | Worker `panic` exits but the rest keep running. | `CatchPanic[Inner]` middleware caught a Mojo abort; one worker is restarting. | Check `/metrics` for `flare_worker_restarts_total`. The pool self-heals; investigate the corresponding log line. |
-| TLS handshake errors in the log, intermittent. | OpenSSL session ticket key rotation drift (you reloaded the cert but the old keys are still in use somewhere). | `TlsAcceptor.reload` rotates ticket keys atomically; check that you're reloading on every host. |
+| TLS handshake errors in the log, intermittent. | OpenSSL session ticket key rotation drift (you reloaded the cert but the old keys are still in use somewhere). | `TlsAcceptor.reload` replaces the `SSL_CTX` and with it the ticket key, so a ticket issued before the reload falls back to a full handshake; reload every host together so a client moving between hosts does not see mixed behaviour. |
 | Memory grows unboundedly under WS load. | Each `WsConnection` allocates 64 KiB of recv buffer; many idle WS clients * 64 KiB. | Set `WsServer.with_idle_timeout`. Audit `permessage-deflate` if context-takeover is on. |
 
 ## Soak harness
@@ -196,7 +221,7 @@ shape is:
 
 ```dockerfile
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y libssl3 libbrotli1 zlib1g \
+RUN apt-get update && apt-get install -y libssl3 libbrotli1 libdeflate0 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 COPY ./target/server /usr/local/bin/server
 COPY ./certs /etc/flare/certs

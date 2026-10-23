@@ -228,6 +228,49 @@ def test_next_fire_ms_overflow_only_returns_rotation() raises:
     assert_true(nf <= UInt64(5000))
 
 
+def test_next_fire_ms_overflow_only_is_lower_bound_after_advance() raises:
+    """RT-01: overflow timers are promoted at the next slot-0 boundary, so
+    with an empty wheel and a non-empty overflow list the hint must not
+    exceed that boundary. A timer due at 512, observed at now=500, used to
+    be reported as due at 1012 (now + 512) although it fires at 512."""
+    var tw = TimerWheel(now_ms=UInt64(0))
+    _ = tw.schedule(512, UInt64(7))  # delay 512 -> overflow list
+    var fired = List[UInt64]()
+    tw.advance(UInt64(500), fired)
+    var hint = tw.next_fire_ms()
+    assert_equal(hint, UInt64(512))
+    # Ground truth: the wheel fires the timer at 512.
+    var fired_at = UInt64(0)
+    for t in range(501, 1100):
+        tw.advance(UInt64(t), fired)
+        if len(fired) > 0:
+            fired_at = UInt64(t)
+            break
+    assert_equal(fired_at, UInt64(512))
+    assert_true(hint <= fired_at)
+
+
+def test_next_fire_ms_wheel_hint_capped_at_promotion_boundary() raises:
+    """RT-01: a wheel timer further away than the next slot-0 boundary must
+    not push the hint past it while the overflow list is non-empty (the
+    overflow timer is promoted, and may fire, at the boundary)."""
+    var tw = TimerWheel(now_ms=UInt64(0))
+    _ = tw.schedule(700, UInt64(1))  # overflow, fires at 700
+    var fired = List[UInt64]()
+    tw.advance(UInt64(100), fired)
+    _ = tw.schedule(511, UInt64(2))  # wheel slot 99, fires at 611
+    # Boundary at 512 (= now 100 + (512 - slot 100)); wheel timer at 611.
+    assert_equal(tw.next_fire_ms(), UInt64(512))
+
+
+def test_next_fire_ms_overflow_hint_at_slot_zero() raises:
+    """RT-01: at slot 0 the boundary is a full rotation away, so the hint
+    for an overflow-only wheel stays now + 512 (no regression)."""
+    var tw = TimerWheel(now_ms=UInt64(0))
+    _ = tw.schedule(5000, UInt64(1))
+    assert_equal(tw.next_fire_ms(), UInt64(512))
+
+
 def test_next_fire_ms_recovers_after_advance() raises:
     """After the earliest timer fires, next_fire_ms tracks the next one
     (independent of active-timer count; bounded slot scan).
@@ -256,6 +299,64 @@ def test_next_fire_ms_cancel_is_lower_bound() raises:
     tw.advance(UInt64(150), fired)
     assert_equal(len(fired), 0)  # id1 was cancelled, nothing fires
     assert_equal(tw.next_fire_ms(), UInt64(400))
+
+
+def test_a_long_gap_jumps_instead_of_walking() raises:
+    """A wheel anchored at 0 and advanced on the monotonic clock walked
+    every millisecond since boot. The jump fires what is due, keeps
+    what is not, and leaves the wheel on the new tick."""
+    var tw = TimerWheel(now_ms=UInt64(0))
+    _ = tw.schedule(10, UInt64(1))
+    _ = tw.schedule(2_000, UInt64(2))
+    var keep = tw.schedule(2_000_000_000_000, UInt64(3))
+    var cancelled = tw.schedule(20, UInt64(4))
+    _ = tw.cancel(cancelled)
+    var fired = List[UInt64]()
+    # About 31 years in ms. Walked a tick at a time this does not
+    # finish; the jump makes it one pass over three timers.
+    var now = UInt64(1_000_000_000_000)
+    tw.advance(now, fired)
+    assert_equal(len(fired), 2)
+    assert_equal(fired[0], UInt64(1))
+    assert_equal(fired[1], UInt64(2))
+    assert_equal(tw.now_ms(), now)
+    assert_equal(tw.active_count(), 1)
+    # A timer armed after the jump still fires on time.
+    _ = tw.schedule(5, UInt64(5))
+    fired.clear()
+    tw.advance(now + UInt64(5), fired)
+    assert_equal(len(fired), 1)
+    assert_equal(fired[0], UInt64(5))
+    _ = keep
+
+
+def test_overflow_timer_fires_on_time_after_a_jump() raises:
+    var tw = TimerWheel(now_ms=UInt64(0))
+    _ = tw.schedule(700, UInt64(9))  # overflow at schedule time
+    var fired = List[UInt64]()
+    tw.advance(UInt64(600), fired)  # jump: 600 > one rotation
+    assert_equal(len(fired), 0)
+    tw.advance(UInt64(699), fired)
+    assert_equal(len(fired), 0)
+    tw.advance(UInt64(700), fired)
+    assert_equal(len(fired), 1)
+
+
+def test_overflow_promoted_once_per_rotation_still_fires_on_time() raises:
+    """Overflow is now scanned at each rotation boundary instead of on
+    every tick. Stepped in under-a-rotation advances, a far timer still
+    fires on its exact tick."""
+    var tw = TimerWheel(now_ms=UInt64(0))
+    _ = tw.schedule(5_003, UInt64(7))
+    var fired = List[UInt64]()
+    var t = UInt64(0)
+    while t + UInt64(500) < UInt64(5_003):
+        t += UInt64(500)
+        tw.advance(t, fired)
+    tw.advance(UInt64(5_002), fired)
+    assert_equal(len(fired), 0)
+    tw.advance(UInt64(5_003), fired)
+    assert_equal(len(fired), 1)
 
 
 def main() raises:

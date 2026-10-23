@@ -68,7 +68,7 @@ def _synth_initial(
     var plen = encode_varint(UInt64(payload_total))
     for i in range(len(plen)):
         prefix.append(plen[i])
-    return protect_initial_packet(
+    var dg = protect_initial_packet(
         Span[UInt8, _](prefix),
         packet_number=UInt64(0),
         pn_length=1,
@@ -76,6 +76,11 @@ def _synth_initial(
         dcid=dcid,
         is_server=False,
     )
+    # RFC 9000 sec 14.1: the server drops an Initial in a datagram
+    # under 1200 bytes. Trailing zeros are datagram padding.
+    while len(dg) < 1200:
+        dg.append(UInt8(0))
+    return dg^
 
 
 def _extract_retry_token(retry: List[UInt8]) raises -> List[UInt8]:
@@ -159,5 +164,29 @@ def test_quic_retry_server() raises:
     print("test_quic_retry_server: 1 passed")
 
 
+def test_retry_transport_params_name_the_original_dcid() raises:
+    """After a Retry the server sent the post-Retry DCID as
+    original_destination_connection_id and no
+    retry_source_connection_id, so an RFC 9000 sec 7.3 client aborted
+    with TRANSPORT_PARAMETER_ERROR."""
+    print("test_retry_transport_params_name_the_original_dcid")
+    from flare.quic import QuicServerConfig
+    from flare.quic._server_types import _encode_server_transport_params
+    from flare.quic.transport_params import decode_transport_parameters
+
+    var original = _make_cid(UInt8(0x11), 8)
+    var retry_scid = _make_cid(UInt8(0x22), 8)
+    var ours = _make_cid(UInt8(0x33), 8)
+    var blob = _encode_server_transport_params(
+        QuicServerConfig(), ours, original, retry_scid.bytes
+    )
+    var tp = decode_transport_parameters(Span[UInt8, _](blob))
+    assert_true(tp.original_destination_connection_id == original.bytes)
+    assert_true(tp.retry_source_connection_id == retry_scid.bytes)
+    assert_true(tp.initial_source_connection_id == ours.bytes)
+    print("test_retry_transport_params_name_the_original_dcid: passed")
+
+
 def main() raises:
     test_quic_retry_server()
+    test_retry_transport_params_name_the_original_dcid()

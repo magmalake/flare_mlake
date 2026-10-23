@@ -23,9 +23,12 @@ bytes into a typed callback sequence on a caller-supplied
   callback so the caller can log it.
 * :meth:`Http3RequestEventHandler.on_protocol_error` -- the byte
   stream is malformed (truncated varint, oversize length, QPACK
-  decode failure, repeated HEADERS); the caller surfaces this as
-  an H3_FRAME_UNEXPECTED / QPACK_DECOMPRESSION_FAILED stream-
-  level error to the QUIC peer.
+  decode failure, repeated HEADERS, an unknown frame declaring more than
+  ``max_field_section_bytes``); the caller surfaces this as
+  an H3_FRAME_UNEXPECTED stream-level error to the QUIC peer. A
+  QPACK decode failure is tagged ``QPACK_DECOMPRESSION_FAILED``:
+  :class:`flare.http3.Http3Connection` raises it as a connection
+  error (RFC 9204 section 2.2.3).
 
 The dispatcher entry point :func:`feed_into[H]` returns the
 number of bytes consumed. A return of ``0`` means NEEDS_MORE --
@@ -56,6 +59,10 @@ from .frame import (
     H3_FRAME_TYPE_CANCEL_PUSH,
     H3_FRAME_TYPE_DATA,
     H3_FRAME_TYPE_GOAWAY,
+    H3_FRAME_TYPE_H2_CONTINUATION,
+    H3_FRAME_TYPE_H2_PING,
+    H3_FRAME_TYPE_H2_PRIORITY,
+    H3_FRAME_TYPE_H2_WINDOW_UPDATE,
     H3_FRAME_TYPE_HEADERS,
     H3_FRAME_TYPE_MAX_PUSH_ID,
     H3_FRAME_TYPE_PUSH_PROMISE,
@@ -145,6 +152,10 @@ struct Http3RequestReader(Copyable):
 
     var state: Int
     var max_field_section_bytes: UInt64
+    var max_body_bytes: UInt64
+    """Most request-body bytes accepted across all DATA frames."""
+    var body_bytes: UInt64
+    """Request-body bytes delivered so far."""
     var qpack_table: ArcPointer[QpackDynamicTable]
     """RFC 9204 dynamic table shared (by ``ArcPointer``) from the
     owning :class:`Http3Connection`. Defaults to an empty (capacity-0)
@@ -154,10 +165,15 @@ struct Http3RequestReader(Copyable):
     references resolve."""
 
     @staticmethod
-    def new(max_field_section_bytes: UInt64 = UInt64(8192)) -> Self:
+    def new(
+        max_field_section_bytes: UInt64 = UInt64(8192),
+        max_body_bytes: UInt64 = UInt64(10 * 1024 * 1024),
+    ) -> Self:
         return Self(
             state=H3_REQUEST_STATE_INIT,
             max_field_section_bytes=max_field_section_bytes,
+            max_body_bytes=max_body_bytes,
+            body_bytes=UInt64(0),
             qpack_table=ArcPointer[QpackDynamicTable](
                 QpackDynamicTable(UInt64(0))
             ),
@@ -228,6 +244,42 @@ def feed_into[
         header_size = t[2]
     except:
         return 0
+    # Limits are checked from the frame header, before the payload is
+    # waited for. They used to come after the NEEDS_MORE return, so a
+    # HEADERS or DATA frame declaring gigabytes had its bytes buffered
+    # by the caller for as long as the peer cared to send them.
+    if ftype == H3_FRAME_TYPE_HEADERS and flen > reader.max_field_section_bytes:
+        reader.state = H3_REQUEST_STATE_DONE
+        handler.on_protocol_error(
+            String("h3 reader: HEADERS field section above limit")
+        )
+        return header_size
+    if (
+        ftype == H3_FRAME_TYPE_DATA
+        and reader.body_bytes + flen > reader.max_body_bytes
+    ):
+        reader.state = H3_REQUEST_STATE_DONE
+        handler.on_protocol_error(String("h3 reader: request body above limit"))
+        return header_size
+    # Every other type (unknown / grease, and the control types that are
+    # rejected anyway) was NEEDS_MORE until its whole declared payload,
+    # up to 2^62 - 1 bytes, was buffered (H3-01). Its payload would be
+    # discarded, so a frame that large is refused from the header: the
+    # most the caller ever holds is bounded (RFC 9114 sec 10.5).
+    if (
+        ftype != H3_FRAME_TYPE_HEADERS
+        and ftype != H3_FRAME_TYPE_DATA
+        and flen > reader.max_field_section_bytes
+    ):
+        reader.state = H3_REQUEST_STATE_DONE
+        handler.on_protocol_error(
+            String(
+                "h3 reader: H3_EXCESSIVE_LOAD: frame of "
+                + String(flen)
+                + " bytes above the limit"
+            )
+        )
+        return header_size
     var total = header_size + Int(flen)
     if total > len(buf):
         return 0
@@ -249,20 +301,36 @@ def feed_into[
         var payload = buf[header_size:total]
         var headers: List[QpackHeader]
         try:
+            # The limit applies to the *decoded* section as well: a HEADERS
+            # frame under it on the wire can expand to thousands of times
+            # its size (indexed lines, dynamic-table references).
             headers = decode_field_section_dynamic(
-                payload, reader.qpack_table[]
+                payload, reader.qpack_table[], reader.max_field_section_bytes
             )
-        except:
+        except e:
             reader.state = H3_REQUEST_STATE_DONE
-            handler.on_protocol_error(String("h3 reader: QPACK decode failed"))
+            if "field section above limit" in String(e):
+                handler.on_protocol_error(
+                    String("h3 reader: HEADERS field section above limit")
+                )
+                return total
+            # An undecodable field section is a connection error of type
+            # QPACK_DECOMPRESSION_FAILED (RFC 9204 sec 2.2.3, 4.5.1.1);
+            # the tag lets Http3Connection raise it to the QUIC layer.
+            handler.on_protocol_error(
+                String(
+                    "h3 reader: QPACK decode failed"
+                    " (QPACK_DECOMPRESSION_FAILED)"
+                )
+            )
             return total
         if reader.state == H3_REQUEST_STATE_INIT:
             reader.state = H3_REQUEST_STATE_BODY
-            handler.on_headers(headers^)
+            handler.on_headers(headers)
             return total
         # In BODY -- this is the trailers frame.
         reader.state = H3_REQUEST_STATE_TRAILERS
-        handler.on_trailers(headers^)
+        handler.on_trailers(headers)
         return total
 
     if ftype == H3_FRAME_TYPE_DATA:
@@ -272,10 +340,12 @@ def feed_into[
                 String("h3 reader: DATA outside body window")
             )
             return total
+        # One copy of the payload; a byte-at-a-time append loop here
+        # was the top cost of an h3 upload.
         var data = List[UInt8](capacity=Int(flen))
-        for i in range(header_size, total):
-            data.append(buf[i])
-        handler.on_data(data^)
+        data.extend(buf[header_size:total])
+        reader.body_bytes += flen
+        handler.on_data(data)
         return total
 
     # CANCEL_PUSH / SETTINGS / PUSH_PROMISE / GOAWAY / MAX_PUSH_ID
@@ -292,6 +362,27 @@ def feed_into[
         reader.state = H3_REQUEST_STATE_DONE
         handler.on_protocol_error(
             String("h3 reader: control-stream frame type on request stream")
+        )
+        return total
+
+    # 0x02 / 0x06 / 0x08 / 0x09 are the HTTP/2 PRIORITY, PING,
+    # WINDOW_UPDATE and CONTINUATION frame types, reserved by RFC 9114
+    # §7.2.8 and §11.2.1: "their receipt MUST be treated as a
+    # connection error of type H3_FRAME_UNEXPECTED". They were handed to
+    # ``on_unknown_frame`` and skipped (H3-02).
+    if (
+        ftype == H3_FRAME_TYPE_H2_PRIORITY
+        or ftype == H3_FRAME_TYPE_H2_PING
+        or ftype == H3_FRAME_TYPE_H2_WINDOW_UPDATE
+        or ftype == H3_FRAME_TYPE_H2_CONTINUATION
+    ):
+        reader.state = H3_REQUEST_STATE_DONE
+        handler.on_protocol_error(
+            String(
+                "h3 reader: H3_FRAME_UNEXPECTED: HTTP/2-reserved frame type "
+                + String(ftype)
+                + " on request stream"
+            )
         )
         return total
 

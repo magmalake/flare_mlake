@@ -117,6 +117,29 @@ def _do_ssl_ctx_reload(
         raise Error("flare_ssl_ctx_reload failed")
 
 
+def _do_ssl_ctx_set_cert(
+    imm lib: OwnedDLHandle,
+    addr: Int,
+    var host: String,
+    var cert_path: String,
+    var key_path: String,
+) raises:
+    var f = dl_sym[def(Int, Int, Int, Int) thin abi("C") -> c_int](
+        lib, "flare_ssl_ctx_set_cert"
+    )
+    var host_c = host.as_c_string_span()
+    var cert_c = cert_path.as_c_string_span()
+    var key_c = key_path.as_c_string_span()
+    var rc = Int(
+        f(addr, Int(host_c.ptr()), Int(cert_c.ptr()), Int(key_c.ptr()))
+    )
+    _ = host^
+    _ = cert_path^
+    _ = key_path^
+    if rc != 0:
+        raise Error("flare_ssl_ctx_set_cert failed")
+
+
 def _do_ssl_ctx_set_alpn(
     imm lib: OwnedDLHandle, addr: Int, protos: List[UInt8]
 ) raises:
@@ -151,6 +174,26 @@ def _do_ssl_ctx_enable_session_tickets(
         raise Error("flare_ssl_ctx_enable_session_tickets failed")
 
 
+def _do_ssl_ctx_disable_session_tickets(
+    imm lib: OwnedDLHandle, addr: Int
+) raises:
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](
+        lib, "flare_ssl_ctx_disable_session_tickets"
+    )
+    if Int(f(addr)) != 0:
+        raise Error("flare_ssl_ctx_disable_session_tickets failed")
+
+
+def _do_ssl_ctx_set_min_proto(
+    imm lib: OwnedDLHandle, addr: Int, version: Int
+) raises:
+    var f = dl_sym[def(Int, c_int) thin abi("C") -> c_int](
+        lib, "flare_ssl_ctx_set_min_proto"
+    )
+    if Int(f(addr, c_int(version))) != 0:
+        raise Error("flare_ssl_ctx_set_min_proto: unsupported TLS version")
+
+
 def _do_ssl_new_accept(
     imm lib: OwnedDLHandle, ctx_addr: Int, fd: Int
 ) raises -> Int:
@@ -173,6 +216,9 @@ comptime SSL_IO_WANT_READ: Int = -1
 comptime SSL_IO_WANT_WRITE: Int = -2
 comptime SSL_IO_CLOSED: Int = -3
 comptime SSL_IO_FATAL: Int = -4
+comptime SSL_IO_EOF_UNCLEAN: Int = -5
+"""The peer closed without close_notify (``flare_ssl_read_blocking``
+only). A close-delimited body cannot tell this from truncation."""
 
 
 def _do_ssl_read_ex(
@@ -268,8 +314,25 @@ struct ServerCtx(Movable):
 
     def reload(self, cert_path: String, key_path: String) raises:
         """Reload cert + key without restarting. Raises on file
-        load error / key mismatch."""
+        load error / key mismatch, and leaves the context serving the
+        pair it had when it does."""
         _do_ssl_ctx_reload(self._lib, self._addr, cert_path, key_path)
+
+    def set_cert(
+        self, host: String, cert_path: String, key_path: String
+    ) raises:
+        """Serve this pair to clients whose SNI is ``host`` (``""`` for
+        the default, ``*.example.com`` for one-label wildcards),
+        replacing any pair for it. Safe while other threads handshake;
+        a pair that fails to load raises and changes nothing."""
+        _do_ssl_ctx_set_cert(self._lib, self._addr, host, cert_path, key_path)
+
+    def key_matches(self) raises -> Bool:
+        """Whether the context's certificate and private key match."""
+        var f = dl_sym[def(Int) thin abi("C") -> c_int](
+            self._lib, "flare_ssl_ctx_check_private_key"
+        )
+        return Int(f(self._addr)) == 1
 
     def set_alpn(self, protos: List[UInt8]) raises:
         """Set the wire-format ALPN protocols list.
@@ -296,6 +359,18 @@ struct ServerCtx(Movable):
         session.
         """
         _do_ssl_ctx_enable_session_tickets(self._lib, self._addr, lifetime_s)
+
+    def disable_session_tickets(self) raises:
+        """Turn session resumption off: no RFC 5077 tickets, no TLS 1.3
+        NewSessionTicket messages and no server-side session cache, so no
+        session is issued and none can be resumed."""
+        _do_ssl_ctx_disable_session_tickets(self._lib, self._addr)
+
+    def set_min_protocol(self, version: Int) raises:
+        """Refuse protocol versions below ``version``
+        (``TLS_PROTOCOL_TLS12`` or ``TLS_PROTOCOL_TLS13``); anything else
+        raises."""
+        _do_ssl_ctx_set_min_proto(self._lib, self._addr, version)
 
     def addr(self) -> Int:
         """Underlying ``SSL_CTX*`` as an Int."""

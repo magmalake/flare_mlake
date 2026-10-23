@@ -1,4 +1,4 @@
-"""gRPC streaming calls over a long-lived HTTP/2 stream.
+"""The gRPC streaming calls over a long-lived HTTP/2 stream.
 
 The unary :class:`flare.grpc.GrpcClient.call` path buffers the whole
 response and pops it in one shot. Streaming RPCs instead keep one HTTP/2
@@ -38,7 +38,12 @@ from ..tls import TlsStream
 from ..http._client.h2_transport import _H2Transport
 from .framing import decode_grpc_message, encode_grpc_message
 from .metadata import GrpcMetadata
-from .status import GRPC_STATUS_OK, GRPC_STATUS_UNKNOWN, GrpcStatus
+from .status import (
+    GRPC_STATUS_OK,
+    GRPC_STATUS_UNKNOWN,
+    GrpcStatus,
+    grpc_message_decode,
+)
 
 comptime _READ_BUF_SIZE: Int = 16384
 """Per-syscall recv buffer for the streaming read pump (RFC 9113
@@ -61,7 +66,7 @@ def _status_from_headers(hdrs: List[HpackHeader]) -> GrpcStatus:
     """Build a :class:`GrpcStatus` from the ``grpc-status`` /
     ``grpc-message`` header (or trailer) values."""
     var code_str = _hdr_value(hdrs, "grpc-status")
-    var msg = _hdr_value(hdrs, "grpc-message")
+    var msg = grpc_message_decode(_hdr_value(hdrs, "grpc-message"))
     var code = GRPC_STATUS_UNKNOWN
     if code_str.byte_length() > 0:
         try:
@@ -127,7 +132,9 @@ struct GrpcServerStream(Movable):
         var n = self._t.read(buf.unsafe_ptr(), _READ_BUF_SIZE)
         if n == 0:
             return False
-        self._conn.feed(Span[UInt8, _](unsafe_ptr=buf.unsafe_ptr(), length=n))
+        self._conn.receive(
+            Span[UInt8, _](unsafe_ptr=buf.unsafe_ptr(), length=n)
+        )
         var ack = self._conn.drain()
         if len(ack) > 0:
             self._t.write_all(Span[UInt8, _](ack))
@@ -260,7 +267,9 @@ struct GrpcBidiStream(Movable):
         var n = self._t.read(buf.unsafe_ptr(), _READ_BUF_SIZE)
         if n == 0:
             return False
-        self._conn.feed(Span[UInt8, _](unsafe_ptr=buf.unsafe_ptr(), length=n))
+        self._conn.receive(
+            Span[UInt8, _](unsafe_ptr=buf.unsafe_ptr(), length=n)
+        )
         var ack = self._conn.drain()
         if len(ack) > 0:
             self._t.write_all(Span[UInt8, _](ack))

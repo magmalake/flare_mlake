@@ -15,6 +15,7 @@ from std.collections import List
 from std.collections.span import Span
 
 from flare.quic import (
+    CONN_STATE_CLOSING,
     CONN_STATE_DRAINING,
     CONN_STATE_ESTABLISHED,
     CONN_STATE_HANDSHAKE,
@@ -33,6 +34,11 @@ from flare.quic import (
     new_connection,
     new_stream,
 )
+from flare.quic.state import (
+    apply_reset_stream,
+    apply_stop_sending,
+    dispatch_frames,
+)
 from flare.quic.frame import (
     AckFrame,
     AckRange,
@@ -49,7 +55,9 @@ from flare.quic.frame import (
     NewConnectionIdFrame,
     PathChallengeFrame,
     PathResponseFrame,
+    ResetStreamFrame,
     RetireConnectionIdFrame,
+    StopSendingFrame,
     StreamFrame,
     encode_ack,
     encode_connection_close,
@@ -115,6 +123,60 @@ def test_handshake_done_advances_state() raises:
     assert_true(events.handshake_done)
     assert_true(conn.handshake_complete)
     assert_equal(conn.state, CONN_STATE_ESTABLISHED)
+
+
+def test_unknown_frame_body_is_not_reparsed() raises:
+    """QUIC-01: ``21 1c 00 00 00`` is an unknown frame type 0x21 followed
+    by bytes that would be a CONNECTION_CLOSE. The payload is a
+    FRAME_ENCODING_ERROR; the body must never run as frames."""
+    var conn = new_connection()
+    var events = empty_events()
+    var payload = List[UInt8]()
+    payload.append(0x21)
+    payload.append(0x1C)
+    payload.append(0x00)
+    payload.append(0x00)
+    payload.append(0x00)
+    var raised = False
+    try:
+        dispatch_frames(
+            conn, Span[UInt8, _](payload), UInt64(100), events, False
+        )
+    except e:
+        raised = True
+        assert_true("FRAME_ENCODING_ERROR" in String(e))
+    assert_true(raised, "unknown frame type was accepted")
+    assert_false(events.connection_closed)
+    assert_equal(conn.state, CONN_STATE_HANDSHAKE)
+
+
+def test_handshake_done_does_not_reopen_closed_connection() raises:
+    """QUIC-04: CONNECTION_CLOSE then HANDSHAKE_DONE in one payload leaves
+    the connection DRAINING, and HANDSHAKE_DONE after a local close leaves it
+    CLOSING (RFC 9000 sec 10.2: closing / draining only lead to closed)."""
+    var conn = new_connection()
+    var events = empty_events()
+    var payload = List[UInt8]()
+    payload.append(0x1C)  # CONNECTION_CLOSE (transport)
+    payload.append(0x00)
+    payload.append(0x00)
+    payload.append(0x00)
+    encode_handshake_done(payload)
+    dispatch_frames(conn, Span[UInt8, _](payload), UInt64(100), events, False)
+    assert_true(events.connection_closed)
+    assert_equal(conn.state, CONN_STATE_DRAINING)
+    assert_false(events.handshake_done)
+    assert_false(conn.handshake_complete)
+
+    var conn2 = new_connection()
+    var ev2 = empty_events()
+    connection_close(conn2, UInt64(0), "bye")
+    assert_equal(conn2.state, CONN_STATE_CLOSING)
+    var hd = List[UInt8]()
+    encode_handshake_done(hd)
+    _ = handle_frame_buf(conn2, Span[UInt8, _](hd), UInt64(200), ev2)
+    assert_equal(conn2.state, CONN_STATE_CLOSING)
+    assert_false(ev2.handshake_done)
 
 
 def test_mark_handshake_complete_explicit_hook() raises:
@@ -367,9 +429,76 @@ def test_path_response_mismatch_ignored() raises:
     assert_equal(len(conn.outgoing_path_challenge), 8)
 
 
+def test_new_connection_id_is_bounded_and_not_overwritten() raises:
+    """Every NEW_CONNECTION_ID was stored, past the
+    active_connection_id_limit of 2 we advertise, and a repeated
+    sequence number replaced the CID stored under it."""
+    var conn = new_connection()
+    var events = empty_events()
+    var b1 = _ncid_bytes(UInt64(1), UInt64(0), UInt8(0x21))
+    _ = handle_frame_buf(conn, Span[UInt8, _](b1), UInt64(100), events)
+    # An exact retransmit is fine.
+    _ = handle_frame_buf(conn, Span[UInt8, _](b1), UInt64(100), events)
+    var clash = _ncid_bytes(UInt64(1), UInt64(0), UInt8(0x99))
+    var raised = False
+    try:
+        _ = handle_frame_buf(conn, Span[UInt8, _](clash), UInt64(100), events)
+    except:
+        raised = True
+    assert_true(raised, "a reused sequence number was accepted")
+    assert_equal(conn.peer_cids.get(UInt64(1)).value().cid[0], UInt8(0x21))
+    var conn2 = new_connection()
+    var ev2 = empty_events()
+    var n1 = _ncid_bytes(UInt64(1), UInt64(0), UInt8(0x31))
+    _ = handle_frame_buf(conn2, Span[UInt8, _](n1), UInt64(100), ev2)
+    var n2 = _ncid_bytes(UInt64(2), UInt64(0), UInt8(0x32))
+    var over = False
+    try:
+        _ = handle_frame_buf(conn2, Span[UInt8, _](n2), UInt64(100), ev2)
+    except:
+        over = True
+    assert_true(over, "a third active CID was accepted")
+
+
+def test_reset_and_stop_sending_are_recorded_independently() raises:
+    """QUIC-18: RESET_STREAM (receive half) and STOP_SENDING (send half)
+    used to overwrite one shared state, so whichever came second hid the
+    first (RFC 9000 sec 3.1, 3.2)."""
+    var rs = ResetStreamFrame(UInt64(0), UInt64(1), UInt64(0))
+    var ss = StopSendingFrame(UInt64(0), UInt64(2))
+
+    # RESET_STREAM then STOP_SENDING: both halves are reset.
+    var a = new_connection(UInt64(30_000_000), UInt64(1 << 20))
+    a.streams[UInt64(0)] = new_stream(UInt64(0), UInt64(1 << 20))
+    apply_reset_stream(a, rs)
+    apply_stop_sending(a, ss)
+    assert_true(a.streams[UInt64(0)].peer_reset, "RESET_STREAM was lost")
+    assert_true(a.streams[UInt64(0)].send_reset)
+
+    # STOP_SENDING then RESET_STREAM: same result in the other order.
+    var b = new_connection(UInt64(30_000_000), UInt64(1 << 20))
+    b.streams[UInt64(0)] = new_stream(UInt64(0), UInt64(1 << 20))
+    apply_stop_sending(b, ss)
+    assert_true(b.streams[UInt64(0)].send_reset)
+    assert_false(b.streams[UInt64(0)].peer_reset)
+    apply_reset_stream(b, rs)
+    assert_true(b.streams[UInt64(0)].peer_reset)
+    assert_true(b.streams[UInt64(0)].send_reset, "STOP_SENDING was lost")
+
+    # A lone frame touches only its own half.
+    var c = new_connection(UInt64(30_000_000), UInt64(1 << 20))
+    c.streams[UInt64(0)] = new_stream(UInt64(0), UInt64(1 << 20))
+    apply_reset_stream(c, rs)
+    assert_true(c.streams[UInt64(0)].peer_reset)
+    assert_false(c.streams[UInt64(0)].send_reset)
+
+
 def main() raises:
     test_initial_connection_state()
     test_handshake_done_advances_state()
+    test_unknown_frame_body_is_not_reparsed()
+    test_handshake_done_does_not_reopen_closed_connection()
+    test_reset_and_stop_sending_are_recorded_independently()
     test_mark_handshake_complete_explicit_hook()
     test_stream_frame_opens_stream()
     test_stream_frame_with_fin_finishes_stream()
@@ -388,4 +517,5 @@ def main() raises:
     test_path_challenge_queues_response()
     test_path_response_validates_matching_challenge()
     test_path_response_mismatch_ignored()
-    print("test_quic_state: 20 passed")
+    test_new_connection_id_is_bounded_and_not_overwritten()
+    print("test_quic_state: 23 passed")

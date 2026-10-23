@@ -1,4 +1,4 @@
-"""``ServerConfig.ws_offload``: keep the reactor free during a WebSocket.
+"""``WsUpgrade.offload``: keep the reactor free during a WebSocket.
 
 A WebSocket handler owns its connection for as long as that connection
 lives. Run inline, it owns the reactor worker too -- so on a
@@ -14,7 +14,7 @@ The thresholds are far apart on purpose (the handler sleeps 2500 ms, the
 split is at 1200 ms) so neither direction turns into a timing flake on a
 loaded machine.
 
-A third test covers the other half of what ``ws_offload`` changes: two
+A third test covers the other half of what ``offload`` changes: two
 offloaded handlers run at the same time. The reactor staying free says
 nothing about that, and concurrency is the part of the contract that
 changes what handler authors have to do about shared state.
@@ -26,7 +26,7 @@ from std.testing import assert_equal, assert_true
 
 from flare.utils import SIGKILL, exit, fork, kill, usleep, waitpid
 
-from flare.http import HttpServer, Request, Response, ok
+from flare.http import HttpServer, Request, Response, WsUpgrade, ok
 from flare.http.client_pool import _monotonic_ms
 from flare.net import SocketAddr
 from flare.net._libc import (
@@ -124,9 +124,8 @@ def _measure(
     var pid = fork()
     if pid == 0:
         try:
-            srv.serve_ws_upgrade(
-                _http_handler, _slow_ws_handler, ws_offload=ws_offload
-            )
+            srv.config.ws = WsUpgrade(_slow_ws_handler, ws_offload)
+            srv.serve(_http_handler)
         except:
             pass
         exit()
@@ -152,7 +151,7 @@ def _measure(
 
 
 def test_offloaded_websocket_does_not_block_http() raises:
-    """With ``ws_offload``, the GET overtakes the busy WebSocket."""
+    """With ``offload``, the GET overtakes the busy WebSocket."""
     var body = String("")
     var ws_echo = String("")
     var elapsed = _measure(True, body, ws_echo)
@@ -173,7 +172,7 @@ def test_offloaded_websocket_does_not_block_http() raises:
 
 def test_inline_websocket_blocks_http_on_one_worker() raises:
     """Without it, the same GET waits for the WebSocket -- the behaviour
-    ``ws_offload`` exists to fix, pinned here so it cannot regress into
+    ``offload`` exists to fix, pinned here so it cannot regress into
     looking like the fixed case."""
     var body = String("")
     var ws_echo = String("")
@@ -212,9 +211,8 @@ def test_two_offloaded_websockets_run_concurrently() raises:
     var pid = fork()
     if pid == 0:
         try:
-            srv.serve_ws_upgrade(
-                _http_handler, _slow_ws_handler, ws_offload=True
-            )
+            srv.config.ws = WsUpgrade(_slow_ws_handler, True)
+            srv.serve(_http_handler)
         except:
             pass
         exit()
@@ -257,8 +255,70 @@ def test_two_offloaded_websockets_run_concurrently() raises:
     )
 
 
+def _raw_upgrade_status(port: UInt16) raises -> String:
+    """Send a valid upgrade request and return the response's first line."""
+    var fd = _connect_loopback(port)
+    var req = String(
+        "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    _ = _send(
+        fd,
+        req.as_bytes().unsafe_ptr(),
+        c_size_t(req.byte_length()),
+        c_int(MSG_NOSIGNAL),
+    )
+    var buf = stack_allocation[1024, UInt8]()
+    var n = _recv(fd, buf, c_size_t(1024), c_int(0))
+    var out = String("")
+    for i in range(Int(n)):
+        if buf[unsafe_offset=i] == 13:
+            break
+        out += chr(Int(buf[unsafe_offset=i]))
+    _ = _close(fd)
+    return out^
+
+
+def test_offloaded_threads_are_capped() raises:
+    """With every detached thread busy, an upgrade is refused with 503
+    instead of spawning another; once one ends, upgrades succeed again."""
+    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var port = UInt16(srv.local_addr().port)
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.config.ws = WsUpgrade(_slow_ws_handler, True, max_offloaded=1)
+            srv.serve(_http_handler)
+        except:
+            pass
+        exit()
+    usleep(300000)
+    var busy = String("")
+    var refused = String("")
+    var after = String("")
+    try:
+        var ws = WsClient.connect("ws://127.0.0.1:" + String(Int(port)) + "/ws")
+        ws.send_text("hold")
+        usleep(200000)
+        refused = _raw_upgrade_status(port)
+        var reply = ws.recv()
+        if reply.opcode == WsOpcode.TEXT:
+            busy = reply.text_payload()
+        usleep(300000)
+        after = _raw_upgrade_status(port)
+    except e:
+        print("cap test error:", e)
+    _ = kill(pid, SIGKILL)
+    _ = waitpid(pid)
+    assert_equal(busy, "echo: hold")
+    assert_true(refused.startswith("HTTP/1.1 503"), refused)
+    assert_true(after.startswith("HTTP/1.1 101"), after)
+
+
 def main() raises:
+    test_offloaded_threads_are_capped()
     test_offloaded_websocket_does_not_block_http()
     test_inline_websocket_blocks_http_on_one_worker()
     test_two_offloaded_websockets_run_concurrently()
-    print("test_server_ws_offload: 3 passed")
+    print("test_server_ws_offload: 4 passed")

@@ -15,7 +15,9 @@ HTTP/3 over QUIC uses four families of streams:
   server replies on the same stream with HEADERS + DATA + (FIN).
 * **Unidirectional control stream** (type 0x00) -- exactly one
   per direction; carries SETTINGS first, then GOAWAY /
-  MAX_PUSH_ID over the connection lifetime.
+  MAX_PUSH_ID over the connection lifetime. The server opens its
+  own as stream 3 with its first 1-RTT flight
+  (:meth:`Http3Connection.take_control_stream_start`).
 * **Unidirectional push stream** (type 0x01) -- server-initiated.
   Not implemented (RFC 9114 deprecates push as of revision 9).
 * **Unidirectional QPACK encoder stream** (type 0x02) +
@@ -40,6 +42,13 @@ HTTP/3 over QUIC uses four families of streams:
 - :class:`Http3StreamType` -- the unidirectional-stream type
   codepoints from RFC 9114 §6.2.
 
+Connection errors: an undecodable request field section sets
+:attr:`Http3Connection.connection_error_code` to
+``QPACK_DECOMPRESSION_FAILED`` (0x200), and the driver raises the other
+H3 / QPACK connection errors with the code's name in the message
+(:func:`h3_error_code` maps it back). The QUIC reactor closes the
+connection with that code.
+
 The driver is sans-I/O: the QUIC reactor feeds reassembled stream
 chunks in via :meth:`Http3Connection.feed_stream_chunk` and drains
 pending outbound frames via :meth:`Http3Connection.take_response_frames`.
@@ -58,9 +67,17 @@ from std.memory import ArcPointer
 from std.collections.span import Span
 
 from flare.http3.frame import (
+    H3_FRAME_TYPE_DATA,
     H3_FRAME_TYPE_GOAWAY,
+    H3_FRAME_TYPE_H2_CONTINUATION,
+    H3_FRAME_TYPE_H2_PING,
+    H3_FRAME_TYPE_H2_PRIORITY,
+    H3_FRAME_TYPE_H2_WINDOW_UPDATE,
+    H3_FRAME_TYPE_HEADERS,
+    H3_FRAME_TYPE_PUSH_PROMISE,
     H3_FRAME_TYPE_SETTINGS,
     H3_SETTINGS_ENABLE_CONNECT_PROTOCOL,
+    H3_SETTINGS_H3_DATAGRAM,
     H3_SETTINGS_MAX_FIELD_SECTION_SIZE,
     H3_SETTINGS_QPACK_BLOCKED_STREAMS,
     H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY,
@@ -77,19 +94,87 @@ from flare.http3.request_reader import (
 )
 from flare.http3.response_writer import (
     encode_response_data,
-    encode_response_headers,
+    encode_response_head,
+    encode_response_trailers,
 )
-from flare.http.wire import Request, Response
+from flare.http.wire import (
+    BodyPipe,
+    Request,
+    Response,
+    trailer_field_allowed,
+)
 from flare.qpack import QpackHeader
+from flare.http2.state import validate_request_fields
 from flare.qpack.dynamic import (
     QpackDynamicTable,
     apply_encoder_instructions_partial,
     encode_insert_count_increment,
 )
-from flare.quic.varint import decode_varint, encode_varint
+from flare.quic.varint import Varint, decode_varint, encode_varint
 
 
 # ── Unidirectional stream type codepoints (RFC 9114 §6.2) ───────────────
+
+
+comptime _MAX_CONTROL_FRAME_BYTES: Int = 16384
+"""Largest frame accepted on the peer's control stream. SETTINGS,
+GOAWAY and MAX_PUSH_ID are a few bytes; anything declaring more is
+treated as an excessive load (RFC 9114 sec 8.1)."""
+
+
+comptime H3_SERVER_CONTROL_STREAM_ID: Int = 3
+"""QUIC stream id of the server's control stream: the first
+server-initiated unidirectional stream (RFC 9000 section 2.1, ``0b11``)."""
+
+comptime H3_GENERAL_PROTOCOL_ERROR: UInt64 = 0x101
+"""RFC 9114 section 8.1: the default code for an error with no more
+specific H3 code."""
+comptime H3_STREAM_CREATION_ERROR: UInt64 = 0x103
+comptime H3_CLOSED_CRITICAL_STREAM: UInt64 = 0x104
+comptime H3_FRAME_UNEXPECTED: UInt64 = 0x105
+comptime H3_FRAME_ERROR: UInt64 = 0x106
+comptime H3_EXCESSIVE_LOAD: UInt64 = 0x107
+comptime H3_SETTINGS_ERROR: UInt64 = 0x109
+comptime H3_MISSING_SETTINGS: UInt64 = 0x10A
+comptime H3_DATAGRAM_ERROR: UInt64 = 0x33
+"""RFC 9297 sec 2.1: a malformed HTTP Datagram."""
+comptime QPACK_DECOMPRESSION_FAILED: UInt64 = 0x200
+"""RFC 9204 section 6."""
+comptime QPACK_ENCODER_STREAM_ERROR: UInt64 = 0x201
+comptime QPACK_DECODER_STREAM_ERROR: UInt64 = 0x202
+
+
+def h3_error_code(message: String) -> UInt64:
+    """The HTTP/3 / QPACK error code (RFC 9114 section 8.1, RFC 9204
+    section 6) named by an error ``message``, or
+    :data:`H3_GENERAL_PROTOCOL_ERROR` when it names none.
+
+    The driver raises ``Error`` with the code's name in the text
+    (``"H3_FRAME_UNEXPECTED: ..."``); the QUIC layer maps that to the
+    CONNECTION_CLOSE error code through this function."""
+    if "QPACK_DECOMPRESSION_FAILED" in message:
+        return QPACK_DECOMPRESSION_FAILED
+    if "QPACK_ENCODER_STREAM_ERROR" in message:
+        return QPACK_ENCODER_STREAM_ERROR
+    if "QPACK_DECODER_STREAM_ERROR" in message:
+        return QPACK_DECODER_STREAM_ERROR
+    if "H3_STREAM_CREATION_ERROR" in message:
+        return H3_STREAM_CREATION_ERROR
+    if "H3_CLOSED_CRITICAL_STREAM" in message:
+        return H3_CLOSED_CRITICAL_STREAM
+    if "H3_FRAME_UNEXPECTED" in message:
+        return H3_FRAME_UNEXPECTED
+    if "H3_FRAME_ERROR" in message:
+        return H3_FRAME_ERROR
+    if "H3_EXCESSIVE_LOAD" in message:
+        return H3_EXCESSIVE_LOAD
+    if "H3_SETTINGS_ERROR" in message:
+        return H3_SETTINGS_ERROR
+    if "H3_MISSING_SETTINGS" in message:
+        return H3_MISSING_SETTINGS
+    if "H3_DATAGRAM_ERROR" in message:
+        return H3_DATAGRAM_ERROR
+    return H3_GENERAL_PROTOCOL_ERROR
 
 
 struct Http3StreamType:
@@ -148,9 +233,27 @@ struct Http3Config(Copyable, Defaultable):
     0 (paired with qpack_max_table_capacity=0)."""
 
     var enable_connect_protocol: Bool
-    """RFC 9220 §3 -- whether to advertise CONNECT-Protocol
-    support for WebSocket / WebTransport bootstrapping. Default
-    True since the rest of flare supports CONNECT semantics."""
+    """RFC 9220 §3 -- whether to advertise SETTINGS_ENABLE_CONNECT_PROTOCOL
+    and accept extended CONNECT (``:protocol``) requests. Default False:
+    advertising it obliges the server to accept such requests (RFC 8441
+    sec 3), and it used to be advertised while every one was refused."""
+
+    var max_body_size: UInt64
+    """Largest request body buffered for a handler. A request with more
+    is answered 413 and the client asked to stop sending (RFC 9114 sec
+    4.1.2). Default 10 MiB, as on h2."""
+
+    var stream_request_bodies: Bool
+    """Hand a request with a body to the handler on its HEADERS, the body
+    to follow through ``Request.body_stream()`` as it arrives, instead of
+    after the whole body is buffered; credit is granted as the handler
+    reads, so ``max_body_size`` does not apply. Default False: handlers
+    otherwise expect the whole body in ``Request.body``."""
+
+    var h3_datagram: Bool
+    """RFC 9297 -- advertise SETTINGS_H3_DATAGRAM and carry HTTP
+    Datagrams on extended CONNECT tunnels. Needs QUIC DATAGRAM support
+    (``QuicServerConfig.max_datagram_frame_size`` > 0). Default False."""
 
     var goaway_threshold_streams: UInt64
     """Local soft cap on the stream count above which the server
@@ -162,7 +265,10 @@ struct Http3Config(Copyable, Defaultable):
         self.max_field_section_size = UInt64(65536)
         self.qpack_max_table_capacity = UInt64(0)
         self.qpack_blocked_streams = UInt64(0)
-        self.enable_connect_protocol = True
+        self.enable_connect_protocol = False
+        self.h3_datagram = False
+        self.stream_request_bodies = False
+        self.max_body_size = UInt64(10 * 1024 * 1024)
         self.goaway_threshold_streams = UInt64((1 << 63) - 1)
 
 
@@ -240,6 +346,21 @@ struct _Http3StreamState(Copyable, Defaultable):
     Guards against the reactor double-dispatching the same
     request through a Handler."""
 
+    var too_large: Bool
+    """The body went over ``Http3Config.max_body_size``: the request is
+    answered 413 instead of being served."""
+
+    var streaming: Bool
+    """``Http3Config.stream_request_bodies``: the request is handed over
+    on its HEADERS and its body flows through :attr:`pipe`."""
+    var pipe: Optional[ArcPointer[BodyPipe]]
+
+    var tunnel: Bool
+    """The HEADERS carry ``:protocol`` and extended CONNECT is enabled
+    (RFC 9220): the request is ready without a FIN, and the body that
+    follows is the tunnel's bytes (:meth:`Http3Connection.take_stream_body`).
+    """
+
     def __init__(out self):
         self.reader = Http3RequestReader.new()
         self.inbox = List[UInt8]()
@@ -253,6 +374,10 @@ struct _Http3StreamState(Copyable, Defaultable):
         self.outbox = List[UInt8]()
         self.response_emitted = False
         self.request_taken = False
+        self.too_large = False
+        self.streaming = False
+        self.pipe = None
+        self.tunnel = False
 
     @staticmethod
     def with_limits(max_field_section_bytes: UInt64) -> Self:
@@ -348,6 +473,98 @@ struct _Http3EventCollector(Http3RequestEventHandler, Movable):
 # ── Per-connection driver ──────────────────────────────────────────────
 
 
+comptime _MAX_OUT_OF_ORDER_BYTES: Int = 1 << 24
+"""Most stream bytes held ahead of a gap, per stream (16 MiB): the
+largest receive window the QUIC server grants a stream, so a peer within
+flow control never trips it. Across streams the connection's MAX_DATA,
+granted only as requests are answered, bounds the total held."""
+
+
+struct _StreamReassembly(Copyable, Defaultable):
+    """Offset-ordered reassembly for one peer stream.
+
+    QUIC STREAM frames carry an offset and may arrive out of order,
+    duplicated or overlapping (retransmits). The server fed each one
+    straight to the h3 reader as if it followed the last, so a reordered
+    request was parsed from scrambled bytes and a duplicate was parsed
+    twice. :meth:`push` hands back only the bytes that now follow the
+    contiguous prefix, holding anything past a gap until it fills.
+    """
+
+    var next_offset: UInt64
+    var pending: Dict[UInt64, List[UInt8]]
+    var pending_bytes: Int
+    var fin_offset: Optional[UInt64]
+    var fin_signaled: Bool
+
+    def __init__(out self):
+        self.next_offset = 0
+        self.pending = Dict[UInt64, List[UInt8]]()
+        self.pending_bytes = 0
+        self.fin_offset = None
+        self.fin_signaled = False
+
+    def push(
+        mut self, offset: UInt64, data: Span[UInt8, _], fin: Bool
+    ) raises -> List[UInt8]:
+        """Take one STREAM frame; return the bytes that are now
+        contiguous, in order. Raises on an inconsistent final size, on
+        bytes past it, or past :data:`_MAX_OUT_OF_ORDER_BYTES` held."""
+        var end = offset + UInt64(len(data))
+        if fin:
+            if (
+                self.fin_offset and end != self.fin_offset.value()
+            ) or end < self.next_offset:
+                raise Error("h3: inconsistent QUIC final size")
+            self.fin_offset = Optional(end)
+        if self.fin_offset and end > self.fin_offset.value():
+            raise Error("h3: stream bytes beyond the final size")
+        var out = List[UInt8]()
+        if end <= self.next_offset:
+            return out^  # wholly a duplicate
+        if offset > self.next_offset:
+            if offset not in self.pending:
+                if self.pending_bytes + len(data) > _MAX_OUT_OF_ORDER_BYTES:
+                    raise Error("h3: too many out-of-order stream bytes")
+                var held = List[UInt8](capacity=len(data))
+                held.extend(data)
+                self.pending[offset] = held^
+                self.pending_bytes += len(data)
+            return out^
+        out.extend(data[Int(self.next_offset - offset) :])
+        self.next_offset = end
+        var progressed = True
+        while progressed:
+            progressed = False
+            var chosen = Optional[UInt64](None)
+            for entry in self.pending.items():
+                if entry.key <= self.next_offset:
+                    chosen = Optional(entry.key)
+                    break
+            if chosen:
+                var key = chosen.value()
+                var chunk = self.pending.pop(key)
+                self.pending_bytes -= len(chunk)
+                var cend = key + UInt64(len(chunk))
+                if cend > self.next_offset:
+                    out.extend(
+                        Span[UInt8, _](chunk)[Int(self.next_offset - key) :]
+                    )
+                    self.next_offset = cend
+                progressed = True
+        return out^
+
+    def take_fin(mut self) -> Bool:
+        """``True`` exactly once, when every byte up to the final size
+        has been delivered."""
+        if self.fin_signaled or not self.fin_offset:
+            return False
+        if self.next_offset < self.fin_offset.value():
+            return False
+        self.fin_signaled = True
+        return True
+
+
 struct Http3Connection(Copyable, Defaultable):
     """Per-connection HTTP/3 server driver.
 
@@ -387,8 +604,12 @@ struct Http3Connection(Copyable, Defaultable):
     field-section-size + QPACK parameters."""
 
     var goaway_emitted: Bool
-    """Whether the server has emitted GOAWAY. Once True, new
-    request streams are rejected with H3_REQUEST_CANCELLED."""
+    """Whether the server has emitted GOAWAY. Once True, request
+    streams at or above :attr:`goaway_id` are rejected."""
+    var goaway_id: UInt64
+    """The stream id the GOAWAY named: requests below it are still
+    served (RFC 9114 sec 5.2), so one reordered behind the GOAWAY is not
+    lost."""
 
     var streams: Dict[Int, _Http3StreamState]
     """Per-stream state carriers. Keys are QUIC stream IDs.
@@ -438,12 +659,32 @@ struct Http3Connection(Copyable, Defaultable):
     var peer_settings_enable_connect_protocol: Bool
     """RFC 9220 §3 -- whether the peer advertises CONNECT-
     Protocol support."""
+    var peer_settings_h3_datagram: Bool
+    """RFC 9297 -- the peer sent SETTINGS_H3_DATAGRAM = 1."""
+    var peer_quic_datagram: Bool
+    """Set by the QUIC layer: the peer advertised a non-zero
+    ``max_datagram_frame_size``. SETTINGS_H3_DATAGRAM = 1 without it is
+    an H3_SETTINGS_ERROR (RFC 9297 sec 2.1.1)."""
 
     var peer_goaway_max_stream_id: UInt64
     """RFC 9114 §5.2 -- peer-emitted GOAWAY identifier. UINT64_MAX
     means no GOAWAY has arrived yet; once a GOAWAY arrives this
     holds the maximum stream id the peer will accept. Stream ids
     >= this value are aborted by the H3 layer."""
+
+    var reassembly: Dict[Int, _StreamReassembly]
+    """Per-stream offset reassembly in front of the readers; see
+    :meth:`feed_stream_frame`."""
+
+    var closed_request_streams: Dict[Int, Bool]
+    """Client request streams answered and closed above
+    :attr:`closed_request_floor`. A retransmitted STREAM frame for a
+    stream the server had already answered found no state, opened it
+    afresh and ran the request a second time."""
+
+    var closed_request_floor: Int
+    """Every client bidi stream id below this is closed. Advanced as
+    streams close in order, so the tombstone set stays small."""
 
     var peer_uni_buffers: Dict[Int, List[UInt8]]
     """Per-uni-stream inbound buffer. The stream-type varint may
@@ -471,10 +712,24 @@ struct Http3Connection(Copyable, Defaultable):
     Increment we emitted on our QPACK decoder stream (RFC 9204
     §4.4.3). Drained by :meth:`take_qpack_decoder_frames`."""
 
+    var control_stream_sent: Bool
+    """Whether :meth:`take_control_stream_start` has handed the
+    reactor the server's control-stream prefix (H3-07)."""
+
+    var connection_error_code: UInt64
+    """Non-zero once the driver has hit an error that RFC 9114 / 9204
+    make a *connection* error (so far an undecodable field section,
+    ``QPACK_DECOMPRESSION_FAILED``). The QUIC layer reads it after each
+    feed and closes the connection with this code."""
+
+    var connection_error_reason: String
+    """Human-readable cause of :attr:`connection_error_code`."""
+
     def __init__(out self):
         self.config = Http3Config()
         self.peer_settings_received = False
         self.goaway_emitted = False
+        self.goaway_id = UInt64.MAX
         self.streams = Dict[Int, _Http3StreamState]()
         self.control_stream_id = -1
         self.qpack_encoder_stream_id = -1
@@ -486,13 +741,21 @@ struct Http3Connection(Copyable, Defaultable):
         self.peer_settings_qpack_max_table_capacity = UInt64(0)
         self.peer_settings_qpack_blocked_streams = UInt64(0)
         self.peer_settings_enable_connect_protocol = False
+        self.peer_settings_h3_datagram = False
+        self.peer_quic_datagram = False
         self.peer_goaway_max_stream_id = UInt64((1 << 63) - 1)
+        self.reassembly = Dict[Int, _StreamReassembly]()
+        self.closed_request_streams = Dict[Int, Bool]()
+        self.closed_request_floor = 0
         self.peer_uni_buffers = Dict[Int, List[UInt8]]()
         self.peer_uni_kinds = Dict[Int, Int]()
         self.qpack_table = ArcPointer[QpackDynamicTable](
             QpackDynamicTable(UInt64(0))
         )
         self.pending_qpack_increment = 0
+        self.control_stream_sent = False
+        self.connection_error_code = 0
+        self.connection_error_reason = String("")
 
     @staticmethod
     def with_config(config: Http3Config) -> Self:
@@ -513,7 +776,7 @@ struct Http3Connection(Copyable, Defaultable):
         """
         if stream_id in self.streams:
             return
-        if self.goaway_emitted:
+        if self.goaway_emitted and UInt64(stream_id) >= self.goaway_id:
             raise Error(
                 "Http3Connection.open_request_stream: GOAWAY emitted;"
                 " new request streams are rejected"
@@ -521,6 +784,7 @@ struct Http3Connection(Copyable, Defaultable):
         var state = _Http3StreamState.with_limits(
             self.config.max_field_section_size
         )
+        state.reader.max_body_bytes = self.config.max_body_size
         state.reader.qpack_table = self.qpack_table
         self.streams[stream_id] = state^
 
@@ -529,7 +793,67 @@ struct Http3Connection(Copyable, Defaultable):
         response FIN has been emitted (so the server doesn't
         keep parser state around for a stream that's done)."""
         if stream_id in self.streams:
-            _ = self.streams.pop(stream_id)
+            var st = self.streams.pop(stream_id)
+            if st.pipe and not st.pipe.value()[].done:
+                st.pipe.value()[].failed = True
+        if stream_id in self.reassembly:
+            _ = self.reassembly.pop(stream_id)
+        if (stream_id & 0x3) == 0 and stream_id >= self.closed_request_floor:
+            self.closed_request_streams[stream_id] = True
+            while self.closed_request_floor in self.closed_request_streams:
+                _ = self.closed_request_streams.pop(self.closed_request_floor)
+                self.closed_request_floor += 4
+
+    def is_closed_request_stream(self, stream_id: Int) -> Bool:
+        """Whether ``stream_id`` is a client request stream the server
+        has already answered and closed."""
+        if (stream_id & 0x3) != 0:
+            return False
+        return (
+            stream_id < self.closed_request_floor
+            or stream_id in self.closed_request_streams
+        )
+
+    def feed_stream_frame(
+        mut self,
+        stream_id: Int,
+        offset: UInt64,
+        data: Span[UInt8, _],
+        fin: Bool,
+    ) raises:
+        """Feed one QUIC STREAM frame, by offset.
+
+        Bytes reach the h3 readers in order, once each; FIN is signalled
+        only when every byte up to the final size has arrived. Frames
+        for a request stream already answered are dropped. Uni streams
+        go to :meth:`feed_uni_stream_chunk`, bidi streams to
+        :meth:`feed_stream_chunk` and :meth:`signal_end_of_stream`.
+        """
+        var is_uni = (stream_id & 0x2) != 0
+        if not is_uni and self.is_closed_request_stream(stream_id):
+            return
+        if stream_id not in self.reassembly:
+            self.reassembly[stream_id] = _StreamReassembly()
+        var ready: List[UInt8]
+        var fin_now: Bool
+        ref r = self.reassembly[stream_id]
+        ready = r.push(offset, data, fin)
+        fin_now = r.take_fin()
+        if len(ready) > 0:
+            if is_uni:
+                self.feed_uni_stream_chunk(stream_id, ready^)
+            else:
+                self.feed_stream_chunk(stream_id, ready^)
+        if fin_now and not is_uni:
+            self.signal_end_of_stream(stream_id)
+
+    def delivered_offset(self, stream_id: Int) -> UInt64:
+        """Bytes of ``stream_id`` delivered in order so far (0 for a
+        stream not seen)."""
+        try:
+            return self.reassembly[stream_id].next_offset
+        except:
+            return UInt64(0)
 
     def has_stream(self, stream_id: Int) -> Bool:
         """Whether the driver currently tracks a carrier for
@@ -595,14 +919,19 @@ struct Http3Connection(Copyable, Defaultable):
         # _Http3StreamState (inbox + headers + body) on every inbound
         # chunk is the dominant per-request cost under concurrency.
         ref state = self.streams[stream_id]
-        for i in range(len(chunk)):
-            state.inbox.append(chunk[i])
+        if state.reader.state == H3_REQUEST_STATE_DONE:
+            return  # nothing more is read; it used to pile up in the inbox
+        if len(state.inbox) == 0:
+            state.inbox = chunk^
+        else:
+            state.inbox.extend(Span[UInt8, _](chunk))
         var cursor = 0
         while cursor < len(state.inbox):
             var collector = _Http3EventCollector.new()
-            var view = state.inbox[cursor:]
+            # A span, not a slice: slicing the List copied the rest of
+            # the inbox for every frame, quadratic in frames per chunk.
             var consumed = feed_into(
-                state.reader, Span[UInt8, _](view), collector
+                state.reader, Span[UInt8, _](state.inbox)[cursor:], collector
             )
             if consumed == 0:
                 break
@@ -621,15 +950,41 @@ struct Http3Connection(Copyable, Defaultable):
                 else:
                     state.headers = collector.headers.copy()
                     state.headers_complete = True
+                    if self.config.enable_connect_protocol:
+                        for i in range(len(state.headers)):
+                            if state.headers[i].name == ":protocol":
+                                state.tunnel = True
+                    if self.config.stream_request_bodies and not state.tunnel:
+                        state.streaming = True
+                        state.reader.max_body_bytes = UInt64.MAX
             if collector.data_fired:
-                for j in range(len(collector.data)):
-                    state.body.append(collector.data[j])
+                state.body.extend(Span[UInt8, _](collector.data))
             if collector.trailers_fired:
                 state.trailers = collector.trailers.copy()
             if collector.unknown_fired:
                 state.unknown_frames.append(collector.unknown_frame_type)
             if collector.error_fired:
                 state.protocol_error = String(collector.error_message)
+                state.too_large = "body above limit" in state.protocol_error
+                # The server advertises no blocked streams, so a field
+                # section that cannot be decoded now is a connection
+                # error, not a stream-local one that left the request
+                # unanswered (QPACK-05, RFC 9204 sec 2.1.2, 2.2.3).
+                if (
+                    "QPACK_DECOMPRESSION_FAILED" in state.protocol_error
+                    and self.connection_error_code == 0
+                ):
+                    self.connection_error_code = QPACK_DECOMPRESSION_FAILED
+                    self.connection_error_reason = String(state.protocol_error)
+                # An HTTP/2-reserved frame type is a connection error of
+                # type H3_FRAME_UNEXPECTED (RFC 9114 sec 7.2.8, 11.2.1;
+                # H3-02).
+                elif (
+                    "H3_FRAME_UNEXPECTED" in state.protocol_error
+                    and self.connection_error_code == 0
+                ):
+                    self.connection_error_code = H3_FRAME_UNEXPECTED
+                    self.connection_error_reason = String(state.protocol_error)
                 break
             if state.reader.state == H3_REQUEST_STATE_DONE:
                 break
@@ -637,9 +992,14 @@ struct Http3Connection(Copyable, Defaultable):
         # chunk doesn't re-parse old bytes.
         if cursor > 0:
             var rest = List[UInt8](capacity=len(state.inbox) - cursor)
-            for k in range(cursor, len(state.inbox)):
-                rest.append(state.inbox[k])
+            rest.extend(Span[UInt8, _](state.inbox)[cursor:])
             state.inbox = rest^
+        if state.pipe:
+            ref p = state.pipe.value()[]
+            p.data.extend(Span[UInt8, _](state.body))
+            state.body.clear()
+            if state.protocol_error.byte_length() > 0:
+                p.failed = True
 
     def signal_end_of_stream(mut self, stream_id: Int) raises:
         """Signal that the QUIC layer observed FIN on
@@ -653,6 +1013,8 @@ struct Http3Connection(Copyable, Defaultable):
             return
         ref state = self.streams[stream_id]
         state.fin_received = True
+        if state.pipe:
+            state.pipe.value()[].done = True
 
     def take_completed_streams(self) raises -> List[Int]:
         """Return the IDs of streams that have a request ready
@@ -677,10 +1039,17 @@ struct Http3Connection(Copyable, Defaultable):
                 continue
             if not entry.value.headers_complete:
                 continue
-            if entry.value.protocol_error.byte_length() != 0:
+            if (
+                entry.value.protocol_error.byte_length() != 0
+                and not entry.value.too_large
+            ):
                 continue
-            var done = entry.value.fin_received or (
-                entry.value.reader.state == H3_REQUEST_STATE_DONE
+            var done = (
+                entry.value.too_large
+                or entry.value.streaming
+                or entry.value.fin_received
+                or entry.value.tunnel
+                or entry.value.reader.state == H3_REQUEST_STATE_DONE
             )
             if not done:
                 continue
@@ -703,34 +1072,105 @@ struct Http3Connection(Copyable, Defaultable):
                 "Http3Connection.take_request: request already taken on stream "
                 + String(stream_id)
             )
+        if state.too_large:
+            state.request_taken = True
+            raise Error("Http3Connection.take_request: request body too large")
         if not state.headers_complete:
             raise Error(
                 "Http3Connection.take_request: HEADERS frame not yet parsed on"
                 " stream "
                 + String(stream_id)
             )
-        var method = String("GET")
-        var path = String("/")
+        # RFC 9114 sec 4.3.1: exactly one :method, :scheme and :path
+        # (CONNECT aside), pseudo-headers first, no connection-specific
+        # fields, clean values -- the rules h2 applies, shared through
+        # validate_request_fields. A request with no pseudo-headers used
+        # to be served as GET /. Malformed raises; the dispatcher
+        # answers 400.
+        if not validate_request_fields(
+            state.headers, False, self.config.enable_connect_protocol
+        ) or not validate_request_fields(state.trailers, True, False):
+            state.request_taken = True
+            raise Error(
+                "Http3Connection.take_request: malformed request on stream "
+                + String(stream_id)
+            )
+        var method = String("")
+        var path = String("")
         for i in range(len(state.headers)):
-            var name = state.headers[i].name
-            var value = state.headers[i].value
+            ref name = state.headers[i].name
             if name == ":method":
-                method = String(value)
+                method = state.headers[i].value
             elif name == ":path":
-                path = String(value)
-        var req = Request(method=method^, url=path^, body=state.body.copy())
+                path = state.headers[i].value
+        var body = List[UInt8]()
+        swap(body, state.body)
+        var pipe = Optional[ArcPointer[BodyPipe]](None)
+        if state.streaming and not state.fin_received:
+            pipe = ArcPointer(BodyPipe(body^, False))
+            body = List[UInt8]()
+            state.pipe = pipe
+        var req = Request(method=method, url=path, body=body)
+        req.body_pipe = pipe^
+        # Same rules as h2's take_request: repeated fields are appended,
+        # cookie crumbs are joined (RFC 9114 sec 4.2.1), and :authority
+        # becomes Host -- it used to be dropped, leaving Host-based
+        # routing blind on h3.
+        var cookie = String("")
         for i in range(len(state.headers)):
-            var name = state.headers[i].name
-            if (
-                name == ":method"
-                or name == ":path"
-                or name == ":scheme"
-                or name == ":authority"
-            ):
+            ref name = state.headers[i].name
+            if name == ":authority":
+                req.headers.set("Host", String(state.headers[i].value))
                 continue
-            req.headers.set(state.headers[i].name, state.headers[i].value)
+            if name == ":method" or name == ":path" or name == ":scheme":
+                continue
+            if name == "cookie":
+                if cookie.byte_length() > 0:
+                    cookie += "; "
+                cookie += String(state.headers[i].value)
+                continue
+            if name == "host" and req.headers.contains("Host"):
+                continue
+            req.headers.append(state.headers[i].name, state.headers[i].value)
+        if cookie.byte_length() > 0:
+            req.headers.append("cookie", cookie)
+        for i in range(len(state.trailers)):
+            if trailer_field_allowed(state.trailers[i].name):
+                req.trailers.append(
+                    state.trailers[i].name, state.trailers[i].value
+                )
         state.request_taken = True
         return req^
+
+    def is_tunnel(self, stream_id: Int) -> Bool:
+        """Whether ``stream_id`` carries an extended CONNECT request."""
+        try:
+            return self.streams[stream_id].tunnel
+        except:
+            return False
+
+    def body_backlog(self, stream_id: Int) -> Int:
+        """Body bytes of a streamed request received and not yet read by
+        its handler; -1 when the stream has no body being streamed."""
+        try:
+            ref st = self.streams[stream_id]
+            if st.pipe:
+                return len(st.pipe.value()[].data)
+        except:
+            pass
+        return -1
+
+    def take_stream_body(mut self, stream_id: Int) -> List[UInt8]:
+        """The DATA payload bytes received on ``stream_id`` since the
+        request (or the last call) took them: an extended CONNECT
+        tunnel's inbound bytes."""
+        var out = List[UInt8]()
+        if stream_id in self.streams:
+            try:
+                swap(out, self.streams[stream_id].body)
+            except:
+                pass
+        return out^
 
     def emit_response(mut self, stream_id: Int, var response: Response) raises:
         """Encode ``response`` into the per-stream outbox so the
@@ -755,14 +1195,21 @@ struct Http3Connection(Copyable, Defaultable):
                 " stream "
                 + String(stream_id)
             )
-        var headers = List[QpackHeader]()
-        for i in range(response.headers.len()):
-            var name = response.headers._keys[i]
-            var value = response.headers._values[i]
-            headers.append(QpackHeader(String(name), String(value)))
-        encode_response_headers(response.status, headers, state.outbox)
+        encode_response_head(response.status, response.headers, state.outbox)
         if len(response.body) != 0:
             encode_response_data(Span[UInt8, _](response.body), state.outbox)
+        # Trailers follow the body as a final HEADERS frame (RFC 9114
+        # sec 4.1); a buffered response used to drop them, which breaks
+        # gRPC status over h3.
+        if len(response.trailers._keys) > 0:
+            var tr = List[QpackHeader]()
+            for i in range(len(response.trailers._keys)):
+                tr.append(
+                    QpackHeader(
+                        response.trailers._keys[i], response.trailers._values[i]
+                    )
+                )
+            encode_response_trailers(tr, state.outbox)
         state.response_emitted = True
 
     # -- Unidirectional stream type dispatch (RFC 9114 §6.2) ----------
@@ -780,9 +1227,9 @@ struct Http3Connection(Copyable, Defaultable):
 
         * 0x00 (Control) -- parses SETTINGS first, then
           GOAWAY / MAX_PUSH_ID over the stream's lifetime.
-        * 0x01 (Push) -- the server records but ignores the
-          stream (push is deprecated as of RFC 9114 revision
-          9; the reactor STOP_SENDINGs at the QUIC layer).
+        * 0x01 (Push) -- refused: only a server opens push streams,
+          so a client's is ``H3_STREAM_CREATION_ERROR`` (RFC 9114
+          §6.2.2).
         * 0x02 (QPACK encoder) -- replayed into the connection
           dynamic table via
           :meth:`_feed_peer_qpack_encoder_stream`; each insert
@@ -791,6 +1238,10 @@ struct Http3Connection(Copyable, Defaultable):
         * 0x03 (QPACK decoder) -- captured but unused (we emit
           only static-table field sections, so the peer never
           acknowledges dynamic inserts to us).
+
+        A second QPACK encoder or decoder stream is
+        ``H3_STREAM_CREATION_ERROR`` (RFC 9204 §4.2), like a second
+        control stream.
 
         The stream-type varint may span multiple chunks (it is
         at most 8 bytes per RFC 9000 §16). The driver buffers
@@ -854,11 +1305,27 @@ struct Http3Connection(Copyable, Defaultable):
             self.peer_control_stream_id = stream_id
             return Http3StreamType.CONTROL
         if type_code == UInt64(Http3StreamType.PUSH):
-            return Http3StreamType.PUSH
+            # Only a server pushes (RFC 9114 sec 6.2.2): a client-initiated
+            # push stream is a connection error. It was recorded and its
+            # bytes dropped (H3-05).
+            raise Error(
+                "h3 server: client opened a push stream "
+                "(RFC 9114 6.2.2 H3_STREAM_CREATION_ERROR)"
+            )
         if type_code == UInt64(Http3StreamType.QPACK_ENCODER):
+            if self.peer_qpack_encoder_stream_id >= 0:
+                raise Error(
+                    "h3 server: peer opened a second QPACK encoder stream "
+                    "(RFC 9204 4.2 H3_STREAM_CREATION_ERROR)"
+                )
             self.peer_qpack_encoder_stream_id = stream_id
             return Http3StreamType.QPACK_ENCODER
         if type_code == UInt64(Http3StreamType.QPACK_DECODER):
+            if self.peer_qpack_decoder_stream_id >= 0:
+                raise Error(
+                    "h3 server: peer opened a second QPACK decoder stream "
+                    "(RFC 9204 4.2 H3_STREAM_CREATION_ERROR)"
+                )
             self.peer_qpack_decoder_stream_id = stream_id
             return Http3StreamType.QPACK_DECODER
         return -1
@@ -873,13 +1340,34 @@ struct Http3Connection(Copyable, Defaultable):
         var cursor = 0
         while cursor < len(bytes):
             var view = Span[UInt8, _](bytes[cursor:])
-            var type_var = decode_varint(view)
+            # A varint split across chunks is "need more", not an
+            # error. decode_varint raises on a short buffer, which
+            # propagated out and tore the connection down whenever a
+            # frame header straddled two QUIC packets.
+            var type_var: Varint
+            try:
+                type_var = decode_varint(view)
+            except:
+                break
             if type_var.consumed >= len(view):
                 break
             var rest = view[type_var.consumed :]
-            var len_var = decode_varint(rest)
+            var len_var: Varint
+            try:
+                len_var = decode_varint(rest)
+            except:
+                break
             var header_size = type_var.consumed + len_var.consumed
             var payload_size = Int(len_var.value)
+            # Checked from the header, before any payload is held: the
+            # carry below grew for as long as the peer kept a declared
+            # frame length unmet.
+            if len_var.value > UInt64(_MAX_CONTROL_FRAME_BYTES):
+                raise Error(
+                    "H3_EXCESSIVE_LOAD: control frame of "
+                    + String(len_var.value)
+                    + " bytes"
+                )
             if header_size + payload_size > len(view):
                 break
             var payload_start = cursor + header_size
@@ -908,6 +1396,14 @@ struct Http3Connection(Copyable, Defaultable):
         )
         self.pending_qpack_increment += result[0]
         var consumed = result[1]
+        # An unfinished instruction is at most one insert, which cannot
+        # exceed the table capacity. More than that waiting is not a
+        # partial instruction.
+        if len(bytes) - consumed > Int(self.qpack_table[].max_capacity) + 64:
+            raise Error(
+                "QPACK_ENCODER_STREAM_ERROR: unparsed encoder-stream bytes"
+                " past the table capacity"
+            )
         if consumed < len(bytes):
             var carry = List[UInt8](capacity=len(bytes) - consumed)
             for k in range(consumed, len(bytes)):
@@ -944,6 +1440,8 @@ struct Http3Connection(Copyable, Defaultable):
         * Any other frame before SETTINGS -> H3_MISSING_SETTINGS.
         * GOAWAY may arrive after SETTINGS; subsequent GOAWAYs
           must monotonically decrease (RFC 9114 §5.2).
+        * DATA, HEADERS, PUSH_PROMISE and the HTTP/2-reserved types
+          -> H3_FRAME_UNEXPECTED.
         """
         if frame_type == H3_FRAME_TYPE_SETTINGS:
             if self.peer_settings_received:
@@ -963,8 +1461,26 @@ struct Http3Connection(Copyable, Defaultable):
             )
         if frame_type == H3_FRAME_TYPE_GOAWAY:
             if len(payload) == 0:
-                raise Error("h3 server: empty GOAWAY payload")
-            var goaway_id = decode_varint(payload)
+                raise Error(
+                    "h3 server: empty GOAWAY payload "
+                    "(RFC 9114 7.2.6 H3_FRAME_ERROR)"
+                )
+            var goaway_id: Varint
+            try:
+                goaway_id = decode_varint(payload)
+            except:
+                raise Error(
+                    "h3 server: truncated GOAWAY stream id "
+                    "(RFC 9114 7.2.6 H3_FRAME_ERROR)"
+                )
+            # The payload is exactly one varint (RFC 9114 sec 7.2.6);
+            # bytes after it are H3_FRAME_ERROR (sec 7.1). They were
+            # ignored (H3-06).
+            if goaway_id.consumed != len(payload):
+                raise Error(
+                    "h3 server: GOAWAY payload has bytes after the stream "
+                    "id (RFC 9114 7.1 H3_FRAME_ERROR)"
+                )
             if (
                 self.peer_goaway_max_stream_id != UInt64((1 << 63) - 1)
                 and goaway_id.value > self.peer_goaway_max_stream_id
@@ -975,12 +1491,44 @@ struct Http3Connection(Copyable, Defaultable):
                 )
             self.peer_goaway_max_stream_id = goaway_id.value
             return
+        # DATA, HEADERS and PUSH_PROMISE are request-stream frames, and
+        # the HTTP/2 PRIORITY / PING / WINDOW_UPDATE / CONTINUATION types
+        # are reserved: each is a connection error of type
+        # H3_FRAME_UNEXPECTED on a control stream (RFC 9114 sec 7.2.1,
+        # 7.2.2, 7.2.5, 7.2.8, 11.2.1). They were silently dropped (H3-03).
+        # CANCEL_PUSH, MAX_PUSH_ID and unknown types stay accepted.
+        if (
+            frame_type == H3_FRAME_TYPE_DATA
+            or frame_type == H3_FRAME_TYPE_HEADERS
+            or frame_type == H3_FRAME_TYPE_PUSH_PROMISE
+            or frame_type == H3_FRAME_TYPE_H2_PRIORITY
+            or frame_type == H3_FRAME_TYPE_H2_PING
+            or frame_type == H3_FRAME_TYPE_H2_WINDOW_UPDATE
+            or frame_type == H3_FRAME_TYPE_H2_CONTINUATION
+        ):
+            raise Error(
+                "h3 server: frame type "
+                + String(frame_type)
+                + " is not allowed on the control stream"
+                " (RFC 9114 7.2 H3_FRAME_UNEXPECTED)"
+            )
 
     def _apply_peer_settings(mut self, var settings: List[Http3Setting]) raises:
         """Update the connection's view of the peer's announced
         SETTINGS. Unknown settings identifiers are ignored per
         RFC 9114 §7.2.4.1; the codec already rejects malformed
-        pairs."""
+        pairs. The identifiers 0x02 to 0x05 are HTTP/2 settings that
+        HTTP/3 reserves: receiving one is ``H3_SETTINGS_ERROR``
+        (RFC 9114 §7.2.4.1, §11.2.2), checked before any value is
+        applied."""
+        for i in range(len(settings)):
+            var reserved = settings[i].identifier
+            if reserved >= UInt64(0x02) and reserved <= UInt64(0x05):
+                raise Error(
+                    "h3 server: peer sent HTTP/2-reserved SETTINGS identifier "
+                    + String(reserved)
+                    + " (RFC 9114 7.2.4.1 H3_SETTINGS_ERROR)"
+                )
         for i in range(len(settings)):
             var id_ = settings[i].identifier
             var v = settings[i].value
@@ -992,6 +1540,13 @@ struct Http3Connection(Copyable, Defaultable):
                 self.peer_settings_qpack_blocked_streams = v
             elif id_ == H3_SETTINGS_ENABLE_CONNECT_PROTOCOL:
                 self.peer_settings_enable_connect_protocol = v != UInt64(0)
+            elif id_ == H3_SETTINGS_H3_DATAGRAM:
+                if v > 1 or (v == 1 and not self.peer_quic_datagram):
+                    raise Error(
+                        "h3 server: bad SETTINGS_H3_DATAGRAM (RFC 9297"
+                        " 2.1.1 H3_SETTINGS_ERROR)"
+                    )
+                self.peer_settings_h3_datagram = v == 1
 
     def emit_initial_settings(self) raises -> List[UInt8]:
         """Build the server's outbound control-stream prefix:
@@ -999,12 +1554,12 @@ struct Http3Connection(Copyable, Defaultable):
         frame carrying the local
         :class:`Http3Config` values.
 
-        The reactor opens a local control uni-stream via QUIC
-        and emits these bytes as the very first payload (RFC
-        9114 §6.2.1: SETTINGS MUST be the first frame). This
-        is the only frame the server is required to send
-        proactively; GOAWAY / MAX_PUSH_ID are emitted on
-        demand."""
+        The reactor sends these bytes as the very first payload of the
+        server's control stream (RFC 9114 §6.2.1: SETTINGS MUST be the
+        first frame); :meth:`take_control_stream_start` is the
+        once-only form it calls. This is the only frame the server is
+        required to send proactively; GOAWAY / MAX_PUSH_ID are emitted
+        on demand."""
         var out = List[UInt8]()
         var type_var = encode_varint(UInt64(Http3StreamType.CONTROL))
         for i in range(len(type_var)):
@@ -1035,10 +1590,31 @@ struct Http3Connection(Copyable, Defaultable):
                     value=UInt64(1),
                 )
             )
+        if self.config.h3_datagram:
+            settings.append(
+                Http3Setting(identifier=H3_SETTINGS_H3_DATAGRAM, value=1)
+            )
         var payload = List[UInt8]()
         encode_http3_settings(settings, payload)
         encode_http3_frame(H3_FRAME_TYPE_SETTINGS, Span[UInt8, _](payload), out)
         return out^
+
+    def take_control_stream_start(mut self) raises -> List[UInt8]:
+        """The bytes to send at offset 0 of the server's control stream
+        (:data:`H3_SERVER_CONTROL_STREAM_ID`): stream type 0x00 and the
+        SETTINGS frame (RFC 9114 sections 6.2.1, 7.2.4). Returns them
+        once; every later call returns an empty list. Also records
+        :attr:`control_stream_id`.
+
+        The QUIC reactor calls this with the first 1-RTT flight, so the
+        control stream is initiated at the beginning of the connection
+        (H3-07: it was never opened, and the client never received the
+        server's SETTINGS)."""
+        if self.control_stream_sent:
+            return List[UInt8]()
+        self.control_stream_sent = True
+        self.control_stream_id = H3_SERVER_CONTROL_STREAM_ID
+        return self.emit_initial_settings()
 
     def emit_goaway(mut self, max_stream_id: UInt64) raises -> List[UInt8]:
         """Build a GOAWAY frame announcing ``max_stream_id`` (RFC
@@ -1052,6 +1628,7 @@ struct Http3Connection(Copyable, Defaultable):
         var payload = encode_varint(max_stream_id)
         encode_http3_frame(H3_FRAME_TYPE_GOAWAY, Span[UInt8, _](payload), out)
         self.goaway_emitted = True
+        self.goaway_id = max_stream_id
         return out^
 
     def take_response_frames(mut self, stream_id: Int) raises -> List[UInt8]:

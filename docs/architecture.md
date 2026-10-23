@@ -206,8 +206,8 @@ flare.dns      getaddrinfo (dual-stack)
 flare.net      IpAddr, SocketAddr, RawSocket
 flare.runtime  Reactor (kqueue/epoll + EPOLLEXCLUSIVE), TimerWheel,
                Scheduler, HandoffQueue + WorkerHandoffPool,
-               num_cpus / default_worker_count, pthread + pinning,
-               block_in_pool (per-call pthread escape hatch)
+               num_cpus / default_worker_count, AsyncRT thread
+               engine + pinning, block_in_pool (blocking escape hatch)
 flare.testing  fork-and-serve helpers (`fork_server` /
                `kill_forked_server`) for cookbook examples and
                integration tests that need a real bound port
@@ -252,7 +252,7 @@ small `StepResult` per call telling the reactor how to update its
 interest mask, whether to re-arm the idle timer, and whether the
 connection is finished. The reactor owns the lifecycle.
 
-A 3-cycle inline fast path in `run_reactor_loop` lets a single
+A 3-cycle inline fast path in the HTTP reactor loop lets a single
 readable event drive the next writable + the next readable in
 sequence (without going back through `kqueue.kevent` / `epoll_wait`)
 when the buffers permit. This is the single biggest win on the
@@ -316,7 +316,8 @@ Cooperation is the contract.
 ## Multicore: thread-per-core, two listener modes
 
 `HttpServer.serve(handler, num_workers=N)` with `N >= 2` runs N
-pthread workers via `Scheduler`. Each worker owns its own reactor,
+workers via `Scheduler`, on the AsyncRT pool (see
+[`threading.md`](threading.md)). Each worker owns its own reactor,
 its own timer wheel, its own per-connection state.
 **Shared-nothing.** Two listener strategies are supported:
 
@@ -344,7 +345,8 @@ its own timer wheel, its own per-connection state.
   for the head-to-head numbers.
 
 `pin_cores=True` (default) pins worker `i` to core `i % num_cpus()`
-on Linux via `pthread_setaffinity_np`. macOS does not expose CPU
+on Linux via `pthread_setaffinity_np`, and restores the thread's mask
+when the worker exits. macOS does not expose CPU
 affinity to userspace, so pinning is a no-op there. The upper
 bound on `num_workers` is 256, enforced by `Scheduler.start`.
 
@@ -449,7 +451,7 @@ there is no parity table any more -- one type, one shape:
 | HTTP server (HTTP/1.1 + HTTP/2 + HTTP/3 via ALPN; UDP listener mounted alongside TCP) | [`flare.http.HttpServer.bind_with_http3`](../flare/http/server.mojo) |
 | HTTP client (HTTP/1.1 + HTTP/2 via TLS+ALPN or `prefer_h2c=True`) | [`flare.http.HttpClient`](../flare/http/client.mojo) |
 | WebSocket server (HTTP/1.1 Upgrade) | [`flare.ws.WsServer`](../flare/ws/server.mojo) |
-| WebSocket-over-HTTP/2 server (RFC 8441 Extended CONNECT; reactor sidecar) | [`flare.http.HttpServer.serve[H, W: WsH2Handler]`](../flare/http/server.mojo) |
+| WebSocket-over-HTTP/2 server (RFC 8441 Extended CONNECT; reactor sidecar) | [`flare.http.HttpServer.attach_ws_h2`](../flare/http/server.mojo) |
 | WebSocket server (multi-worker via SO_REUSEPORT) | `flare.ws.WsServer.serve(handler, num_workers=N)` |
 | WebSocket client (`ws://` / `wss://` — HTTP/1.1 Upgrade; ALPN advertises `http/1.1` on `wss://` to lock in the Upgrade path) | [`flare.ws.WsClient`](../flare/ws/client.mojo) |
 | Low-level HTTP/2 byte driver (server) | [`flare.http2.Http2Connection`](../flare/http2/server.mojo) |

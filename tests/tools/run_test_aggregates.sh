@@ -29,6 +29,11 @@ _ncpu="$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null) || echo 2 )"
 [ "$_ncpu" -gt 4 ] 2>/dev/null && _ncpu=4
 JOBS="${AGG_JOBS:-$_ncpu}"
 BUILD_DIR="${BUILD_DIR:-build/agg}"
+# Extra `-D` flags for every mojo build/run below, word-split on purpose
+# (e.g. MOJO_DEFINES="-D ASSERT=all"). Point BUILD_DIR elsewhere too, so
+# the two builds don't overwrite each other.
+MOJO_DEFINES="${MOJO_DEFINES:-}"
+[ -n "$MOJO_DEFINES" ] && echo "── MOJO_DEFINES: $MOJO_DEFINES ──"
 
 # Tests that mutate process-global state (env vars, named semaphores,
 # io_uring registrations) or are runtime-bound rather than compile-bound.
@@ -38,11 +43,14 @@ STANDALONE=(
   tests/runtime/test_block_in_pool.mojo
   tests/runtime/test_closure_send_contract.mojo
   tests/runtime/test_handoff.mojo
+  tests/runtime/test_scheduler_start_rollback.mojo
   tests/runtime/test_uring_bufring_dispatch.mojo
   tests/runtime/test_io_uring_sqe.mojo
   tests/runtime/test_reuseport.mojo
   tests/http/test_uring_serve_handler.mojo
   tests/http/test_uring_serve_handler_load.mojo
+  tests/http/test_uring_bufring_buffers.mojo
+  tests/http/test_uring_bufring_partial.mojo
   tests/runtime/stress_scheduler.mojo
 )
 
@@ -91,11 +99,16 @@ build_one() {
   [ "$area" = "_root" ] && inc="tests"
   # build/gen holds the generated sample_pb that
   # tests/grpc/proto/test_codegen.mojo imports.
-  if ! mojo build -I . -I "$inc" -I build/gen "$src" -o "$out" 2>"$out.log"; then
+  # Remove last run's binary first. The parallel path detects a failed
+  # build by the missing artifact, so a failure used to leave the old
+  # binary in place, pass that check, and run stale code as this run.
+  rm -f "$out"
+  # shellcheck disable=SC2086
+  if ! mojo build $MOJO_DEFINES -I . -I "$inc" -I build/gen "$src" -o "$out" 2>"$out.log"; then
     echo "BUILD FAILED: $src"; sed -n '1,20p' "$out.log"; return 1
   fi
 }
-export -f build_one; export BUILD_DIR
+export -f build_one; export BUILD_DIR MOJO_DEFINES
 build_failed=()
 if [ "$JOBS" -gt 1 ]; then
   printf '%s\n' "${AGGS[@]}" | xargs -P "$JOBS" -I FF bash -c 'build_one FF'
@@ -127,7 +140,8 @@ done
 echo "── running ${#STANDALONE[@]} standalone tests ──"
 for t in "${STANDALONE[@]}"; do
   [ -f "$t" ] || { echo "MISSING: $t"; failed+=("$t"); continue; }
-  if ! mojo -I . "$t"; then failed+=("$t"); fi
+  # shellcheck disable=SC2086
+  if ! mojo $MOJO_DEFINES -I . "$t"; then failed+=("$t"); fi
 done
 
 # Examples are programs, not test functions, so they cannot be aggregated
@@ -158,7 +172,9 @@ echo "   ${#EXAMPLES[@]} examples"
 build_example() {
   local src="$1" out="$BUILD_DIR/ex_${1//\//_}"
   out="${out%.mojo}"
-  if ! mojo build -I . "$src" -o "$out" 2>"$out.log"; then
+  rm -f "$out"  # same reason as build_one: never run a stale example
+  # shellcheck disable=SC2086
+  if ! mojo build $MOJO_DEFINES -I . "$src" -o "$out" 2>"$out.log"; then
     echo "BUILD FAILED: $src"; sed -n '1,20p' "$out.log"; return 1
   fi
 }

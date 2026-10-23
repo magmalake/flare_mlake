@@ -34,6 +34,7 @@ from flare.quic.frame import (
     ConnectionCloseFrame,
     CryptoFrame,
     DataBlockedFrame,
+    AckFrequencyFrame,
     DatagramFrame,
     FrameHandler,
     MaxDataFrame,
@@ -139,7 +140,10 @@ struct _NoOpHandler(FrameHandler, Movable):
     def on_datagram(mut self, dg: DatagramFrame) raises:
         self.dispatches += 1
 
-    def on_unknown(mut self, type_id: UInt64) raises:
+    def on_ack_frequency(mut self, f: AckFrequencyFrame) raises:
+        self.dispatches += 1
+
+    def on_immediate_ack(mut self) raises:
         self.dispatches += 1
 
 
@@ -151,11 +155,10 @@ def target(data: List[UInt8]) raises:
 
     var ok_first = True
     var consumed_first = 0
-    var dispatches_first = 0
     try:
         var h1 = _NoOpHandler(dispatches=0)
         consumed_first = parse_frame_into(span, h1)
-        dispatches_first = h1.dispatches
+        var dispatches_first = h1.dispatches
         _assert(
             consumed_first >= 1 and consumed_first <= n,
             (

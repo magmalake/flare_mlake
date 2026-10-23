@@ -53,9 +53,9 @@ Wire-protocol scope:
 Out of scope (intentional, mirrors the server's scope):
 
 * Server push (``PUSH_PROMISE``) -- we never originate it and
-  reject inbound PUSH_PROMISE frames from servers via
-  RST_STREAM (PROTOCOL_ERROR) since flare clients do not opt
-  into the SETTINGS_ENABLE_PUSH affordance.
+  treat an inbound PUSH_PROMISE from a server as a connection error
+  (GOAWAY with PROTOCOL_ERROR, RFC 9113 §8.4) since flare clients do
+  not opt into the SETTINGS_ENABLE_PUSH affordance.
 * Stream priority (deprecated by RFC 9113 §5.3.2).
 * Trailers (HEADERS frames *after* the response DATA stream
   closes) -- accepted at the parser level but not surfaced
@@ -74,6 +74,7 @@ plumbing) lives here.
 # methods across files, so the file sits over the 1000-line Pass-B cap.
 # Allowlisted in tests/tools/check_reactor_size.sh until then.
 from std.collections import Dict, Optional
+from std.time import perf_counter_ns
 
 from .frame import (
     Frame,
@@ -88,6 +89,7 @@ from .hpack import HpackHeader
 from .state import Connection, Http2Error, Http2ErrorCode, Stream, StreamState
 
 from ._client_types import (
+    BDP_WINDOW_MAX,
     Http2ClientConfig,
     Http2Response,
     _h2_response_to_http,
@@ -96,6 +98,10 @@ from ._client_types import (
 
 
 # ── Http2ClientConnection ────────────────────────────────────────────────
+
+
+def _bdp_ping_payload() -> List[UInt8]:
+    return List[UInt8]("flarebdp".as_bytes())
 
 
 struct Http2ClientConnection(Defaultable, Movable):
@@ -183,6 +189,18 @@ struct Http2ClientConnection(Defaultable, Movable):
     (RFC 9113 §5.1.1: odd integers, monotonically increasing).
     Starts at 1 and increments by 2 on every
     :meth:`next_stream_id` call."""
+    var _bdp_window: Int
+    """Current stream and connection receive window. Grown from PING
+    round-trip samples of the bytes in flight (the bandwidth-delay
+    product), as hyper does, up to :data:`BDP_WINDOW_MAX`."""
+    var _bdp_bytes: Int
+    var _bdp_sent_ns: Int
+    """When the outstanding BDP PING went out; 0 when none is."""
+    var _bdp_next_ns: Int
+    var _bdp_hdr: List[UInt8]
+    """Partial frame header :meth:`receive` is reading."""
+    var _bdp_skip: Int
+    """Payload bytes left of the frame :meth:`receive` is in."""
 
     var _stream_errors: Dict[Int, Int]
     """Stream-id -> peer-supplied RST_STREAM error code
@@ -208,7 +226,14 @@ struct Http2ClientConnection(Defaultable, Movable):
         self.outbox = List[UInt8]()
         self.greeted = False
         self.config = Http2ClientConfig()
+        self.conn.initial_window_size = self.config.initial_window_size
         self._next_sid = 1
+        self._bdp_window = 65535
+        self._bdp_bytes = 0
+        self._bdp_sent_ns = 0
+        self._bdp_next_ns = 0
+        self._bdp_hdr = List[UInt8]()
+        self._bdp_skip = 0
         self._stream_errors = Dict[Int, Int]()
         self._pending_body = Dict[Int, List[UInt8]]()
         self._pending_body_fin = Dict[Int, Bool]()
@@ -262,10 +287,11 @@ struct Http2ClientConnection(Defaultable, Movable):
         var out = Http2ClientConnection.with_config(config^)
         var s = Stream()
         s.id = 1
-        s.send_window = out.conn.initial_window_size
+        s.send_window = out.conn.peer_initial_window_size
         s.recv_window = out.conn.initial_window_size
         s.state = StreamState.HALF_CLOSED_LOCAL()
         out.conn.streams[1] = s^
+        out.conn.note_local_stream(1)
         out._next_sid = 3
         return out^
 
@@ -283,13 +309,18 @@ struct Http2ClientConnection(Defaultable, Movable):
         var out = Http2ClientConnection()
         out.config = config^
         out.conn.initial_window_size = out.config.initial_window_size
-        out.conn.send_window = out.config.initial_window_size
-        out.conn.recv_window = out.config.initial_window_size
-        out.conn.max_frame_size = out.config.max_frame_size
+        # Connection windows start at 65535 (RFC 9113 sec 6.9.2).
+        out.conn.send_window = 65535
+        out.conn.recv_window = 65535
+        # We accept up to what we advertise; what we send stays at 16384
+        # until the server's SETTINGS raise it (RFC 9113 sec 4.2).
+        out.conn.local_max_frame_size = out.config.max_frame_size
         out.conn.max_header_list_size = out.config.max_header_list_size
-        out.conn.hpack_decoder.max_size = out.config.header_table_size
-        # The ceiling a peer size update may restore to is what we
-        # advertise, not the table's current size.
+        # What we advertise is the ceiling for a peer size update
+        # (RFC 7541 sec 6.3). The decoder's *current* size stays at the
+        # 4096 default: the peer's encoder keeps that table until it has
+        # received our SETTINGS and sent a size update (sec 4.2), so
+        # shrinking now would drop entries it still indexes (HPACK-03).
         out.conn.hpack_decoder.settings_max_size = out.config.header_table_size
         out.conn.hpack_decoder.allow_huffman = out.config.allow_huffman_decode
         out.conn.hpack_encoder.allow_huffman = out.config.allow_huffman_encode
@@ -354,9 +385,19 @@ struct Http2ClientConnection(Defaultable, Movable):
             self._append_setting(p, 0x8, 1)
         f.payload = p^
         f.header.length = len(f.payload)
-        var bytes = encode_frame(f^)
+        var bytes = encode_frame(f)
         for i in range(len(bytes)):
             self.outbox.append(bytes[i])
+        # The connection window starts at 65535 (RFC 9113 sec 6.9.2);
+        # open it to match a larger configured stream window.
+        self._bdp_window = max(65535, self.config.initial_window_size)
+        if self._bdp_window > 65535:
+            self.outbox.extend(
+                encode_frame(
+                    Connection._window_update_frame(0, self._bdp_window - 65535)
+                )
+            )
+            self.conn.recv_window = self._bdp_window
         self.greeted = True
 
     def _append_setting(self, mut buf: List[UInt8], id: Int, value: Int):
@@ -390,11 +431,15 @@ struct Http2ClientConnection(Defaultable, Movable):
         becomes observable via :meth:`response_ready` after this
         call returns.
 
+        An oversized frame (RFC 9113 sec 4.2) queues
+        GOAWAY(FRAME_SIZE_ERROR) and discards the rest of the input
+        instead of raising; check :attr:`conn.goaway_sent` and flush
+        :meth:`drain` before closing.
+
         Raises:
-            Error: On a connection-level protocol violation
-                (malformed frame header, RST_STREAM on stream 0,
-                etc.). The caller SHOULD send a GOAWAY and close
-                the socket.
+            Error: On a connection-level protocol violation the frame
+                layer cannot report as a frame (malformed frame header,
+                etc.).
         """
         for i in range(len(data)):
             self.inbox.append(data[i])
@@ -408,9 +453,17 @@ struct Http2ClientConnection(Defaultable, Movable):
                     | Int(self.inbox[2])
                 )
                 if frame_size > self.config.max_frame_size:
-                    raise Error(
-                        "h2 client: frame exceeds advertised maximum size"
+                    # sec 4.2: a frame over the size we advertised is a
+                    # connection error FRAME_SIZE_ERROR. Queue the GOAWAY
+                    # rather than raising: callers let a raise propagate
+                    # and then close without sending anything (H2-18).
+                    var gerr = self.conn._conn_error(
+                        Http2ErrorCode.FRAME_SIZE_ERROR().value
                     )
+                    for gi in range(len(gerr)):
+                        self.outbox.extend(Span(encode_frame(gerr[gi])))
+                    self.inbox = List[UInt8]()
+                    return
             var span = Span[UInt8, _](self.inbox)
             var got = parse_frame(span)
             if not got:
@@ -421,24 +474,14 @@ struct Http2ClientConnection(Defaultable, Movable):
             for i in range(consumed, len(self.inbox)):
                 rest.append(self.inbox[i])
             self.inbox = rest^
-            # Special-case: PUSH_PROMISE from the server. We never
-            # opt in (SETTINGS_ENABLE_PUSH=0 in our preface
-            # SETTINGS), so any such frame is a protocol violation.
-            # Emit RST_STREAM(PROTOCOL_ERROR) on the promised
-            # stream id (the first 4 bytes of the PUSH_PROMISE
-            # payload) and drop the frame on the floor.
-            if frame.header.type.value == FrameType.PUSH_PROMISE().value:
-                if len(frame.payload) >= 4:
-                    var promised = (
-                        (Int(frame.payload[0]) << 24)
-                        | (Int(frame.payload[1]) << 16)
-                        | (Int(frame.payload[2]) << 8)
-                        | Int(frame.payload[3])
-                    ) & 0x7FFFFFFF
-                    self._send_rst_stream(
-                        promised, Http2ErrorCode.PROTOCOL_ERROR().value
-                    )
-                continue
+            # PUSH_PROMISE from the server: we never opt in
+            # (SETTINGS_ENABLE_PUSH=0 in our preface SETTINGS), so it is a
+            # connection error of type PROTOCOL_ERROR (RFC 9113 sec 8.4).
+            # It goes to ``handle_frame`` like every other frame, which
+            # answers with GOAWAY. It must not be dropped: its header block
+            # may insert into the server's HPACK table, and skipping it
+            # would leave the decoder out of step for every later response
+            # (RFC 9113 sec 4.3, H2-17).
             # Special-case: RST_STREAM. ``Connection.handle_frame``
             # already marks the stream CLOSED but does not retain
             # the peer's error code. Stash it here so the
@@ -512,6 +555,88 @@ struct Http2ClientConnection(Defaultable, Movable):
         if window_updated and not self.conn.goaway_sent:
             self._pump_all_pending()
 
+    def receive(mut self, data: Span[UInt8, _]) raises:
+        """:meth:`feed` that also grows the receive windows with the
+        measured bandwidth-delay product: drivers call this."""
+        var i = 0
+        while i < len(data):
+            if self._bdp_skip > 0:
+                var k = min(self._bdp_skip, len(data) - i)
+                i += k
+                self._bdp_skip -= k
+                continue
+            self._bdp_hdr.append(data[i])
+            i += 1
+            if len(self._bdp_hdr) < 9:
+                continue
+            ref h = self._bdp_hdr
+            var n = Int(h[0]) << 16 | Int(h[1]) << 8 | Int(h[2])
+            if h[3] == UInt8(FrameType.DATA().value):
+                self._bdp_on_data(n)
+            elif h[3] == UInt8(FrameType.PING().value) and (h[4] & 1) != 0:
+                self._bdp_on_ack()
+            self._bdp_skip = n
+            self._bdp_hdr.clear()
+        self.feed(data)
+
+    def _bdp_on_data(mut self, n: Int):
+        """Count DATA toward the outstanding sample, or start one with a
+        PING when the window can still grow."""
+        if self._bdp_sent_ns != 0:
+            self._bdp_bytes += n
+            return
+        if (
+            n == 0
+            or self._bdp_window >= BDP_WINDOW_MAX
+            or self.conn.goaway_sent
+        ):
+            return
+        var now = perf_counter_ns()
+        if now < self._bdp_next_ns:
+            return
+        var ping = Frame()
+        ping.header.type = FrameType.PING()
+        ping.payload = _bdp_ping_payload()
+        ping.header.length = 8
+        self.outbox.extend(encode_frame(ping))
+        self._bdp_sent_ns = now
+        self._bdp_bytes = n
+
+    def _bdp_on_ack(mut self) raises:
+        """The PING came back (the client sends no other PING): when the
+        round trip's DATA filled two thirds of the window, grow both
+        windows to twice it."""
+        if self._bdp_sent_ns == 0:
+            return
+        self._bdp_sent_ns = 0
+        if self._bdp_bytes * 3 < self._bdp_window * 2:
+            self._bdp_next_ns = perf_counter_ns() + 1_000_000_000
+            return
+        var w = min(self._bdp_bytes * 2, BDP_WINDOW_MAX)
+        if w <= self._bdp_window:
+            return
+        var delta = w - self._bdp_window
+        var p = List[UInt8]()
+        self._append_setting(p, 0x4, w)
+        var f = Frame()
+        f.header.type = FrameType.SETTINGS()
+        f.header.length = len(p)
+        f.payload = p^
+        self.outbox.extend(encode_frame(f))
+        self.conn.initial_window_size = w
+        var sids = List[Int]()
+        for entry in self.conn.streams.items():
+            sids.append(entry[0])
+        for sid in sids:
+            var st = self.conn.streams.pop(sid)
+            st.recv_window += delta
+            self.conn.streams[sid] = st^
+        self.outbox.extend(
+            encode_frame(Connection._window_update_frame(0, delta))
+        )
+        self.conn.recv_window += delta
+        self._bdp_window = w
+
     # ── Stream id allocation ─────────────────────────────────────────────
 
     def next_stream_id(mut self) -> Int:
@@ -572,7 +697,7 @@ struct Http2ClientConnection(Defaultable, Movable):
                 dp.append(body[pos + i])
             df.payload = dp^
             df.header.length = len(df.payload)
-            var db = encode_frame(df^)
+            var db = encode_frame(df)
             for i in range(len(db)):
                 self.outbox.append(db[i])
             self.conn.send_window -= chunk
@@ -580,7 +705,12 @@ struct Http2ClientConnection(Defaultable, Movable):
                 var sl2 = self.conn.streams[sid].copy()
                 sl2.send_window -= chunk
                 if is_last and end_stream:
-                    sl2.state = StreamState.HALF_CLOSED_LOCAL()
+                    # sec 5.1: our END_STREAM closes a stream the peer has
+                    # already ended; otherwise it half-closes our side.
+                    sl2.state = (
+                        StreamState.CLOSED() if sl2.state.value
+                        == StreamState.HALF_CLOSED_REMOTE().value else StreamState.HALF_CLOSED_LOCAL()
+                    )
                 self.conn.streams[sid] = sl2^
             pos += chunk
         return pos
@@ -736,7 +866,7 @@ struct Http2ClientConnection(Defaultable, Movable):
             hf.header.flags = FrameFlags(flags)
             hf.payload = enc^
             hf.header.length = len(hf.payload)
-            var hb = encode_frame(hf^)
+            var hb = encode_frame(hf)
             for i in range(len(hb)):
                 self.outbox.append(hb[i])
         else:
@@ -757,7 +887,7 @@ struct Http2ClientConnection(Defaultable, Movable):
                 first_payload.append(enc[i])
             hf.payload = first_payload^
             hf.header.length = len(hf.payload)
-            var hb = encode_frame(hf^)
+            var hb = encode_frame(hf)
             for i in range(len(hb)):
                 self.outbox.append(hb[i])
             # CONTINUATION frames for the rest. Each carries
@@ -779,7 +909,7 @@ struct Http2ClientConnection(Defaultable, Movable):
                     cp.append(enc[pos + i])
                 cf.payload = cp^
                 cf.header.length = len(cf.payload)
-                var cb = encode_frame(cf^)
+                var cb = encode_frame(cf)
                 for i in range(len(cb)):
                     self.outbox.append(cb[i])
                 pos += chunk
@@ -787,7 +917,7 @@ struct Http2ClientConnection(Defaultable, Movable):
         # works for subsequent inbound frames.
         var s = Stream()
         s.id = sid
-        s.send_window = self.conn.initial_window_size
+        s.send_window = self.conn.peer_initial_window_size
         s.recv_window = self.conn.initial_window_size
         if len(body) == 0:
             s.state = StreamState.HALF_CLOSED_LOCAL()
@@ -795,6 +925,7 @@ struct Http2ClientConnection(Defaultable, Movable):
             s.state = StreamState.OPEN()
         s.response_body_allowed = method.upper() != "HEAD"
         self.conn.streams[sid] = s^
+        self.conn.note_local_stream(sid)
         # Body: emit DATA frames bounded by the current send windows
         # + max_frame_size. If the window is exhausted mid-body the
         # remainder is stashed and drained by ``pump_pending_body``
@@ -855,15 +986,16 @@ struct Http2ClientConnection(Defaultable, Movable):
         hf.header.flags = FrameFlags(FrameFlags.END_HEADERS())
         hf.payload = enc^
         hf.header.length = len(hf.payload)
-        var hb = encode_frame(hf^)
+        var hb = encode_frame(hf)
         for i in range(len(hb)):
             self.outbox.append(hb[i])
         var s = Stream()
         s.id = sid
-        s.send_window = self.conn.initial_window_size
+        s.send_window = self.conn.peer_initial_window_size
         s.recv_window = self.conn.initial_window_size
         s.state = StreamState.OPEN()
         self.conn.streams[sid] = s^
+        self.conn.note_local_stream(sid)
 
     def send_data(
         mut self,
@@ -880,6 +1012,15 @@ struct Http2ClientConnection(Defaultable, Movable):
         :meth:`send_request`. Honours the negotiated send windows;
         raises if the body wouldn't fit.
         """
+        # sec 5.1, closed: "An endpoint MUST NOT send frames other than
+        # PRIORITY on a closed stream." A reset or finished stream stays
+        # closed; sending here would queue a DATA frame the peer answers
+        # with STREAM_CLOSED and would reopen the stream locally.
+        if sid in self.conn.streams and (
+            self.conn.streams[sid].state.value == StreamState.CLOSED().value
+        ):
+            self._discard_pending_body(sid)
+            return
         var n_body = len(body)
         if n_body == 0 and end_stream:
             # Empty DATA with END_STREAM is the half-close marker.
@@ -889,7 +1030,7 @@ struct Http2ClientConnection(Defaultable, Movable):
             df.header.flags = FrameFlags(FrameFlags.END_STREAM())
             df.payload = List[UInt8]()
             df.header.length = 0
-            var db = encode_frame(df^)
+            var db = encode_frame(df)
             for i in range(len(db)):
                 self.outbox.append(db[i])
             if sid in self.conn.streams:
@@ -943,7 +1084,7 @@ struct Http2ClientConnection(Defaultable, Movable):
         p.append(UInt8(error_code & 0xFF))
         f.payload = p^
         f.header.length = len(f.payload)
-        var bytes = encode_frame(f^)
+        var bytes = encode_frame(f)
         for i in range(len(bytes)):
             self.outbox.append(bytes[i])
 
@@ -960,13 +1101,13 @@ struct Http2ClientConnection(Defaultable, Movable):
         p.append(UInt8(error_code & 0xFF))
         f.payload = p^
         f.header.length = len(f.payload)
-        var bytes = encode_frame(f^)
+        var bytes = encode_frame(f)
         for i in range(len(bytes)):
             self.outbox.append(bytes[i])
 
     # ── Inbound completion polling ───────────────────────────────────────
 
-    def response_ready(self, sid: Int) raises -> Bool:
+    def response_ready(mut self, sid: Int) raises -> Bool:
         """Return ``True`` when the response on stream ``sid`` is fully
         buffered and ready to be popped via :meth:`take_response`.
 
@@ -982,10 +1123,14 @@ struct Http2ClientConnection(Defaultable, Movable):
             return True
         if sid not in self.conn.streams:
             return False
-        var s = self.conn.streams[sid].copy()
-        if not s.headers_complete:
-            return False
-        return s.data_complete or s.state.value == StreamState.CLOSED().value
+        # Moved out and back: a copy duplicated the whole buffered body
+        # on every poll, quadratic in the response size.
+        var s = self.conn.streams.pop(sid)
+        var ready = s.headers_complete and (
+            s.data_complete or s.state.value == StreamState.CLOSED().value
+        )
+        self.conn.streams[sid] = s^
+        return ready
 
     def stream_error(self, sid: Int) raises -> Optional[Int]:
         """Return the peer-supplied RST_STREAM error code for ``sid``,
@@ -1094,7 +1239,7 @@ struct Http2ClientConnection(Defaultable, Movable):
             hf.header.flags = FrameFlags(FrameFlags.END_HEADERS())
             hf.payload = enc^
             hf.header.length = len(hf.payload)
-            var hb = encode_frame(hf^)
+            var hb = encode_frame(hf)
             for i in range(len(hb)):
                 self.outbox.append(hb[i])
         else:
@@ -1107,7 +1252,7 @@ struct Http2ClientConnection(Defaultable, Movable):
                 first_payload.append(enc[i])
             hf.payload = first_payload^
             hf.header.length = len(hf.payload)
-            var hb = encode_frame(hf^)
+            var hb = encode_frame(hf)
             for i in range(len(hb)):
                 self.outbox.append(hb[i])
             var pos = max_frame
@@ -1127,17 +1272,18 @@ struct Http2ClientConnection(Defaultable, Movable):
                     cp.append(enc[pos + i])
                 cf.payload = cp^
                 cf.header.length = len(cf.payload)
-                var cb = encode_frame(cf^)
+                var cb = encode_frame(cf)
                 for i in range(len(cb)):
                     self.outbox.append(cb[i])
                 pos += chunk
         var s = Stream()
         s.id = sid
-        s.send_window = self.conn.initial_window_size
+        s.send_window = self.conn.peer_initial_window_size
         s.recv_window = self.conn.initial_window_size
         s.state = StreamState.OPEN()
         s.response_body_allowed = method.upper() != "HEAD"
         self.conn.streams[sid] = s^
+        self.conn.note_local_stream(sid)
 
     def headers_received(self, sid: Int) raises -> Bool:
         """``True`` once the response HEADERS block on ``sid`` is fully

@@ -46,6 +46,7 @@ from flare.quic import (
     TIMER_KIND_ACK_DELAY,
     TIMER_KIND_IDLE,
     TIMER_KIND_PTO,
+    CidKey,
     cid_to_hex,
     decode_timer_token,
     encode_long_header,
@@ -86,7 +87,12 @@ def _make_initial_datagram(
     for i in range(len(payload_len)):
         out.append(payload_len[i])
     out.append(UInt8(0))
-    return out^
+    var dg = out^
+    # RFC 9000 sec 14.1: the server drops an Initial in a datagram
+    # under 1200 bytes. Trailing zeros are datagram padding.
+    while len(dg) < 1200:
+        dg.append(UInt8(0))
+    return dg^
 
 
 def test_token_round_trip() raises:
@@ -163,12 +169,16 @@ def test_advance_idle_closes_connection() raises:
     var peer = SocketAddr(IpAddr.localhost(), UInt16(1234))
     _ = listener.dispatch_datagram(Span[UInt8, _](datagram), peer)
     assert_true(listener.connections[0].alive)
-    var fired = listener.advance_timers(now_ms=UInt64(200))
+    # The 50 ms timeout is raised to three PTOs (750 ms at the initial
+    # RTT; RFC 9000 sec 10.1), so advance past that.
+    var fired = listener.advance_timers(
+        now_ms=listener.timer_wheel.now_ms() + UInt64(2_000)
+    )
     assert_equal(fired, 1, "expected exactly one timer to fire")
     assert_false(listener.connections[0].alive)
     assert_equal(listener.connections[0].conn.state, CONN_STATE_CLOSED)
     assert_equal(
-        listener.cid_table.lookup(cid_to_hex(dcid)),
+        listener.cid_table.lookup(CidKey(dcid)),
         -1,
         "dead slot's CID must be retired",
     )
@@ -203,6 +213,79 @@ def test_on_idle_callback_is_idempotent_to_double_fire() raises:
     assert_false(qc.alive)
 
 
+def test_idle_timer_is_relative_to_the_real_clock() raises:
+    """The wheel was anchored at 0 but advanced on the monotonic clock,
+    so a 50 ms idle timer armed at accept was already days overdue and
+    the first real advance closed every connection."""
+    from flare.quic._server_support import _monotonic_ms
+
+    var listener = _bind_loopback(idle_ms=UInt64(50))
+    var dcid = _make_cid(UInt8(0x71), 8)
+    var scid = _make_cid(UInt8(0x81), 8)
+    var datagram = _make_initial_datagram(dcid, scid)
+    var peer = SocketAddr(IpAddr.localhost(), UInt16(1234))
+    _ = listener.dispatch_datagram(Span[UInt8, _](datagram), peer)
+    var fired = listener.advance_timers(now_ms=_monotonic_ms())
+    assert_equal(fired, 0, "idle timer fired at once")
+    assert_true(listener.connections[0].alive)
+
+
+def test_dead_slots_are_reclaimed_and_reused() raises:
+    """A closed connection's slot stayed allocated for good, so every
+    per-slot table grew with each connection ever accepted and every
+    tick scanned them all. It is now reclaimed when its timer sweeps
+    it, and the next connection gets the slot back."""
+    var listener = _bind_loopback(idle_ms=UInt64(50))
+    var dcid = _make_cid(UInt8(0x71), 8)
+    var scid = _make_cid(UInt8(0x81), 8)
+    var peer = SocketAddr(IpAddr.localhost(), UInt16(1234))
+    _ = listener.dispatch_datagram(
+        Span[UInt8, _](_make_initial_datagram(dcid, scid)), peer
+    )
+    assert_equal(listener.connection_count(), 1)
+    _ = listener.advance_timers(
+        now_ms=listener.timer_wheel.now_ms() + UInt64(2_000)
+    )
+    assert_false(listener.connections[0].alive)
+    assert_equal(len(listener.free_slots), 1)
+    assert_equal(listener.cid_table.lookup(CidKey(dcid)), -1)
+    var dcid2 = _make_cid(UInt8(0x72), 8)
+    var slot = listener.dispatch_datagram(
+        Span[UInt8, _](_make_initial_datagram(dcid2, scid)), peer
+    )
+    assert_equal(slot, 0, "the reclaimed slot was not reused")
+    assert_equal(listener.connection_count(), 1)
+    assert_true(listener.connections[0].alive)
+
+
+def test_live_connections_are_capped() raises:
+    var listener = _bind_loopback()
+    listener.config.max_connections = 2
+    var scid = _make_cid(UInt8(0x90), 8)
+    var peer = SocketAddr(IpAddr.localhost(), UInt16(1234))
+    for k in range(3):
+        _ = listener.dispatch_datagram(
+            Span[UInt8, _](
+                _make_initial_datagram(_make_cid(UInt8(0x10 + k), 8), scid)
+            ),
+            peer,
+        )
+    assert_equal(listener.connection_count(), 2)
+
+
+def test_poll_timeout_follows_the_next_timer() raises:
+    """The serve loop blocks no longer than until the next timer is due
+    (1..100 ms); a fixed 100 ms wait delayed a due PTO by up to 100 ms."""
+    var listener = _bind_loopback()
+    assert_equal(listener.poll_timeout_ms(), 100)
+    _ = listener.timer_wheel.schedule(after_ms=20, token=UInt64(1))
+    var t = listener.poll_timeout_ms()
+    assert_true(t >= 1 and t <= 20, "waits past the next timer")
+    _ = listener.timer_wheel.schedule(after_ms=0, token=UInt64(2))
+    assert_equal(listener.poll_timeout_ms(), 1)
+    listener.close()
+
+
 def main() raises:
     test_token_round_trip()
     test_encode_rejects_invalid_kind()
@@ -213,4 +296,8 @@ def main() raises:
     test_advance_idle_closes_connection()
     test_dispatch_arms_idle_timer_on_accept()
     test_on_idle_callback_is_idempotent_to_double_fire()
-    print("test_quic_timers: 9 passed")
+    test_idle_timer_is_relative_to_the_real_clock()
+    test_dead_slots_are_reclaimed_and_reused()
+    test_live_connections_are_capped()
+    test_poll_timeout_follows_the_next_timer()
+    print("test_quic_timers: 13 passed")

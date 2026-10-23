@@ -15,7 +15,8 @@ everywhere, see ``_scheduler_free_raw``).
 Each iteration:
 
 1. Samples ``num_workers`` uniformly in ``1..=16`` (kept well below
-   the 256 guard so we don't spend minutes just spawning threads),
+   the 256 guard so we don't spend minutes just spawning threads;
+   past the AsyncRT pool capacity the extra workers are OS threads),
    ``pin_cores`` as a random Bool, and an ``extra_churn`` count in
    ``0..=3`` for how many extra idempotent ``shutdown()`` calls to
    make after the first one.

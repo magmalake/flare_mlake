@@ -40,14 +40,17 @@ def _scalar_find_crlfcrlf(data: List[UInt8], start: Int) -> Int:
 
 def _scalar_scan_content_length(data: List[UInt8], header_end: Int) -> Int:
     """Reference implementation used as the oracle."""
-    var needle = "content-length:"
+    var needle = "content-length"
     var np = needle.unsafe_ptr()
     var nl = needle.byte_length()
     var p = data.unsafe_ptr()
     var i = 0
-    while i + nl <= header_end:
-        var found = True
+    while i + nl + 1 <= header_end:
+        # Header lines only: the byte before the name must be LF.
+        var found = i > 0 and p[unsafe_offset=i - 1] == 10
         for j in range(nl):
+            if not found:
+                break
             var c = p[unsafe_offset=i + j]
             if c >= 65 and c <= 90:
                 c = c + 32
@@ -55,19 +58,46 @@ def _scalar_scan_content_length(data: List[UInt8], header_end: Int) -> Int:
                 found = False
                 break
         if found:
+            # Optional SP/HTAB between the name and the colon, then ':'.
             var pos = i + nl
             while pos < header_end and (
                 p[unsafe_offset=pos] == 32 or p[unsafe_offset=pos] == 9
             ):
                 pos += 1
+            if pos >= header_end or p[unsafe_offset=pos] != 58:
+                i += 1
+                continue
+            pos += 1
+            while pos < header_end and (
+                p[unsafe_offset=pos] == 32 or p[unsafe_offset=pos] == 9
+            ):
+                pos += 1
+            # 1-18 digits, optional trailing whitespace, then the end of
+            # the line; anything else is -1 (invalid).
             var result = 0
+            var digits = 0
             while (
                 pos < header_end
                 and p[unsafe_offset=pos] >= 48
                 and p[unsafe_offset=pos] <= 57
             ):
                 result = result * 10 + Int(p[unsafe_offset=pos]) - 48
+                digits += 1
+                if digits > 18:
+                    return -1
                 pos += 1
+            if digits == 0:
+                return -1
+            while pos < header_end and (
+                p[unsafe_offset=pos] == 32 or p[unsafe_offset=pos] == 9
+            ):
+                pos += 1
+            if (
+                pos < header_end
+                and p[unsafe_offset=pos] != 13
+                and p[unsafe_offset=pos] != 10
+            ):
+                return -1
             return result
         i += 1
     return 0

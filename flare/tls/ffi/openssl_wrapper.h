@@ -78,6 +78,7 @@ int flare_ssl_write(flare_ssl_t ssl, const uint8_t* buf, int len);
 #define FLARE_SSL_IO_WANT_WRITE (-2)
 #define FLARE_SSL_IO_CLOSED     (-3)  /* peer close_notify (clean EOF) */
 #define FLARE_SSL_IO_FATAL      (-4)
+#define FLARE_SSL_IO_EOF_UNCLEAN (-5)  /* EOF with no close_notify (blocking read) */
 
 /**
  * Non-blocking ``SSL_read``. Returns the number of plaintext bytes
@@ -177,6 +178,20 @@ int flare_ssl_session_reused(flare_ssl_t ssl);
  */
 int flare_ssl_ctx_enable_session_tickets(flare_ssl_ctx_t ctx, int lifetime_s);
 
+/**
+ * Server-side: turn resumption off. Sets ``SSL_OP_NO_TICKET``, sends zero
+ * TLS 1.3 NewSessionTicket messages (``SSL_CTX_set_num_tickets(ctx, 0)``) and
+ * disables the server session cache (``SSL_SESS_CACHE_OFF``), so no session
+ * is issued and none can be resumed.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int flare_ssl_ctx_disable_session_tickets(flare_ssl_ctx_t ctx);
+
+/* Raise the minimum protocol version: TLS1_2_VERSION (0x0303) or
+ * TLS1_3_VERSION (0x0304). Anything else fails; returns 0 on success. */
+int flare_ssl_ctx_set_min_proto(flare_ssl_ctx_t ctx, int version);
+
 /* ── Error ─────────────────────────────────────────────────────────────────── */
 
 const char* flare_ssl_last_error(void);
@@ -211,6 +226,18 @@ flare_ssl_ctx_t flare_ssl_ctx_new_server(
 int flare_ssl_ctx_reload(
     flare_ssl_ctx_t ctx, const char* cert_path, const char* key_path
 );
+
+/* Serve cert_path / key_path to clients whose SNI is ``host`` ("" for the
+ * default, "*.example.com" for one-label wildcards), replacing any entry
+ * for it. Safe while other threads handshake on ctx; a bad pair changes
+ * nothing. 0 on success, -1 on failure. */
+int flare_ssl_ctx_set_cert(
+    flare_ssl_ctx_t ctx, const char* host, const char* cert_path,
+    const char* key_path
+);
+
+/* 1 when the context's certificate and private key match, else 0. */
+int flare_ssl_ctx_check_private_key(flare_ssl_ctx_t ctx);
 
 /**
  * Set ALPN protocols for server-side selection.

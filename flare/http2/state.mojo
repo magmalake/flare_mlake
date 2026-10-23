@@ -45,11 +45,57 @@ from .frame import (
     H2_DEFAULT_FRAME_SIZE,
     encode_frame,
 )
-from .hpack import HpackDecoder, HpackEncoder, HpackHeader
-from .stream_slab import StreamSlab
+from .hpack import (
+    HPACK_BUDGET_ERROR,
+    HpackDecoder,
+    HpackEncoder,
+    HpackHeader,
+)
+from .stream_slab import SlabEntry, StreamSlab
 
 
 # ── H2 error codes (RFC 9113 §7) ────────────────────────────────────────
+
+
+comptime _MAX_BUFFERED_REQUEST_BYTES: Int = 64 * 1024 * 1024
+"""Request body bytes one server connection buffers before it stops
+returning connection-level flow-control credit."""
+
+comptime _RESET_BY_US_REMEMBERED: Int = 1024
+"""How many of our own RST_STREAMs are remembered for ignoring the
+peer's in-flight frames. Bounded so a reset flood cannot grow it."""
+
+
+def _is_valid_field_value(v: String) -> Bool:
+    """RFC 9113 sec 8.2.1: no NUL / CR / LF, no leading or trailing SP
+    or HTAB."""
+    var n = v.byte_length()
+    if n == 0:
+        return True
+    var p = v.unsafe_ptr()
+    var first = p[unsafe_offset=0]
+    var last = p[unsafe_offset=n - 1]
+    if first == 32 or first == 9 or last == 32 or last == 9:
+        return False
+    for k in range(n):
+        var c = p[unsafe_offset=k]
+        if c == 0 or c == 10 or c == 13:
+            return False
+    return True
+
+
+def h2_setting_error(id: Int, v: Int) -> Int:
+    """The RFC 9113 sec 6.5.2 error code for SETTINGS pair ``(id, v)``,
+    or 0 when it is valid. Every place a peer's settings are applied --
+    a SETTINGS frame and the h2c ``HTTP2-Settings`` header -- goes
+    through this one check."""
+    if id == 0x2 and v != 0 and v != 1:  # SETTINGS_ENABLE_PUSH
+        return Http2ErrorCode.PROTOCOL_ERROR().value
+    if id == 0x4 and v > 0x7FFFFFFF:  # SETTINGS_INITIAL_WINDOW_SIZE
+        return Http2ErrorCode.FLOW_CONTROL_ERROR().value
+    if id == 0x5 and (v < H2_DEFAULT_FRAME_SIZE or v > 16777215):
+        return Http2ErrorCode.PROTOCOL_ERROR().value  # SETTINGS_MAX_FRAME_SIZE
+    return 0
 
 
 struct Http2ErrorCode(Copyable, Defaultable):
@@ -185,7 +231,7 @@ struct StreamState(Copyable, Defaultable):
 comptime StreamId = Int
 
 
-struct Stream(Copyable, Defaultable):
+struct Stream(Copyable, Defaultable, SlabEntry):
     """Per-stream record."""
 
     var id: StreamId
@@ -251,6 +297,24 @@ struct Stream(Copyable, Defaultable):
         self.response_started = False
         self.extended_connect_protocol = ""
 
+    def slab_active(self) -> Bool:
+        var st = self.state.value
+        return (
+            st == StreamState.OPEN().value
+            or st == StreamState.HALF_CLOSED_LOCAL().value
+            or st == StreamState.HALF_CLOSED_REMOTE().value
+        )
+
+    def slab_ready(self) -> Bool:
+        """A request fully buffered and not yet dispatched; see
+        ``Http2Connection.take_completed_streams``."""
+        return (
+            self.headers_complete
+            and self.data_complete
+            and not self.response_started
+            and self.state.value != StreamState.CLOSED().value
+        )
+
 
 # ── Connection ──────────────────────────────────────────────────────────
 
@@ -274,6 +338,13 @@ struct Connection(Copyable, Defaultable):
     cannot bound them. This limit does not apply to client response bodies.
     """
     var initial_window_size: Int
+    """Our SETTINGS_INITIAL_WINDOW_SIZE: the receive window each new
+    stream starts with, and what we advertise."""
+    var peer_initial_window_size: Int
+    """The peer's SETTINGS_INITIAL_WINDOW_SIZE: the *send* window each
+    new stream starts with. One field used to serve both, so the peer's
+    value overwrote ours (and vice versa), and the two ends disagreed
+    about every stream's window."""
     var max_header_list_size: Int
     """SETTINGS_MAX_HEADER_LIST_SIZE (RFC 9113 §6.5.2). ``0`` means
     unset / advertise no cap (the RFC default). ``Http2Config``
@@ -281,6 +352,10 @@ struct Connection(Copyable, Defaultable):
 
     var send_window: Int
     var recv_window: Int
+    """Connection-level receive window: what the peer may still send.
+    DATA debits it; every WINDOW_UPDATE(0) we emit credits it, so credit
+    withheld above ``_MAX_BUFFERED_REQUEST_BYTES`` is a hard bound, not a
+    request: DATA past it is GOAWAY(FLOW_CONTROL_ERROR) (RFC 9113 §6.9.1)."""
     var goaway_received: Bool
     var preface_seen: Bool
     var settings_acked: Bool
@@ -302,6 +377,13 @@ struct Connection(Copyable, Defaultable):
     speak; flipped to ``True`` by the unified
     :class:`flare.http.HttpServer` once the unified
     :class:`flare.ws.WsServer` is wired in (Phase 6)."""
+    var peer_header_table_size: Int
+    """The peer's SETTINGS_HEADER_TABLE_SIZE: the dynamic table limit
+    for *our encoder*. Our encoder never indexes, so this is recorded
+    only. Applying it to our decoder -- as this code once did -- made a
+    peer's 0 evict entries its own encoder still referenced, and its
+    2^32-1 lift our decoder's memory bound."""
+
     var peer_enable_connect_protocol: Bool
     """When ``True``, the *peer* advertised
     ``SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`` in its initial
@@ -321,6 +403,11 @@ struct Connection(Copyable, Defaultable):
     last-stream-id field and the RFC 9113 sec 5.1.1 monotonicity check
     (a peer must not open a stream numbered below one it already
     opened)."""
+    var max_local_stream_id: Int
+    """Client role: highest stream id this endpoint has opened (0 if none).
+    ``last_peer_stream_id`` only tracks peer-initiated ids, so without this
+    a client cannot tell a stream it opened and finished with from one that
+    was never opened (``_idle_id``)."""
     var local_max_frame_size: Int
     """The SETTINGS_MAX_FRAME_SIZE *we* advertise, and therefore the
     largest inbound frame we accept (RFC 9113 sec 4.2).
@@ -343,6 +430,25 @@ struct Connection(Copyable, Defaultable):
     boundary and per-fragment decoding corrupts it."""
     var header_block_end_stream: Bool
     """END_STREAM seen on the HEADERS that opened ``header_block``."""
+    var buffered_request_bytes: Int
+    """Request body bytes buffered on streams whose request has not been
+    taken yet (server side)."""
+    var withheld_conn_credit: Int
+    """Connection-level WINDOW_UPDATE credit held back while
+    ``buffered_request_bytes`` is over the cap."""
+    var reset_by_us: List[Int]
+    """Streams we sent RST_STREAM on, most recent last, bounded. DATA the
+    peer had in flight for them is dropped quietly; it used to be a
+    connection-level STREAM_CLOSED that tore down every other stream."""
+    var header_block_refuse: Int
+    """Non-zero: the open block belongs to a stream being refused, with
+    this RST_STREAM error code. The block is still decoded when it
+    completes -- RFC 9113 sec 4.3: every header block updates the
+    connection-wide HPACK context, refused or not."""
+    var header_block_continuations: Int
+    """CONTINUATION frames seen on the open block (flood guard). Kept on
+    the connection: at most one block is open (sec 6.10), and a refused
+    stream has no entry in ``streams`` to count on."""
     var reset_streams: List[Int]
     """Stream ids that received an inbound RST_STREAM since the
     last :meth:`take_reset_streams` call (RFC 9113 §6.4). Drained
@@ -361,6 +467,7 @@ struct Connection(Copyable, Defaultable):
         self.max_concurrent_streams = 100
         self.max_request_body_size = 10 * 1024 * 1024
         self.initial_window_size = 65535
+        self.peer_initial_window_size = 65535
         self.max_header_list_size = 0  # unset / unbounded (RFC default)
         self.send_window = 65535
         self.recv_window = 65535
@@ -369,14 +476,21 @@ struct Connection(Copyable, Defaultable):
         self.settings_acked = False
         self.is_client = False
         self.enable_connect_protocol = False
+        self.peer_header_table_size = 4096
         self.peer_enable_connect_protocol = False
         self.rst_stream_count = 0
         self.goaway_sent = False
         self.last_peer_stream_id = 0
+        self.max_local_stream_id = 0
         self.local_max_frame_size = H2_DEFAULT_FRAME_SIZE
         self.continuing_stream = 0
         self.header_block = List[UInt8]()
         self.header_block_end_stream = False
+        self.header_block_refuse = 0
+        self.header_block_continuations = 0
+        self.reset_by_us = List[Int]()
+        self.buffered_request_bytes = 0
+        self.withheld_conn_credit = 0
         self.reset_streams = List[Int]()
 
     def _make_settings(self, ack: Bool) -> Frame:
@@ -401,8 +515,10 @@ struct Connection(Copyable, Defaultable):
         var p = List[UInt8]()
 
         # SETTINGS_HEADER_TABLE_SIZE = 0x1 — only when != RFC 7541 default.
-        if self.hpack_decoder.max_size != 4096:
-            self._append_setting(p, 0x1, self.hpack_decoder.max_size)
+        # The advertised value, not the decoder's current size: the
+        # latter stays at 4096 until the peer's size update (HPACK-03).
+        if self.hpack_decoder.settings_max_size != 4096:
+            self._append_setting(p, 0x1, self.hpack_decoder.settings_max_size)
 
         # SETTINGS_MAX_CONCURRENT_STREAMS = 0x3 — flare always
         # advertises its bound (RFC 9113 §6.5.2 has no protocol
@@ -415,8 +531,8 @@ struct Connection(Copyable, Defaultable):
             self._append_setting(p, 0x4, self.initial_window_size)
 
         # SETTINGS_MAX_FRAME_SIZE = 0x5 — only when != RFC default.
-        if self.max_frame_size != H2_DEFAULT_FRAME_SIZE:
-            self._append_setting(p, 0x5, self.max_frame_size)
+        if self.local_max_frame_size != H2_DEFAULT_FRAME_SIZE:
+            self._append_setting(p, 0x5, self.local_max_frame_size)
 
         # SETTINGS_MAX_HEADER_LIST_SIZE = 0x6 — only when set
         # (``0`` = unset, RFC default is "unlimited").
@@ -452,12 +568,52 @@ struct Connection(Copyable, Defaultable):
     def _ensure_stream(mut self, sid: StreamId) raises -> Stream:
         if sid in self.streams:
             return self.streams[sid].copy()
+        # A connection that serves many requests used to keep every
+        # stream it ever saw: memory grew with the connection's age, and
+        # every HEADERS walked the whole table to count active streams.
+        # Once the table passes the threshold, drop every CLOSED entry.
+        # That is amortised O(1) per stream, and it keeps recently
+        # closed streams around for late frames.
+        if len(self.streams) >= self._prune_threshold():
+            self._prune_closed_streams()
         var s = Stream()
         s.id = sid
         s.state = StreamState.IDLE()
-        s.send_window = self.initial_window_size
+        s.send_window = self.peer_initial_window_size
         s.recv_window = self.initial_window_size
         return s^
+
+    def note_local_stream(mut self, sid: Int):
+        """Record that this endpoint opened stream ``sid`` (client role)."""
+        if sid > self.max_local_stream_id:
+            self.max_local_stream_id = sid
+
+    def _idle_id(self, sid: Int) -> Bool:
+        """Whether a stream id that is absent from the table names an *idle*
+        stream (RFC 9113 sec 5.1), as opposed to one already closed and
+        dropped from the table.
+
+        Server role: ids above the highest the peer opened, and every even
+        id. Client role:
+        ``last_peer_stream_id`` stays 0, so use the highest id this client
+        opened; an even id is server-initiated and, with push disabled, is
+        never opened (H2-03).
+        """
+        if self.is_client:
+            return sid > self.max_local_stream_id or (sid % 2) == 0
+        # Server role: a client opens only odd ids (sec 5.1.1) and the
+        # server opens none (push is disabled), so every even id is idle
+        # whatever the highest request id is (H2-15).
+        return sid > self.last_peer_stream_id or (sid % 2) == 0
+
+    def _prune_threshold(self) -> Int:
+        var t = self.max_concurrent_streams * 2
+        return t if t > 256 else 256
+
+    def _prune_closed_streams(mut self) raises:
+        for sid in self.streams.ids():
+            if self.streams[sid].state.value == StreamState.CLOSED().value:
+                _ = self.streams.pop(sid)
 
     def _put_stream(mut self, var s: Stream):
         self.streams[s.id] = s^
@@ -469,8 +625,22 @@ struct Connection(Copyable, Defaultable):
             return self.max_header_list_size
         return _DEFAULT_HARD_HEADER_CAP
 
-    def _rst_stream_frame(self, sid: Int, error_code: Int) -> Frame:
-        """Build a RST_STREAM frame (RFC 9113 6.4)."""
+    def _header_block_ceiling(self) -> Int:
+        """Hard ceiling on a header block, both as raw bytes accumulated
+        across CONTINUATION frames and as decoded list size. Lists
+        between the negotiated cap and this ceiling are decoded in full
+        and refused with RST_STREAM, which keeps HPACK in step; past it
+        the connection is closed."""
+        var c = self._header_list_cap() * 4
+        return c if c > 262144 else 262144
+
+    def _rst_stream_frame(mut self, sid: Int, error_code: Int) -> Frame:
+        """Build a RST_STREAM frame (RFC 9113 6.4), and remember that we
+        reset ``sid``: frames the peer sent before our RST arrived must
+        be ignored, not treated as errors (sec 5.1, "closed")."""
+        self.reset_by_us.append(sid)
+        if len(self.reset_by_us) > _RESET_BY_US_REMEMBERED:
+            _ = self.reset_by_us.pop(0)
         var f = Frame()
         f.header.type = FrameType.RST_STREAM()
         f.header.stream_id = sid
@@ -483,6 +653,54 @@ struct Connection(Copyable, Defaultable):
         f.payload = p^
         f.header.length = len(f.payload)
         return f^
+
+    def _recount_buffered_request_bytes(mut self) -> Int:
+        """Exact buffered total, from the streams still open. The running
+        counter only goes down when a request is taken; resets and
+        pruning drop bodies too, so it is recomputed whenever it claims
+        the cap is reached. O(streams), and only near the cap."""
+        var n = 0
+        for entry in self.streams.items():
+            if entry[1].state.value != StreamState.CLOSED().value:
+                n += len(entry[1].data)
+        self.buffered_request_bytes = n
+        return n
+
+    def release_request_credit(mut self, released: Int) -> List[Frame]:
+        """Account ``released`` body bytes as handed to a handler, and
+        return the withheld connection credit once buffering is back
+        under the cap."""
+        var out = List[Frame]()
+        self.buffered_request_bytes -= released
+        if self.buffered_request_bytes < 0:
+            self.buffered_request_bytes = 0
+        if (
+            self.withheld_conn_credit > 0
+            and self.buffered_request_bytes <= _MAX_BUFFERED_REQUEST_BYTES
+        ):
+            out.append(self._conn_window_update(self.withheld_conn_credit))
+            self.withheld_conn_credit = 0
+        return out^
+
+    def _conn_window_update(mut self, credit: Int) -> Frame:
+        """WINDOW_UPDATE(0, credit), adding ``credit`` back to
+        ``recv_window``.
+
+        Every connection-level credit this endpoint grants goes through
+        here, so ``recv_window`` always equals the window the peer is
+        entitled to (RFC 9113 sec 6.9.1). H2-01.
+        """
+        self.recv_window += credit
+        return Self._window_update_frame(0, credit)
+
+    def _close_if_known(mut self, sid: Int):
+        if sid in self.streams:
+            try:
+                var s = self.streams[sid].copy()
+                s.state = StreamState.CLOSED()
+                self._put_stream(s^)
+            except:
+                pass
 
     @staticmethod
     def _window_update_frame(sid: Int, credit: Int) -> Frame:
@@ -538,7 +756,7 @@ struct Connection(Copyable, Defaultable):
 
         Raises when the declared pad length does not leave room for
         itself, which sec 6.1 makes a connection error."""
-        var p = f.payload.copy()
+        ref p = f.payload
         var start = 0
         var end = len(p)
         if f.header.flags.has(FrameFlags.PADDED()):
@@ -553,10 +771,7 @@ struct Connection(Copyable, Defaultable):
             if end - start < 5:
                 raise Error("h2: PRIORITY prefix truncated")
             start += 5
-        var out = List[UInt8](capacity=end - start)
-        for i in range(start, end):
-            out.append(p[i])
-        return out^
+        return List[UInt8](Span(p)[start:end])
 
     @staticmethod
     def _is_connection_specific(name: String) -> Bool:
@@ -583,105 +798,49 @@ struct Connection(Copyable, Defaultable):
     def _validate_request_headers(
         self, hdrs: List[HpackHeader], is_trailers: Bool
     ) -> Bool:
-        """Return ``True`` when ``hdrs`` is a well-formed HTTP/2 request
-        header list (RFC 9113 sec 8.1.2 and sec 8.3).
-
-        A ``False`` return is a malformed request: the caller answers
-        with RST_STREAM(PROTOCOL_ERROR) rather than serving it."""
-        var seen_regular = False
-        var n_method = 0
-        var n_scheme = 0
-        var n_path = 0
-        var n_authority = 0
-        var path_empty = False
-        var is_connect = False
-        var has_protocol = False
-        for i in range(len(hdrs)):
-            var name = hdrs[i].name
-            if name.byte_length() == 0:
-                return False
-            # sec 8.2.1: field names are lowercase on the wire.
-            var np = name.unsafe_ptr()
-            for k in range(name.byte_length()):
-                var c = np[unsafe_offset=k]
-                if c >= UInt8(ord("A")) and c <= UInt8(ord("Z")):
-                    return False
-            if name.unsafe_ptr()[unsafe_offset=0] == UInt8(ord(":")):
-                # sec 8.3: pseudo-headers never appear in trailers, and
-                # sec 8.1.2.1 puts them all before the regular fields.
-                if is_trailers or seen_regular:
-                    return False
-                if not Connection._is_request_pseudo(name):
-                    return False
-                if name == ":method":
-                    n_method += 1
-                    is_connect = hdrs[i].value == "CONNECT"
-                elif name == ":scheme":
-                    n_scheme += 1
-                elif name == ":path":
-                    n_path += 1
-                    path_empty = hdrs[i].value.byte_length() == 0
-                elif name == ":authority":
-                    n_authority += 1
-                elif name == ":protocol":
-                    has_protocol = True
-            else:
-                seen_regular = True
-                if Connection._is_connection_specific(name):
-                    return False
-                # sec 8.2.2: TE is allowed, but only as "trailers".
-                if name == "te" and hdrs[i].value != "trailers":
-                    return False
-        if is_trailers:
-            return True
-        if n_method != 1:
-            return False
-        if n_scheme > 1 or n_path > 1 or n_authority > 1:
-            return False
-        if is_connect and not has_protocol:
-            # sec 8.5: a classic CONNECT carries :authority only, and
-            # omitting :scheme / :path is required rather than a fault.
-            return n_scheme == 0 and n_path == 0 and n_authority == 1
-        # Extended CONNECT (RFC 8441) and every other method need the
-        # full request triple.
-        if n_scheme != 1 or n_path != 1:
-            return False
-        if path_empty:
-            return False
-        return True
+        """See :func:`validate_request_fields`."""
+        return validate_request_fields(
+            hdrs, is_trailers, self.enable_connect_protocol
+        )
 
     @staticmethod
     def _declared_content_length(hdrs: List[HpackHeader]) -> Int:
-        """The request's ``content-length``, or ``-1`` when absent or
-        unparseable."""
+        """The request's ``content-length``: ``-1`` when absent, ``-2``
+        when malformed, otherwise the number every field denotes.
+
+        RFC 9110 sec 8.6: ``Content-Length = 1*DIGIT``; a recipient MUST
+        prevent integer-conversion overflow, and a message whose
+        content-length fields differ is malformed. The value used to be
+        folded into a wrapping 64-bit ``Int`` (2^64 + 5 read as 5) from the
+        first field only, so flare's view of the body length could differ
+        from an intermediary's (H2-05).
+        """
+        var declared = -1
         for i in range(len(hdrs)):
             if hdrs[i].name == "content-length":
                 var v = hdrs[i].value
                 if v.byte_length() == 0:
-                    return -1
+                    return -2
                 var acc = 0
                 var p = v.unsafe_ptr()
                 for k in range(v.byte_length()):
                     var c = Int(p[unsafe_offset=k])
                     if c < 48 or c > 57:
-                        return -1
+                        return -2
+                    if acc > (Int.MAX - (c - 48)) // 10:
+                        return -2
                     acc = acc * 10 + (c - 48)
-                return acc
-        return -1
+                if declared >= 0 and acc != declared:
+                    return -2
+                declared = acc
+        return declared
 
     def _active_stream_count(self) -> Int:
         """Streams that count against SETTINGS_MAX_CONCURRENT_STREAMS
-        (RFC 9113 sec 5.1.2: open plus either half-closed state)."""
-        var n = 0
-        for entry in self.streams.items():
-            var st = entry[1].state.value
-            if (
-                st == StreamState.OPEN().value
-                or st == StreamState.HALF_CLOSED_LOCAL().value
-                or st == StreamState.HALF_CLOSED_REMOTE().value
-            ):
-                n += 1
-        return n
+        (RFC 9113 sec 5.1.2: open plus either half-closed state).
+        ``Stream.slab_active`` is the predicate; the slab keeps the
+        count exact on every write."""
+        return self.streams.active_count()
 
     def _commit_header_block(mut self, sid: StreamId) raises -> List[Frame]:
         """Decode the accumulated header block for ``sid``, validate it,
@@ -697,11 +856,30 @@ struct Connection(Copyable, Defaultable):
 
         var hdrs: List[HpackHeader]
         try:
-            hdrs = self.hpack_decoder.decode(Span[UInt8, _](block))
-        except:
+            hdrs = self.hpack_decoder.decode(
+                Span[UInt8, _](block), self._header_block_ceiling()
+            )
+        except e:
+            # A block expanding past the ceiling is a decode bomb, and
+            # the decode stopped midway: the table is out of step.
+            if HPACK_BUDGET_ERROR in String(e):
+                return self._conn_error(
+                    Http2ErrorCode.ENHANCE_YOUR_CALM().value
+                )
             # sec 4.3: the HPACK context is connection-wide, so a
             # decode failure poisons every later block.
             return self._conn_error(Http2ErrorCode.COMPRESSION_ERROR().value)
+
+        var refuse = self.header_block_refuse
+        self.header_block_refuse = 0
+        if refuse != 0:
+            # Decoded only to keep HPACK in step; the fields are dropped.
+            out.append(self._rst_stream_frame(sid, refuse))
+            if sid in self.streams:
+                var rs = self.streams[sid].copy()
+                rs.state = StreamState.CLOSED()
+                self._put_stream(rs^)
+            return out^
 
         var s = self._ensure_stream(sid)
         var is_trailers = s.headers_complete
@@ -841,6 +1019,7 @@ struct Connection(Copyable, Defaultable):
                 self._put_stream(s^)
                 return out^
 
+        s.headers.reserve(len(s.headers) + len(hdrs))
         for j in range(len(hdrs)):
             s.headers.append(hdrs[j].copy())
             # RFC 8441 sec 4: capture ``:protocol`` on Extended CONNECT
@@ -853,6 +1032,21 @@ struct Connection(Copyable, Defaultable):
             if self.is_client and not s.response_body_allowed:
                 s.content_length = -1
         s.headers_complete = True
+
+        if s.content_length == -2:
+            # A malformed content-length (non-digits, overflow, or fields
+            # that disagree) makes the request malformed (RFC 9113 sec
+            # 8.1.1): stream error, not a body length to trust.
+            out.append(
+                self._rst_stream_frame(
+                    sid, Http2ErrorCode.PROTOCOL_ERROR().value
+                )
+            )
+            s.state = StreamState.CLOSED()
+            s.data = List[UInt8]()
+            s.headers = List[HpackHeader]()
+            self._put_stream(s^)
+            return out^
 
         if end_stream:
             # sec 8.1.2.6: a declared content-length must match the DATA
@@ -909,23 +1103,29 @@ struct Connection(Copyable, Defaultable):
                 self.continuing_stream
             ):
                 return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
-            var cs = self.streams[sid].copy()
-            cs.continuation_count += 1
-            if cs.continuation_count > _CONTINUATION_FRAME_CAP:
+            self.header_block_continuations += 1
+            if self.header_block_continuations > _CONTINUATION_FRAME_CAP:
                 # CONTINUATION flood (CVE-2024-27316).
                 self.continuing_stream = 0
                 self.header_block = List[UInt8]()
                 return self._conn_error(
                     Http2ErrorCode.ENHANCE_YOUR_CALM().value
                 )
-            self._put_stream(cs^)
-            var cfrag: List[UInt8]
-            try:
-                cfrag = self._strip_pad_and_priority(f, False)
-            except:
-                return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
-            for i in range(len(cfrag)):
-                self.header_block.append(cfrag[i])
+            # This branch returns before the frame-size check below, so
+            # each CONTINUATION was accepted at up to 16 MiB: 64 of them
+            # buffered a gigabyte. It also stripped padding, a flag
+            # CONTINUATION does not have (RFC 9113 sec 6.10).
+            if plen > self.local_max_frame_size:
+                self.continuing_stream = 0
+                self.header_block = List[UInt8]()
+                return self._conn_error(Http2ErrorCode.FRAME_SIZE_ERROR().value)
+            if len(self.header_block) + plen > self._header_block_ceiling():
+                self.continuing_stream = 0
+                self.header_block = List[UInt8]()
+                return self._conn_error(
+                    Http2ErrorCode.ENHANCE_YOUR_CALM().value
+                )
+            self.header_block.extend(Span[UInt8, _](f.payload))
             if not f.header.flags.has(FrameFlags.END_HEADERS()):
                 return out^
             self.continuing_stream = 0
@@ -943,6 +1143,11 @@ struct Connection(Copyable, Defaultable):
         elif ft == FrameType.GOAWAY().value:
             if sid != 0:
                 return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
+            # sec 6.8: last-stream-id (4) + error code (4), then optional
+            # debug data; anything shorter is too small for its mandatory
+            # fields (sec 4.2).
+            if plen < 8:
+                return self._conn_error(Http2ErrorCode.FRAME_SIZE_ERROR().value)
         elif ft == FrameType.SETTINGS().value:
             if sid != 0:
                 return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
@@ -963,11 +1168,18 @@ struct Connection(Copyable, Defaultable):
                 | Int(f.payload[3])
             ) & 0x7FFFFFFF
             if dep == sid:
+                # sec 5.1: RST_STREAM must not be sent on an idle stream,
+                # so there the only report is a connection error (H2-16).
+                if sid not in self.streams and self._idle_id(sid):
+                    return self._conn_error(
+                        Http2ErrorCode.PROTOCOL_ERROR().value
+                    )
                 out.append(
                     self._rst_stream_frame(
                         sid, Http2ErrorCode.PROTOCOL_ERROR().value
                     )
                 )
+                self._close_if_known(sid)
                 return out^
         elif ft == FrameType.RST_STREAM().value:
             if sid == 0:
@@ -975,7 +1187,7 @@ struct Connection(Copyable, Defaultable):
             if plen != 4:
                 return self._conn_error(Http2ErrorCode.FRAME_SIZE_ERROR().value)
             # sec 6.4: RST_STREAM on a stream the peer never opened.
-            if sid not in self.streams and sid > self.last_peer_stream_id:
+            if sid not in self.streams and self._idle_id(sid):
                 return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
         elif ft == FrameType.WINDOW_UPDATE().value:
             if plen != 4:
@@ -993,13 +1205,20 @@ struct Connection(Copyable, Defaultable):
         if plen > self.local_max_frame_size:
             return self._conn_error(Http2ErrorCode.FRAME_SIZE_ERROR().value)
 
-        # sec 5.1.1: peer-initiated stream ids are odd and must only
-        # increase. A lower id that is not still in the table refers to
-        # a stream the peer already finished with.
+        # sec 5.1.1: peer-initiated stream ids are odd and must strictly
+        # increase. An id at or below the highest one seen that is not
+        # still in the table was used up already: finished, or refused
+        # (a refused stream is never stored but still consumes its id).
+        # Before any stream id has been seen there is nothing to reuse;
+        # stream 0 is rejected further down.
         if ft == FrameType.HEADERS().value and not self.is_client:
             if sid != 0 and (sid % 2) == 0:
                 return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
-            if sid < self.last_peer_stream_id and sid not in self.streams:
+            if (
+                self.last_peer_stream_id > 0
+                and sid <= self.last_peer_stream_id
+                and sid not in self.streams
+            ):
                 return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
             if sid > self.last_peer_stream_id:
                 self.last_peer_stream_id = sid
@@ -1023,35 +1242,28 @@ struct Connection(Copyable, Defaultable):
                 # RFC 9113 sec 6.5.2 bounds. Out-of-range values are
                 # connection errors, not values to clamp: accepting one
                 # silently desynchronises both ends' idea of the window.
-                if id == 0x2:  # SETTINGS_ENABLE_PUSH
-                    if v != 0 and v != 1:
-                        return self._conn_error(
-                            Http2ErrorCode.PROTOCOL_ERROR().value
-                        )
-                elif id == 0x4:  # SETTINGS_INITIAL_WINDOW_SIZE
-                    if v > 0x7FFFFFFF:
-                        return self._conn_error(
-                            Http2ErrorCode.FLOW_CONTROL_ERROR().value
-                        )
-                elif id == 0x5:  # SETTINGS_MAX_FRAME_SIZE
-                    if v < H2_DEFAULT_FRAME_SIZE or v > 16777215:
-                        return self._conn_error(
-                            Http2ErrorCode.PROTOCOL_ERROR().value
-                        )
+                var bad = h2_setting_error(id, v)
+                if bad != 0:
+                    return self._conn_error(bad)
 
                 if id == 0x4:  # SETTINGS_INITIAL_WINDOW_SIZE
                     # sec 6.9.2: the change is a delta applied to every
                     # existing stream's send window, and the result may
                     # legitimately go negative (the peer over-sent
                     # against the older, larger window).
-                    var delta = v - self.initial_window_size
-                    self.initial_window_size = v
+                    var delta = v - self.peer_initial_window_size
+                    self.peer_initial_window_size = v
                     if delta != 0:
                         var ids = List[Int]()
                         for entry in self.streams.items():
                             ids.append(entry[0])
                         for k in range(len(ids)):
                             var st2 = self.streams[ids[k]].copy()
+                            # A closed stream has no window to adjust; its
+                            # stale one could otherwise trip
+                            # FLOW_CONTROL_ERROR on a healthy connection.
+                            if st2.state.value == StreamState.CLOSED().value:
+                                continue
                             if st2.send_window + delta > _MAX_WINDOW:
                                 return self._conn_error(
                                     Http2ErrorCode.FLOW_CONTROL_ERROR().value
@@ -1061,7 +1273,10 @@ struct Connection(Copyable, Defaultable):
                 elif id == 0x5:  # SETTINGS_MAX_FRAME_SIZE
                     self.max_frame_size = v
                 elif id == 0x1:  # SETTINGS_HEADER_TABLE_SIZE
-                    self.hpack_decoder.max_size = v
+                    # The *peer's* decoder limit: it bounds what our
+                    # encoder may index (RFC 9113 sec 6.5.2), never our
+                    # decoder, whose size only an in-band update changes.
+                    self.peer_header_table_size = v
                 elif id == 0x8:  # SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441)
                     # Peer is advertising whether Extended CONNECT
                     # is allowed. RFC 8441 §3: on the server side
@@ -1099,11 +1314,19 @@ struct Connection(Copyable, Defaultable):
                     return self._conn_error(
                         Http2ErrorCode.PROTOCOL_ERROR().value
                     )
+                # sec 5.1: no RST_STREAM on an idle stream (H2-16).
+                if sid not in self.streams and self._idle_id(sid):
+                    return self._conn_error(
+                        Http2ErrorCode.PROTOCOL_ERROR().value
+                    )
                 out.append(
                     self._rst_stream_frame(
                         sid, Http2ErrorCode.PROTOCOL_ERROR().value
                     )
                 )
+                # A reset stream is closed (sec 5.1). Leaving it open let
+                # the handler run and keep sending on it.
+                self._close_if_known(sid)
                 return out^
             if sid == 0:
                 # sec 6.9.1: a window may not grow past 2^31-1.
@@ -1115,7 +1338,7 @@ struct Connection(Copyable, Defaultable):
             else:
                 if sid not in self.streams:
                     # sec 5.1: WINDOW_UPDATE on an idle stream.
-                    if sid > self.last_peer_stream_id:
+                    if self._idle_id(sid):
                         return self._conn_error(
                             Http2ErrorCode.PROTOCOL_ERROR().value
                         )
@@ -1136,10 +1359,23 @@ struct Connection(Copyable, Defaultable):
 
         if ft == FrameType.HEADERS().value:
             if f.header.stream_id == 0:
-                raise Error("h2: HEADERS on stream 0")
+                # sec 6.2: HEADERS on stream 0 is a connection error. A
+                # raise would leave the connection without a GOAWAY.
+                return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
+            # sec 5.1.1: a client opens every stream it uses, and with
+            # push disabled the server never opens one, so a response
+            # HEADERS on an id the client has no stream for (idle, or
+            # even) is an unexpected stream identifier.
+            if self.is_client and f.header.stream_id not in self.streams:
+                return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
             # sec 5.1: a stream the peer already ended, or one it has
             # closed, must not carry another HEADERS. A second HEADERS
             # on an open stream is trailers and must end the stream.
+            # Refusals below record a code rather than returning at
+            # once: the block must still be decoded (sec 4.3), or its
+            # dynamic-table inserts are lost and every later block on the
+            # connection decodes against the wrong table.
+            var refuse = 0
             if f.header.stream_id in self.streams:
                 var prev = self.streams[f.header.stream_id].copy()
                 var st = prev.state.value
@@ -1147,10 +1383,9 @@ struct Connection(Copyable, Defaultable):
                     return self._conn_error(
                         Http2ErrorCode.STREAM_CLOSED().value
                     )
-                if (
-                    not self.is_client
-                    and st == StreamState.HALF_CLOSED_REMOTE().value
-                ):
+                if st == StreamState.HALF_CLOSED_REMOTE().value:
+                    # sec 5.1: the peer already sent END_STREAM, in either
+                    # role (a server's response, a client's request).
                     return self._conn_error(
                         Http2ErrorCode.STREAM_CLOSED().value
                     )
@@ -1160,30 +1395,18 @@ struct Connection(Copyable, Defaultable):
                     and not f.header.flags.has(FrameFlags.END_STREAM())
                 ):
                     # sec 8.1: trailers must carry END_STREAM.
-                    out.append(
-                        self._rst_stream_frame(
-                            f.header.stream_id,
-                            Http2ErrorCode.PROTOCOL_ERROR().value,
-                        )
-                    )
-                    prev.state = StreamState.CLOSED()
-                    self._put_stream(prev^)
-                    return out^
+                    refuse = Http2ErrorCode.PROTOCOL_ERROR().value
             # sec 5.1.2: refuse a stream past the concurrency limit we
             # advertised instead of serving it.
+            # A limit of 0 is not special (sec 6.5.2): it admits no stream,
+            # which is how an operator drains a server.
             if (
-                not self.is_client
+                refuse == 0
+                and not self.is_client
                 and f.header.stream_id not in self.streams
-                and self.max_concurrent_streams > 0
                 and self._active_stream_count() >= self.max_concurrent_streams
             ):
-                out.append(
-                    self._rst_stream_frame(
-                        f.header.stream_id,
-                        Http2ErrorCode.REFUSED_STREAM().value,
-                    )
-                )
-                return out^
+                refuse = Http2ErrorCode.REFUSED_STREAM().value
             # sec 5.3.1: the priority prefix must not name this stream.
             if f.header.flags.has(FrameFlags.PRIORITY()):
                 var off = 1 if f.header.flags.has(FrameFlags.PADDED()) else 0
@@ -1207,9 +1430,12 @@ struct Connection(Copyable, Defaultable):
             self.header_block_end_stream = f.header.flags.has(
                 FrameFlags.END_STREAM()
             )
-            var s = self._ensure_stream(f.header.stream_id)
-            s.continuation_count = 0
-            self._put_stream(s^)
+            self.header_block_refuse = refuse
+            self.header_block_continuations = 0
+            if refuse == 0:
+                var s = self._ensure_stream(f.header.stream_id)
+                s.continuation_count = 0
+                self._put_stream(s^)
             if not f.header.flags.has(FrameFlags.END_HEADERS()):
                 # Block stays open; only CONTINUATION on this stream may
                 # follow (sec 6.10).
@@ -1223,29 +1449,68 @@ struct Connection(Copyable, Defaultable):
             return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
 
         if ft == FrameType.DATA().value:
+            # RFC 9113 sec 6.9.1: DATA that does not fit the connection
+            # window we granted is a connection error, whether or not the
+            # frame is then processed. Until this check existed the
+            # connection window was never enforced, so the 64 MiB
+            # buffered-request cap below only stopped a peer that chose to
+            # obey the credit it withheld (H2-01).
+            if plen > self.recv_window:
+                return self._conn_error(
+                    Http2ErrorCode.FLOW_CONTROL_ERROR().value
+                )
+            self.recv_window -= plen
+            if sid in self.reset_by_us:
+                # In flight before our RST_STREAM reached the peer:
+                # ignore it, but hand back the connection-level credit it
+                # used, or the connection window drains away.
+                if plen > 0:
+                    out.append(self._conn_window_update(plen))
+                return out^
             if sid not in self.streams:
                 # sec 5.1: DATA on a stream that was never opened is
                 # PROTOCOL_ERROR; on one already gone, STREAM_CLOSED.
-                if sid > self.last_peer_stream_id:
+                if self._idle_id(sid):
                     return self._conn_error(
                         Http2ErrorCode.PROTOCOL_ERROR().value
                     )
                 return self._conn_error(Http2ErrorCode.STREAM_CLOSED().value)
-            var s = self.streams[sid].copy()
-            if self.is_client and not s.headers_complete:
-                return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
+            var s = self.streams.pop(sid)
             var st = s.state.value
             if (
                 st == StreamState.CLOSED().value
                 or st == StreamState.HALF_CLOSED_REMOTE().value
             ):
                 # The peer already ended its half; more DATA is not
-                # allowed to arrive on it.
+                # allowed to arrive on it. Tested before the "no response
+                # head yet" case below: a stream the server reset before
+                # answering is closed, so its DATA is STREAM_CLOSED, not
+                # PROTOCOL_ERROR (RFC 9113 sec 5.1, H2-20).
+                self._put_stream(s^)
                 return self._conn_error(Http2ErrorCode.STREAM_CLOSED().value)
+            if self.is_client and not s.headers_complete:
+                # RFC 9113 sec 8.1 / 8.1.1: a response that starts with DATA
+                # is malformed, and a malformed response is a stream error
+                # (sec 5.4.2), so one bad stream cannot take its siblings
+                # down. Reset it, and return the frame's connection credit
+                # as the 204-body branch below does (DOC-03).
+                out.append(
+                    self._rst_stream_frame(
+                        sid, Http2ErrorCode.PROTOCOL_ERROR().value
+                    )
+                )
+                s.state = StreamState.CLOSED()
+                s.data = List[UInt8]()
+                s.headers = List[HpackHeader]()
+                self._put_stream(s^)
+                if plen > 0:
+                    out.append(self._conn_window_update(plen))
+                return out^
             var body: List[UInt8]
             try:
                 body = self._strip_pad_and_priority(f, False)
             except:
+                self._put_stream(s^)
                 return self._conn_error(Http2ErrorCode.PROTOCOL_ERROR().value)
             # Flow control is accounted on the whole frame payload,
             # padding included (sec 6.9.1).
@@ -1258,6 +1523,11 @@ struct Connection(Copyable, Defaultable):
                 )
                 s.state = StreamState.CLOSED()
                 self._put_stream(s^)
+                # The discarded DATA still counted against the connection
+                # window (RFC 9113 sec 6.9): give its credit back or the
+                # peer's window shrinks for good (H2-09).
+                if len(f.payload) > 0:
+                    out.append(self._conn_window_update(len(f.payload)))
                 return out^
             if self.is_client and not s.response_body_allowed and len(body) > 0:
                 # Stream error, for the same reason as the response-head
@@ -1273,7 +1543,7 @@ struct Connection(Copyable, Defaultable):
                 s.headers = List[HpackHeader]()
                 self._put_stream(s^)
                 if len(f.payload) > 0:
-                    out.append(Self._window_update_frame(0, len(f.payload)))
+                    out.append(self._conn_window_update(len(f.payload)))
                 return out^
             if not self.is_client and len(body) > (
                 self.max_request_body_size - len(s.data)
@@ -1299,11 +1569,31 @@ struct Connection(Copyable, Defaultable):
                 s.state = StreamState.CLOSED()
                 self._put_stream(s^)
                 if len(f.payload) > 0:
-                    out.append(Self._window_update_frame(0, len(f.payload)))
+                    out.append(self._conn_window_update(len(f.payload)))
                 return out^
-            for j in range(len(body)):
-                s.data.append(body[j])
+            s.data.extend(Span[UInt8, _](body))
             s.received_body_bytes += len(body)
+            # sec 8.1.1: more DATA than content-length declared is
+            # malformed on the frame that goes over, not only at
+            # END_STREAM -- waiting let a peer buffer past its own claim.
+            if (
+                not self.is_client
+                and s.content_length >= 0
+                and s.received_body_bytes > s.content_length
+            ):
+                out.append(
+                    self._rst_stream_frame(
+                        sid, Http2ErrorCode.PROTOCOL_ERROR().value
+                    )
+                )
+                s.data = List[UInt8]()
+                s.state = StreamState.CLOSED()
+                self._put_stream(s^)
+                if len(f.payload) > 0:
+                    out.append(self._conn_window_update(len(f.payload)))
+                return out^
+            if not self.is_client:
+                self.buffered_request_bytes += len(body)
             # Padding is immediately consumed. Streaming DATA credit is
             # returned by drain_body, not merely by pumping the socket.
             var credit = len(f.payload)
@@ -1324,6 +1614,9 @@ struct Connection(Copyable, Defaultable):
                     )
                     s.state = StreamState.CLOSED()
                     self._put_stream(s^)
+                    # Credit for the discarded DATA goes back too (H2-09).
+                    if len(f.payload) > 0:
+                        out.append(self._conn_window_update(len(f.payload)))
                     return out^
                 s.data_complete = True
                 # Client-side: a stream we've already half-closed
@@ -1335,13 +1628,42 @@ struct Connection(Copyable, Defaultable):
                     s.state = StreamState.CLOSED()
                 else:
                     s.state = StreamState.HALF_CLOSED_REMOTE()
+            # sec 5.1: nothing but PRIORITY may be sent on a closed
+            # stream, and the credit of a stream this frame just closed
+            # is useless to the peer, so no stream-level WINDOW_UPDATE
+            # for it (H2-19). The connection-level one below still goes.
+            var stream_closed = s.state.value == StreamState.CLOSED().value
             self._put_stream(s^)
             # Connection credit lets unrelated streams progress; each
             # streaming response remains bounded by its own receive window.
+            #
+            # Server side, request bodies are buffered until END_STREAM
+            # and every DATA frame was credited straight back, so the
+            # only bound was max_request_body_size per stream: 100
+            # streams of 10 MiB, 1 GiB per connection. Past
+            # _MAX_BUFFERED_REQUEST_BYTES the connection-level credit is
+            # withheld, which stalls the peer, until handlers take their
+            # bodies (release_request_credit).
             if len(f.payload) > 0:
-                if credit > 0:
+                if credit > 0 and not stream_closed:
                     out.append(Self._window_update_frame(sid, credit))
-                out.append(Self._window_update_frame(0, len(f.payload)))
+                if (
+                    not self.is_client
+                    and self.buffered_request_bytes
+                    > _MAX_BUFFERED_REQUEST_BYTES
+                    and self._recount_buffered_request_bytes()
+                    > _MAX_BUFFERED_REQUEST_BYTES
+                ):
+                    self.withheld_conn_credit += len(f.payload)
+                else:
+                    # Back under the cap (bodies taken or dropped): return
+                    # whatever was held along with this frame's credit.
+                    out.append(
+                        self._conn_window_update(
+                            len(f.payload) + self.withheld_conn_credit
+                        )
+                    )
+                    self.withheld_conn_credit = 0
             return out^
 
         if ft == FrameType.GOAWAY().value:
@@ -1409,8 +1731,7 @@ struct Connection(Copyable, Defaultable):
             df.header.stream_id = sid
             df.header.flags = FrameFlags(FrameFlags.END_STREAM())
             var pl = List[UInt8](capacity=len(body))
-            for i in range(len(body)):
-                pl.append(body[i])
+            pl.extend(body)
             df.payload = pl^
             frames.append(df^)
         return frames^
@@ -1460,8 +1781,7 @@ struct Connection(Copyable, Defaultable):
             # No END_STREAM: the trailing HEADERS below closes the stream.
             df.header.flags = FrameFlags()
             var pl = List[UInt8](capacity=len(body))
-            for i in range(len(body)):
-                pl.append(body[i])
+            pl.extend(body)
             df.payload = pl^
             frames.append(df^)
         var tl = List[HpackHeader]()
@@ -1525,3 +1845,115 @@ struct Connection(Copyable, Defaultable):
         )
         tf.payload = tenc^
         return tf^
+
+
+def validate_request_fields(
+    hdrs: List[HpackHeader], is_trailers: Bool, allow_extended_connect: Bool
+) -> Bool:
+    """Return ``True`` when ``hdrs`` is a well-formed request header
+    list: HTTP/2 (RFC 9113 sec 8.1.2 and sec 8.3), and HTTP/3, whose
+    rules are the same (RFC 9114 sec 4.2 and sec 4.3.1).
+
+    A ``False`` return is a malformed request: the caller answers
+    with RST_STREAM(PROTOCOL_ERROR) rather than serving it."""
+    var seen_regular = False
+    var n_method = 0
+    var n_scheme = 0
+    var n_path = 0
+    var n_authority = 0
+    var path_empty = False
+    var path_value = String("")
+    var method_value = String("")
+    var authority = String("")
+    var host = String("")
+    var is_connect = False
+    var has_protocol = False
+    for i in range(len(hdrs)):
+        var name = hdrs[i].name
+        if name.byte_length() == 0:
+            return False
+        # sec 8.2.1: field names are lowercase on the wire, and no
+        # name or value may hold NUL, CR or LF; a name holds no
+        # whitespace, controls or octets >= 0x7f, and no colon except as
+        # the pseudo-header prefix (a name like ``a:b`` is a header
+        # injection once re-serialised as HTTP/1.1; H2-10). A value has no
+        # leading or trailing whitespace. CR / LF in a value used to reach
+        # take_request, where HeaderMap raised and took the whole
+        # connection down.
+        var np = name.unsafe_ptr()
+        for k in range(name.byte_length()):
+            var c = np[unsafe_offset=k]
+            if c >= UInt8(ord("A")) and c <= UInt8(ord("Z")):
+                return False
+            if c <= 32 or c >= 127:
+                return False
+            if k > 0 and c == UInt8(ord(":")):
+                return False
+        if not _is_valid_field_value(hdrs[i].value):
+            return False
+        if name.unsafe_ptr()[unsafe_offset=0] == UInt8(ord(":")):
+            # sec 8.3: pseudo-headers never appear in trailers, and
+            # sec 8.1.2.1 puts them all before the regular fields.
+            if is_trailers or seen_regular:
+                return False
+            if not Connection._is_request_pseudo(name):
+                return False
+            if name == ":method":
+                n_method += 1
+                method_value = hdrs[i].value
+                is_connect = hdrs[i].value == "CONNECT"
+            elif name == ":scheme":
+                n_scheme += 1
+            elif name == ":path":
+                n_path += 1
+                path_value = hdrs[i].value
+                path_empty = hdrs[i].value.byte_length() == 0
+            elif name == ":authority":
+                n_authority += 1
+                authority = hdrs[i].value
+            elif name == ":protocol":
+                has_protocol = True
+        else:
+            seen_regular = True
+            if name == "host":
+                host = hdrs[i].value
+            if Connection._is_connection_specific(name):
+                return False
+            # sec 8.2.2: TE is allowed, but only as "trailers".
+            if name == "te" and hdrs[i].value != "trailers":
+                return False
+    if is_trailers:
+        return True
+    if n_method != 1:
+        return False
+    # RFC 8441 sec 4: :protocol only on CONNECT, and only once we
+    # have advertised SETTINGS_ENABLE_CONNECT_PROTOCOL.
+    if has_protocol and (not is_connect or not allow_extended_connect):
+        return False
+    # sec 8.3.1: a host field that disagrees with :authority is
+    # malformed. Routing on one while a proxy checked the other is
+    # the usual confusion.
+    if (
+        authority.byte_length() > 0
+        and host.byte_length() > 0
+        and host != authority
+    ):
+        return False
+    if n_scheme > 1 or n_path > 1 or n_authority > 1:
+        return False
+    if is_connect and not has_protocol:
+        # sec 8.5: a classic CONNECT carries :authority only, and
+        # omitting :scheme / :path is required rather than a fault.
+        return n_scheme == 0 and n_path == 0 and n_authority == 1
+    # Extended CONNECT (RFC 8441) and every other method need the
+    # full request triple.
+    if n_scheme != 1 or n_path != 1:
+        return False
+    if path_empty:
+        return False
+    # sec 8.3.1: origin-form, or "*" for OPTIONS.
+    if not path_value.startswith("/") and not (
+        path_value == "*" and method_value == "OPTIONS"
+    ):
+        return False
+    return True

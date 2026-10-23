@@ -33,6 +33,13 @@ from std.sys.info import CompilationTarget, platform_map
 from std.os import getenv
 
 from ..utils.dylib import find_flare_lib
+from ._libc_cloexec import (
+    F_GETFD,
+    F_SETFD,
+    FD_CLOEXEC,
+    _SOCK_CLOEXEC_LINUX,
+    _set_cloexec,
+)
 
 # ── platform_map shorthand ────────────────────────────────────────────────────
 comptime _pm = platform_map[T=Int, ...]
@@ -349,7 +356,7 @@ def _read_ip_from_sockaddr(buf: Pointer[UInt8, _]) raises -> String:
     return String(
         StringSlice(
             unsafe_from_utf8=CStringSpan(
-                unsafe_from_ptr=ntop_buf.unsafe_bitcast[Int8]()
+                unsafe_from_ptr=ntop_buf.unsafe_bitcast[c_char]()
             )
         )
     )
@@ -387,7 +394,7 @@ def _read_ipv6_from_sockaddr(buf: Pointer[UInt8, _]) raises -> String:
     return String(
         StringSlice(
             unsafe_from_utf8=CStringSpan(
-                unsafe_from_ptr=ntop_buf.unsafe_bitcast[Int8]()
+                unsafe_from_ptr=ntop_buf.unsafe_bitcast[c_char]()
             )
         )
     )
@@ -434,7 +441,7 @@ def _strerror(code: c_int) -> String:
     return String(
         StringSlice(
             unsafe_from_utf8=CStringSpan(
-                unsafe_from_ptr=ptr.unsafe_bitcast[Int8]()
+                unsafe_from_ptr=ptr.unsafe_bitcast[c_char]()
             )
         )
     )
@@ -461,12 +468,25 @@ def _os_error(op: String) -> String:
 
 @always_inline
 def _socket(family: c_int, kind: c_int, protocol: c_int) -> c_int:
-    """Wrapper around ``socket(2)``.
+    """Wrapper around ``socket(2)``. The socket is close-on-exec.
+
+    Every flare socket used to be inherited by any child the process
+    exec'd: listeners kept a port bound past a restart, and client
+    connections stayed open in a subprocess. On Linux the flag is
+    set atomically with ``SOCK_CLOEXEC``, so a fork+exec on another
+    thread cannot slip in between; macOS sets it right after.
 
     Returns:
         File descriptor on success, ``INVALID_FD`` on failure (errno set).
     """
-    return external_call["socket", c_int](family, kind, protocol)
+    comptime if CompilationTarget.is_linux():
+        return external_call["socket", c_int](
+            family, kind | _SOCK_CLOEXEC_LINUX, protocol
+        )
+    else:
+        var fd = external_call["socket", c_int](family, kind, protocol)
+        _set_cloexec(fd)
+        return fd
 
 
 @always_inline
@@ -499,14 +519,22 @@ def _accept(
     addr: Pointer[UInt8, _],
     addrlen: Pointer[c_uint, _],
 ) -> c_int:
-    """Wrapper around ``accept(2)``."""
+    """Wrapper around ``accept(2)``; the accepted fd is close-on-exec
+    (``accept4`` with ``SOCK_CLOEXEC`` on Linux)."""
     debug_assert[assert_mode="safe"](
         Int(addr) != 0 and Int(addrlen) != 0,
         "_accept: null addr / addrlen out-parameter",
     )
-    return external_call["accept", c_int](
-        fd, addr.unsafe_bitcast[NoneType](), addrlen
-    )
+    comptime if CompilationTarget.is_linux():
+        return external_call["accept4", c_int](
+            fd, addr.unsafe_bitcast[NoneType](), addrlen, _SOCK_CLOEXEC_LINUX
+        )
+    else:
+        var cfd = external_call["accept", c_int](
+            fd, addr.unsafe_bitcast[NoneType](), addrlen
+        )
+        _set_cloexec(cfd)
+        return cfd
 
 
 @always_inline
@@ -857,7 +885,7 @@ def _gai_strerror(code: c_int) -> String:
     return String(
         StringSlice(
             unsafe_from_utf8=CStringSpan(
-                unsafe_from_ptr=ptr.unsafe_bitcast[Int8]()
+                unsafe_from_ptr=ptr.unsafe_bitcast[c_char]()
             )
         )
     )

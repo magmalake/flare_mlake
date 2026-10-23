@@ -42,6 +42,7 @@ from flare.quic import (
     QUIC_VERSION_1,
     QuicListener,
     QuicServerConfig,
+    CidKey,
     cid_to_hex,
     encode_long_header,
     encode_short_header,
@@ -88,7 +89,12 @@ def _make_initial_datagram(
     for i in range(len(payload_len)):
         out.append(payload_len[i])
     out.append(UInt8(0))
-    return out^
+    var dg = out^
+    # RFC 9000 sec 14.1: the server drops an Initial in a datagram
+    # under 1200 bytes. Trailing zeros are datagram padding.
+    while len(dg) < 1200:
+        dg.append(UInt8(0))
+    return dg^
 
 
 def _make_handshake_datagram(
@@ -167,8 +173,10 @@ def test_dispatch_initial_creates_new_slot() raises:
     var slot = listener.dispatch_datagram(Span[UInt8, _](datagram), peer)
     assert_equal(slot, 0)
     assert_equal(listener.connection_count(), 1)
-    assert_equal(len(listener.cid_table), 1)
-    assert_equal(listener.cid_table.lookup(cid_to_hex(dcid)), 0)
+    # Two routes to the slot: the server's own CID and the client's
+    # Initial DCID (for its Initial retransmits).
+    assert_equal(len(listener.cid_table), 2)
+    assert_equal(listener.cid_table.lookup(CidKey(dcid)), 0)
 
 
 def test_dispatch_initial_retransmit_routes_to_same_slot() raises:
@@ -216,7 +224,7 @@ def test_dispatch_short_unknown_dcid_drops() raises:
 def test_dispatch_short_known_dcid_routes() raises:
     var listener = _bind_loopback()
     var dcid = _make_cid(UInt8(0x20), 8)
-    listener.cid_table.register(cid_to_hex(dcid), 42)
+    listener.cid_table.register(CidKey(dcid), 42)
     var datagram = _make_short_datagram(dcid)
     var peer = SocketAddr(IpAddr.localhost(), UInt16(54321))
     var slot = listener.dispatch_datagram(Span[UInt8, _](datagram), peer)
@@ -251,7 +259,7 @@ def test_live_loopback_tick_routes_initial() raises:
     var got = listener.tick(timeout_ms=500)
     assert_true(got, "listener must drain the inbound Initial datagram")
     assert_equal(listener.connection_count(), 1)
-    assert_equal(listener.cid_table.lookup(cid_to_hex(dcid)), 0)
+    assert_equal(listener.cid_table.lookup(CidKey(dcid)), 0)
 
 
 def test_cid_to_hex_round_trip() raises:

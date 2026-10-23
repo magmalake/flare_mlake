@@ -19,6 +19,7 @@ from std.testing import (
     assert_raises,
     TestSuite,
 )
+from flare.ws.frame import ws_frame_length
 from flare.ws import (
     WsFrame,
     WsOpcode,
@@ -275,6 +276,48 @@ def test_decode_fragmented_control_raises() raises:
 
     with assert_raises(contains="WsProtocolError"):
         _ = WsFrame.decode_one(Span[UInt8, _](wire))
+
+
+def _decodes(first: Int, second: Int, tail: Int = 0) -> Bool:
+    var wire = List[UInt8]()
+    wire.append(UInt8(first))
+    wire.append(UInt8(second))
+    for _ in range(tail):
+        wire.append(UInt8(0))
+    try:
+        _ = WsFrame.decode_one(Span[UInt8, _](wire))
+        return True
+    except:
+        return False
+
+
+def test_decode_reserved_opcode_raises() raises:
+    """WS-01: RFC 6455 sec 5.2 -- an unknown opcode fails the connection.
+
+    Opcodes 0x3-0x7 and 0xB-0xF are reserved. ``decode_one`` checked the
+    RSV bits but not the opcode, so ``recv()`` returned such a frame to the
+    application.
+    """
+    for op in range(16):
+        var known = op <= 2 or (op >= 8 and op <= 10)
+        # FIN set, empty payload, unmasked.
+        assert_equal(_decodes(0x80 | op, 0x00), known, "opcode " + String(op))
+        # FIN set, masked, empty payload (4 mask bytes).
+        assert_equal(
+            _decodes(0x80 | op, 0x80, 4), known, "masked opcode " + String(op)
+        )
+    # A reserved opcode is a protocol error, not just "some error".
+    with assert_raises(contains="WsProtocolError"):
+        _ = WsFrame.decode_one(Span[UInt8, _](_two(0x83, 0x00)))
+    with assert_raises(contains="WsProtocolError"):
+        _ = WsFrame.decode_one(Span[UInt8, _](_two(0x8B, 0x00)))
+
+
+def _two(a: Int, b: Int) -> List[UInt8]:
+    var out = List[UInt8]()
+    out.append(UInt8(a))
+    out.append(UInt8(b))
+    return out^
 
 
 # ── Round-trip tests ──────────────────────────────────────────────────────────
@@ -701,6 +744,174 @@ def test_ws_connection_carries_handshake_origin() raises:
     _drain_101(raw_client)
     raw_client.close()
     srv.close()
+
+
+def test_client_frames_are_masked_with_a_fresh_random_key() raises:
+    """``encode(mask=True)`` used an all-zero key, so the payload crossed the
+    wire unmasked -- the thing RFC 6455 sec 5.3 masking exists to stop."""
+    var f = WsFrame.text("hello hello hello")
+    var a = f.encode(mask=True)
+    var b = f.encode(mask=True)
+    # Short frame: 2-byte header, then the 4-byte key.
+    var key_a = List[UInt8](Span[UInt8, _](a)[2:6])
+    var key_b = List[UInt8](Span[UInt8, _](b)[2:6])
+    var zero = True
+    for k in key_a:
+        if k != 0:
+            zero = False
+    assert_false(zero, "mask key is all zeros")
+    var same = True
+    for k in range(4):
+        if key_a[k] != key_b[k]:
+            same = False
+    assert_false(same, "two frames shared a mask key")
+    # The payload is not on the wire in the clear, and still decodes.
+    var wire = List[UInt8](Span[UInt8, _](a)[6:])
+    assert_false(wire == List[UInt8]("hello hello hello".as_bytes()))
+    var back = WsFrame.decode_one(Span[UInt8, _](a))
+    assert_equal(back.frame.text_payload(), "hello hello hello")
+
+
+def test_handshake_nonce_is_random() raises:
+    from flare.ws.client import _generate_ws_key
+
+    assert_true(_generate_ws_key() != _generate_ws_key())
+
+
+def _huge_masked_header(declared: Int) -> List[UInt8]:
+    """A masked BINARY frame header declaring ``declared`` payload bytes
+    (64-bit length form) and nothing after it."""
+    var h = List[UInt8]()
+    h.append(0x82)
+    h.append(0x80 | 127)
+    for i in range(8):
+        h.append(UInt8((declared >> (8 * (7 - i))) & 0xFF))
+    for _ in range(4):
+        h.append(0x11)
+    return h^
+
+
+def test_decode_refuses_an_oversized_frame_from_its_header() raises:
+    """``decode_one`` read the length and then asked for more bytes, so the
+    readers buffered towards any declared size up to 4 GiB. It now
+    fails as soon as the header is in, with nothing of the payload."""
+    from flare.ws.frame import WS_TOO_BIG_MARKER
+
+    var h = _huge_masked_header(0x7FFF_FFFF)
+    var msg = String("")
+    try:
+        _ = WsFrame.decode_one(Span[UInt8, _](h))
+    except e:
+        msg = String(e)
+    assert_true(WS_TOO_BIG_MARKER in msg, msg)
+    # The limit is the caller's: 11 bytes over a 10-byte cap fails,
+    # 10 bytes passes.
+    var over = WsFrame.binary(List[UInt8](length=11, fill=UInt8(1))).encode(
+        mask=True
+    )
+    var raised = False
+    try:
+        _ = WsFrame.decode_one(Span[UInt8, _](over), max_payload=10)
+    except:
+        raised = True
+    assert_true(raised, "an 11-byte payload passed a 10-byte cap")
+    var fits = WsFrame.binary(List[UInt8](length=10, fill=UInt8(1))).encode(
+        mask=True
+    )
+    var r = WsFrame.decode_one(Span[UInt8, _](fits), max_payload=10)
+    assert_equal(len(r.frame.payload), 10)
+
+
+def test_server_answers_an_oversized_frame_with_1009() raises:
+    """The server read towards a declared 2 GiB frame; now recv() raises
+    and the client is told why with CLOSE 1009."""
+    from flare.ws.server import (
+        _read_upgrade_request,
+        _send_upgrade_response,
+        _compute_accept_srv,
+    )
+
+    var srv = WsServer.bind(SocketAddr.localhost(0))
+    var port = srv.local_addr().port
+    var raw_client = TcpStream.connect(SocketAddr.localhost(port))
+    _send_upgrade_request_raw(raw_client, "localhost")
+    var server_stream = srv._listener.accept()
+    var srv_peer = server_stream.peer_addr()
+    var upgrade = _read_upgrade_request(server_stream)
+    _send_upgrade_response(server_stream, _compute_accept_srv(upgrade.key))
+    var conn = WsConnection(server_stream^, srv_peer)
+    _drain_101(raw_client)
+
+    var h = _huge_masked_header(0x7FFF_FFFF)
+    raw_client.write_all(Span[UInt8, _](h))
+    var raised = False
+    try:
+        _ = conn.recv()
+    except:
+        raised = True
+    assert_true(raised, "recv() accepted a 2 GiB frame header")
+
+    var buf = List[UInt8](length=4, fill=UInt8(0))
+    var got = 0
+    while got < 4:
+        var n = raw_client.read(buf.unsafe_ptr().unsafe_offset(got), 4 - got)
+        if n == 0:
+            break
+        got += n
+    assert_equal(got, 4)
+    assert_equal(Int(buf[0]), 0x88)  # FIN + CLOSE, unmasked
+    assert_equal(Int(buf[1]), 2)
+    assert_equal((Int(buf[2]) << 8) | Int(buf[3]), 1009)
+    raw_client.close()
+    srv.close()
+
+
+def test_client_keeps_frames_that_share_a_segment() raises:
+    """Two server frames in one write: the client's ``_recv_one`` read
+    both into a local buffer, returned the first and dropped the second,
+    so the next recv() waited for bytes it had already thrown away."""
+    from flare.ws.client import _WsStream
+
+    var ln = TcpListener.bind(SocketAddr.localhost(0))
+    var port = ln.local_addr().port
+    var c = TcpStream.connect(SocketAddr.localhost(port))
+    # The pre-fix failure is a hang; a timeout turns it into a raise.
+    c.set_recv_timeout(3000)
+    var s = ln.accept()
+    var wire = WsFrame.text("one").encode(mask=False)
+    wire.extend(Span[UInt8, _](WsFrame.text("two").encode(mask=False)))
+    s.write_all(Span[UInt8, _](wire))
+    var ws = WsClient(_WsStream(c^), "k")
+    assert_equal(ws.recv().text_payload(), "one")
+    assert_equal(ws.recv().text_payload(), "two")
+    s.close()
+    ln.close()
+
+
+def test_ws_frame_length_needs_the_whole_header() raises:
+    var short = List[UInt8]()
+    short.append(0x81)
+    assert_equal(ws_frame_length(Span[UInt8, _](short)), -1)
+    short.append(0x80 | 5)
+    assert_equal(ws_frame_length(Span[UInt8, _](short)), 2 + 4 + 5)
+    var ext16: List[UInt8] = [UInt8(0x82), UInt8(0x80 | 126), UInt8(0x01)]
+    assert_equal(ws_frame_length(Span[UInt8, _](ext16)), -1)
+    ext16.append(0x00)
+    assert_equal(ws_frame_length(Span[UInt8, _](ext16)), 4 + 4 + 256)
+    var ext64: List[UInt8] = [UInt8(0x82), UInt8(127), UInt8(0), UInt8(0)]
+    assert_equal(ws_frame_length(Span[UInt8, _](ext64)), -1)
+
+
+def test_masked_payload_past_the_simd_width_unmasks() raises:
+    var payload = List[UInt8]()
+    for i in range(70):
+        payload.append(UInt8((i * 7) % 256))
+    var f = WsFrame.binary(payload.copy())
+    var wire = f.encode(mask=True)
+    var got = WsFrame.decode_one(Span[UInt8, _](wire)).take_frame()
+    assert_equal(len(got.payload), 70)
+    for i in range(70):
+        assert_equal(Int(got.payload[i]), Int(payload[i]))
 
 
 def main() raises:

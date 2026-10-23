@@ -1,0 +1,82 @@
+import Flare.Core
+
+/-!
+# UDP `recv_from` / `try_recv_from`: decoding the sender address
+
+`flare/udp/socket.mojo:269-360` hands `recvfrom(2)` a zeroed stack buffer
+of `SOCKADDR_IN6_SIZE` (28) bytes with `addrlen = 28` (fixed, NET-01), then decodes it with
+`_sockaddr_to_socket_addr` (`net/socket.mojo:561-585`), which for
+`AF_INET6` calls `_read_ipv6_from_sockaddr` (`net/_libc.mojo:366-397`):
+`inet_ntop` over the 16 bytes at offset 8 (`sin6_addr`).
+
+Memory is modelled as a function `Nat → UInt8` over offsets from the start
+of `peer_buf`; offsets at or past the buffer size are whatever the stack
+holds there (`stack`). The kernel's behaviour is the hypothesis
+`RecvfromFills` (POSIX `recvfrom`: the stored address is truncated to
+`addrlen`; nothing past `addrlen` is written).
+
+Not modelled: `inet_ntop`'s text form (the model compares the 16 raw
+address bytes it would format), and the family-byte layout difference
+between Linux and macOS (both decoders read the family from inside the
+first 16 bytes, so it is decoded correctly either way).
+-/
+namespace Flare.L2.Udp
+
+/-- `SOCKADDR_IN_SIZE` and `SOCKADDR_IN6_SIZE` (`net/_libc.mojo:88-89`). -/
+def sockaddrInSize : Nat := 16
+def sockaddrIn6Size : Nat := 28
+
+/-- Environment hypothesis (POSIX `recvfrom(2)`): with a buffer of `bufLen`
+bytes, zeroed by the caller, and a sender sockaddr `sa` of `saLen` bytes,
+afterwards byte `i` of the buffer is `sa i` for `i < min bufLen saLen`, still
+`0` for the rest of the buffer, and memory past the buffer is untouched. -/
+def RecvfromFills (bufLen saLen : Nat) (sa stack mem : Nat → UInt8) : Prop :=
+  ∀ i, mem i = if i < min bufLen saLen then sa i else if i < bufLen then 0 else stack i
+
+/-- `_read_port_from_sockaddr`: big-endian `sin_port` / `sin6_port` at 2..3.
+mirrors flare/net/_libc.mojo#_read_port_from_sockaddr sha=d9108923cf78 at=59bda50f -/
+def readPort (mem : Nat → UInt8) : Nat := (mem 2).toNat * 256 + (mem 3).toNat
+
+/-- the 16 bytes `_read_ipv6_from_sockaddr` passes to `inet_ntop`
+(`sin6_addr`, offset 8).
+mirrors flare/net/_libc.mojo#_read_ipv6_from_sockaddr sha=36ca058c8e13 at=59bda50f -/
+def readAddr6 (mem : Nat → UInt8) : List UInt8 := (List.range 16).map fun i => mem (8 + i)
+
+/-- the 4 bytes `_read_ip_from_sockaddr` passes to `inet_ntop` (`sin_addr`,
+offset 4).
+mirrors flare/net/_libc.mojo#_read_ip_from_sockaddr sha=6169c435ff94 at=59bda50f -/
+def readAddr4 (mem : Nat → UInt8) : List UInt8 := (List.range 4).map fun i => mem (4 + i)
+
+/-- buffer size `recv_from` / `try_recv_from` allocate (and pass as
+`addrlen`): a `sockaddr_in6`-sized buffer.
+mirrors flare/udp/socket.mojo#UdpSocket.try_recv_from+UdpSocket.recv_from sha=91e42f4613fd at=32c48a33 (fixed, NET-01) -/
+def implBufLen : Nat := sockaddrIn6Size
+
+/-- the offsets the IPv6 decoder reads -/
+def addr6Offsets : List Nat := (List.range 16).map (8 + ·)
+
+/-- With the 28-byte buffer an IPv6 sender's address and port are
+decoded exactly, whatever the stack holds. -/
+theorem impl_addr6 {sa stack mem : Nat → UInt8} (h : RecvfromFills implBufLen sockaddrIn6Size sa stack mem) :
+    readAddr6 mem = readAddr6 sa ∧ readPort mem = readPort sa := by
+  refine ⟨?_, ?_⟩
+  · unfold readAddr6
+    apply List.map_congr_left
+    intro i hi
+    rw [List.mem_range] at hi
+    rw [h]; unfold implBufLen sockaddrIn6Size; rw [if_pos (by omega)]
+  · unfold readPort; rw [h 2, h 3]; rfl
+
+/-- IPv4 senders are decoded correctly with either buffer size. -/
+theorem addr4_ok (bufLen : Nat) (hb : 16 ≤ bufLen) {sa stack mem : Nat → UInt8}
+    (h : RecvfromFills bufLen sockaddrInSize sa stack mem) :
+    readAddr4 mem = readAddr4 sa ∧ readPort mem = readPort sa := by
+  refine ⟨?_, ?_⟩
+  · unfold readAddr4
+    apply List.map_congr_left
+    intro i hi
+    rw [List.mem_range] at hi
+    rw [h]; unfold sockaddrInSize; rw [if_pos (by omega)]
+  · unfold readPort; rw [h 2, h 3]; unfold sockaddrInSize; rw [if_pos (by omega), if_pos (by omega)]
+
+end Flare.L2.Udp

@@ -40,7 +40,7 @@ from std.ffi import c_int, c_size_t, ErrNo, get_errno
 from std.memory import Pointer, stack_allocation
 from std.memory.alloc import unsafe_alloc
 
-from flare.errors import map_handler_error
+from flare.errors import map_handler_error, log_handler_error
 from flare.http.cancel import Cancel, CancelCell, CancelReason
 from flare.http.handler import CancelHandler, Handler
 from flare.http.headers import HeaderMap
@@ -59,6 +59,7 @@ from flare.runtime import Pool
 from flare.tcp import TcpStream
 from flare.tls._server_ffi import SSL_IO_WANT_READ, SSL_IO_WANT_WRITE
 from flare.ws.server_h2 import WsH2Hooks, WsOverH2ServerStream
+from flare.ws.frame import WsFrame
 
 from ._reactor.tls_transport import TlsTransport
 
@@ -325,6 +326,8 @@ struct Http2ConnHandle(Movable):
             settings_payload: Raw bytes of the ``HTTP2-Settings``
                 header value (base64url-decoded). Format identical
                 to a SETTINGS frame body.
+            ws_hooks: Optional non-owning WS-over-h2 sidecar handler
+                (RFC 8441). ``None`` disables the WS carrier path.
         """
         self.peer = stream.peer_addr()
         self._stream = stream^
@@ -383,6 +386,23 @@ struct Http2ConnHandle(Movable):
                 return TLS_FILL_CROSS
             return TLS_FILL_CLOSED
 
+    def _take_outbox(mut self):
+        """Queue the driver's outbound bytes behind ``write_buf``.
+
+        When nothing is pending the two buffers trade places instead, so
+        a response body is not copied a second time; otherwise the bytes
+        are appended. Neither keeps more than ``_RETAINED_BYTES`` of
+        capacity for the next round.
+        """
+        if self.write_pos >= len(self.write_buf):
+            self.write_buf.clear()
+            self.write_pos = 0
+            swap(self.write_buf, self.h2.outbox)
+        else:
+            self.write_buf.extend(Span(self.h2.outbox))
+            self.h2.outbox.clear()
+        _reset_retained(self.h2.outbox)
+
     def _flush_write_buf_tls(mut self) raises -> Optional[StepResult]:
         """TLS twin of the ``on_writable`` send loop; see the h1
         ``ConnHandle._flush_write_buf_tls`` for the contract."""
@@ -421,13 +441,7 @@ struct Http2ConnHandle(Movable):
         initial SETTINGS frame is pre-queued in ``write_buf``.
         """
         self.h2.feed(bytes)
-        var ack = self.h2.drain()
-
-        # One copy: this is every outbound byte of the connection, and
-
-        # for a streaming response it runs once per window's worth.
-
-        self.write_buf.extend(Span(ack))
+        self._take_outbox()
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
@@ -481,6 +495,12 @@ struct Http2ConnHandle(Movable):
                     )
                     for i in range(got_int):
                         inbound.append(chunk[unsafe_offset=i])
+                    # Bound one event's read. A peer that keeps the socket
+                    # full was read until EAGAIN into one list; the
+                    # level-triggered reactor raises another event for the
+                    # rest, after other fds have had their turn.
+                    if len(inbound) >= 1024 * 1024:
+                        break
                 elif got == 0:
                     # Peer FIN observed mid-connection. Mark closed
                     # so the reactor unregisters the fd after any
@@ -531,10 +551,12 @@ struct Http2ConnHandle(Movable):
             var req = self.h2.take_request(sid)
             req.peer = self.peer
             var expose_errors = req.expose_errors
+            var request_id = req.headers.get("x-request-id")
             var resp: Response
             try:
-                resp = handler.serve(req^).lower()
+                resp = handler.serve(req).lower()
             except e:
+                log_handler_error(request_id, String(e))
                 var mapped = map_handler_error(String(e), expose_errors)
                 resp = Response(status=mapped.status, reason=mapped.reason)
             try:
@@ -555,14 +577,8 @@ struct Http2ConnHandle(Movable):
                 self._stream_pump()
             except:
                 self.should_close = True
-        # Drain everything the driver wants to send.
-        var out = self.h2.drain()
-
-        # One copy: this is every outbound byte of the connection, and
-
-        # for a streaming response it runs once per window's worth.
-
-        self.write_buf.extend(Span(out))
+        # Everything the driver wants to send.
+        self._take_outbox()
         if self.h2.conn.goaway_received:
             self.should_close = True
         if self.h2.conn.goaway_sent:
@@ -614,7 +630,16 @@ struct Http2ConnHandle(Movable):
             var sid = sids[i]
             var carrier = self._ws_tunnels[sid].copy()
             while True:
-                var f = carrier.try_pull_frame(self.h2)
+                var f: Optional[WsFrame]
+                try:
+                    f = carrier.try_pull_frame(self.h2)
+                except:
+                    # A bad frame on one tunnel (oversized, unmasked)
+                    # ends that tunnel; the carrier has queued its CLOSE.
+                    # Letting it raise took down every other stream on
+                    # the connection with it.
+                    carrier.closed = True
+                    break
                 if not f:
                     break
                 hooks.msg_thunk(hooks.addr, carrier, self.h2, f.take())
@@ -694,6 +719,12 @@ struct Http2ConnHandle(Movable):
         and must not be re-polled in a tight loop.
         """
         if sid not in self._stream_out:
+            return
+        if not self.h2._stream_still_sendable(sid):
+            # Reset by the peer: stop pulling the source and free it,
+            # rather than framing into a dead stream until its window
+            # runs out and then holding the source forever.
+            self._clear_stream(sid)
             return
         var addr = self._stream_out[sid]
         var st = Pool[H2StreamOut].get_ptr(addr)
@@ -893,6 +924,12 @@ struct Http2ConnHandle(Movable):
                     var got_int = Int(got)
                     for i in range(got_int):
                         inbound.append(chunk[unsafe_offset=i])
+                    # Bound one event's read. A peer that keeps the socket
+                    # full was read until EAGAIN into one list; the
+                    # level-triggered reactor raises another event for the
+                    # rest, after other fds have had their turn.
+                    if len(inbound) >= 1024 * 1024:
+                        break
                 elif got == 0:
                     # Peer FIN -- flip every live cell so in-flight
                     # handlers short-circuit cooperatively.
@@ -945,10 +982,12 @@ struct Http2ConnHandle(Movable):
             req.peer = self.peer
             var cancel = Cancel(addr)
             var expose_errors = req.expose_errors
+            var request_id = req.headers.get("x-request-id")
             var resp: Response
             try:
-                resp = handler.serve(req^, cancel)
+                resp = handler.serve(req, cancel)
             except e:
+                log_handler_error(request_id, String(e))
                 var mapped = map_handler_error(String(e), expose_errors)
                 resp = Response(status=mapped.status, reason=mapped.reason)
             try:
@@ -964,14 +1003,14 @@ struct Http2ConnHandle(Movable):
                 self._stream_pump()
             except:
                 self.should_close = True
-        var out = self.h2.drain()
-
-        # One copy: this is every outbound byte of the connection, and
-
-        # for a streaming response it runs once per window's worth.
-
-        self.write_buf.extend(Span(out))
+        self._take_outbox()
         if self.h2.conn.goaway_received:
+            self.should_close = True
+        if self.h2.conn.goaway_sent:
+            # As in on_readable: a connection error is GOAWAY and then
+            # close. This path lacked the check, so on a CancelHandler
+            # server the RST-flood and CONTINUATION-flood GOAWAYs were
+            # sent and the connection kept going.
             self.should_close = True
         var has_outbound = len(self.write_buf) > self.write_pos
         if has_outbound:
@@ -1065,7 +1104,7 @@ struct Http2ConnHandle(Movable):
                 idle_timeout_ms=config.write_timeout_ms,
             )
         # write_buf fully drained; reset for the next response.
-        self.write_buf.clear()
+        _reset_retained(self.write_buf)
         self.write_pos = 0
         # Streaming responses (K1 on h2): refill from every active chunk
         # source, window permitting, and stay in STATE_WRITING to flush.
@@ -1078,9 +1117,7 @@ struct Http2ConnHandle(Movable):
             except:
                 self.should_close = True
                 return StepResult(want_read=False, want_write=False, done=True)
-            var out = self.h2.drain()
-            for i in range(len(out)):
-                self.write_buf.append(out[i])
+            self._take_outbox()
             if len(self.write_buf) > self.write_pos:
                 self.state = STATE_WRITING
                 return StepResult(
@@ -1167,6 +1204,19 @@ def _h2_conn_ptr_from_int(
 
 
 # ── Protocol-detection (preface peek) ──────────────────────────────────────
+
+
+comptime _RETAINED_BYTES: Int = 64 * 1024
+"""Largest buffer capacity a connection keeps between responses: one
+large response must not pin its size for the connection's lifetime."""
+
+
+def _reset_retained(mut buf: List[UInt8]):
+    """Empty ``buf``, keeping its allocation only up to ``_RETAINED_BYTES``."""
+    if buf.capacity() > _RETAINED_BYTES:
+        buf = List[UInt8]()
+    else:
+        buf.clear()
 
 
 comptime _H2_PREFACE_BYTES_LEN: Int = 24

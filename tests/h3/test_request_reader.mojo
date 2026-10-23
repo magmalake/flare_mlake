@@ -223,6 +223,28 @@ def test_oversized_headers_is_protocol_error() raises:
     assert_equal(r.state, H3_REQUEST_STATE_DONE)
 
 
+def test_small_headers_frame_that_expands_past_the_limit_is_refused() raises:
+    """The limit is on the decoded section, not only the HEADERS payload:
+    1000 one-byte indexed lines (``:method GET``, 42 bytes decoded each)
+    fit an 8 KiB wire limit many times over and decode to 42 KB. They are
+    refused as an oversized section, not expanded and not mistaken for a
+    QPACK_DECOMPRESSION_FAILED connection error."""
+    var r = Http3RequestReader.new()
+    var rec = _Recorder.new()
+    var payload = List[UInt8]()
+    payload.append(0x00)
+    payload.append(0x00)
+    for _ in range(1000):
+        payload.append(UInt8(0xC0 | 17))
+    var hf = _frame(H3_FRAME_TYPE_HEADERS, payload)
+    var _ = feed_into(r, Span[UInt8, _](hf), rec)
+    assert_equal(rec.error_count, 1)
+    assert_equal(rec.headers_count, 0)
+    assert_true("field section above limit" in rec.last_error)
+    assert_true("QPACK_DECOMPRESSION_FAILED" not in rec.last_error)
+    assert_equal(r.state, H3_REQUEST_STATE_DONE)
+
+
 def test_repeat_headers_after_trailers_is_protocol_error() raises:
     var r = Http3RequestReader.new()
     var rec = _Recorder.new()
@@ -240,6 +262,120 @@ def test_repeat_headers_after_trailers_is_protocol_error() raises:
     assert_equal(rec.error_count, 1)
 
 
+def _header_only(ftype: UInt64, declared: UInt64) raises -> List[UInt8]:
+    """A frame header declaring ``declared`` payload bytes, and none of
+    the payload."""
+    from flare.quic.varint import encode_varint
+
+    var out = List[UInt8]()
+    for b in encode_varint(ftype):
+        out.append(b)
+    for b in encode_varint(declared):
+        out.append(b)
+    return out^
+
+
+def test_limits_are_checked_before_the_payload_arrives() raises:
+    """The HEADERS limit ran only once the whole frame was buffered, and
+    DATA had no limit: a frame declaring a gigabyte had the caller
+    buffer towards it. Both fail from the header now."""
+    var r = Http3RequestReader.new(max_field_section_bytes=UInt64(8192))
+    var rec = _Recorder.new()
+    var h = _header_only(H3_FRAME_TYPE_HEADERS, UInt64(1) << 30)
+    var n = feed_into(r, Span[UInt8, _](h), rec)
+    assert_true(n > 0, "an oversized HEADERS header was NEEDS_MORE")
+    assert_equal(rec.error_count, 1)
+
+    var r2 = Http3RequestReader.new(max_body_bytes=UInt64(1000))
+    var rec2 = _Recorder.new()
+    var hf = _frame(H3_FRAME_TYPE_HEADERS, _qpack_request_headers())
+    _ = feed_into(r2, Span[UInt8, _](hf), rec2)
+    var d = _header_only(H3_FRAME_TYPE_DATA, UInt64(1) << 30)
+    var n2 = feed_into(r2, Span[UInt8, _](d), rec2)
+    assert_true(n2 > 0, "an oversized DATA header was NEEDS_MORE")
+    assert_equal(rec2.error_count, 1)
+
+
+def test_oversized_unknown_frame_is_refused_from_its_header() raises:
+    """H3-01: an unknown / grease frame was only checked once its whole
+    declared payload (up to 2^62 - 1 bytes) was buffered, so the caller
+    kept appending to the stream inbox for as long as the peer sent.
+    Like HEADERS and DATA it is acted on from the header alone."""
+    var r = Http3RequestReader.new(max_field_section_bytes=UInt64(8192))
+    var rec = _Recorder.new()
+    var h = _header_only(UInt64(0x21), (UInt64(1) << 62) - 1)
+    var n = feed_into(r, Span[UInt8, _](h), rec)
+    assert_equal(n, len(h), "an oversized unknown frame was NEEDS_MORE")
+    assert_equal(rec.error_count, 1)
+    assert_equal(rec.unknown_count, 0)
+    assert_true("H3_EXCESSIVE_LOAD" in rec.last_error)
+    assert_equal(r.state, H3_REQUEST_STATE_DONE)
+    # One byte past the cap is refused, the cap itself is skipped.
+    var r2 = Http3RequestReader.new(max_field_section_bytes=UInt64(16))
+    var rec2 = _Recorder.new()
+    var over = _header_only(UInt64(0x21), UInt64(17))
+    assert_equal(feed_into(r2, Span[UInt8, _](over), rec2), len(over))
+    assert_equal(rec2.error_count, 1)
+    var r3 = Http3RequestReader.new(max_field_section_bytes=UInt64(16))
+    var rec3 = _Recorder.new()
+    var at_cap = _header_only(UInt64(0x21), UInt64(16))
+    # Header alone: the payload has not arrived, NEEDS_MORE, no error.
+    assert_equal(feed_into(r3, Span[UInt8, _](at_cap), rec3), 0)
+    for _ in range(16):
+        at_cap.append(0)
+    assert_equal(feed_into(r3, Span[UInt8, _](at_cap), rec3), len(at_cap))
+    assert_equal(rec3.unknown_count, 1)
+    assert_equal(rec3.error_count, 0)
+
+
+def test_h2_reserved_frame_types_are_refused() raises:
+    """H3-02: types 0x02, 0x06, 0x08 and 0x09 (HTTP/2 PRIORITY, PING,
+    WINDOW_UPDATE, CONTINUATION) were skipped as unknown frames. Their
+    receipt is H3_FRAME_UNEXPECTED (RFC 9114 sec 7.2.8, 11.2.1), whether
+    they arrive before HEADERS or in the middle of a request."""
+    var reserved = List[UInt64]()
+    reserved.append(UInt64(0x02))
+    reserved.append(UInt64(0x06))
+    reserved.append(UInt64(0x08))
+    reserved.append(UInt64(0x09))
+    for i in range(len(reserved)):
+        var t = reserved[i]
+        # First frame on the stream.
+        var r = Http3RequestReader.new()
+        var rec = _Recorder.new()
+        var f = _frame(t, List[UInt8]())
+        assert_equal(feed_into(r, Span[UInt8, _](f), rec), len(f))
+        assert_equal(rec.error_count, 1, "reserved type was ignored")
+        assert_equal(rec.unknown_count, 0)
+        assert_true("H3_FRAME_UNEXPECTED" in rec.last_error)
+        assert_equal(r.state, H3_REQUEST_STATE_DONE)
+        # After a valid HEADERS frame, with a payload.
+        var r2 = Http3RequestReader.new()
+        var rec2 = _Recorder.new()
+        var wire = _frame(H3_FRAME_TYPE_HEADERS, _qpack_request_headers())
+        var payload = List[UInt8]()
+        payload.append(UInt8(1))
+        payload.append(UInt8(2))
+        wire.extend(_frame(t, payload))
+        var off = 0
+        while off < len(wire):
+            var n = feed_into(r2, Span[UInt8, _](wire)[off:], rec2)
+            if n == 0:
+                break
+            off += n
+        assert_equal(rec2.headers_count, 1)
+        assert_equal(rec2.error_count, 1, "reserved type after HEADERS ignored")
+        assert_true("H3_FRAME_UNEXPECTED" in rec2.last_error)
+        assert_equal(r2.state, H3_REQUEST_STATE_DONE)
+    # A grease type that is not reserved is still skipped.
+    var r3 = Http3RequestReader.new()
+    var rec3 = _Recorder.new()
+    var g = _frame(UInt64(0x21), List[UInt8]())
+    assert_equal(feed_into(r3, Span[UInt8, _](g), rec3), len(g))
+    assert_equal(rec3.unknown_count, 1)
+    assert_equal(rec3.error_count, 0)
+
+
 def main() raises:
     test_initial_state()
     test_headers_only()
@@ -250,5 +386,9 @@ def main() raises:
     test_truncated_frame_yields_needs_more()
     test_unknown_frame_type_is_skipped()
     test_oversized_headers_is_protocol_error()
+    test_small_headers_frame_that_expands_past_the_limit_is_refused()
     test_repeat_headers_after_trailers_is_protocol_error()
-    print("test_h3_request_reader: 10 passed")
+    test_limits_are_checked_before_the_payload_arrives()
+    test_oversized_unknown_frame_is_refused_from_its_header()
+    test_h2_reserved_frame_types_are_refused()
+    print("test_h3_request_reader: 14 passed")

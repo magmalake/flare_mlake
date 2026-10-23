@@ -23,6 +23,8 @@ Round-trips real bytes through real UDS socket pairs (no mocks):
 """
 
 import std.os as os
+from std.ffi import c_int, external_call
+from std.memory import stack_allocation
 from std.testing import (
     TestSuite,
     assert_equal,
@@ -31,9 +33,17 @@ from std.testing import (
     assert_true,
 )
 
-from flare.net import ConnectionRefused
+from flare.net import AddressInUse, ConnectionRefused
+from flare.net.socket import RawSocket, SOCK_DGRAM
+from flare.net._libc import _bind
 from flare.uds import UnixListener, UnixStream, accept_uds_fd
-from flare.uds._libc import AF_UNIX, SUN_PATH_MAX
+from flare.uds._libc import (
+    AF_UNIX,
+    SOCKADDR_UN_SIZE,
+    SUN_PATH_MAX,
+    fill_sockaddr_un,
+    read_path_from_sockaddr_un,
+)
 
 
 def _tmp_uds_path(suffix: String) raises -> String:
@@ -76,6 +86,36 @@ def test_bind_then_query_local_path() raises:
     assert_equal(l.local_path(), p)
     var queried = l.queried_local_path()
     assert_equal(queried, p)
+
+
+def test_queried_local_path_round_trips_non_ascii() raises:
+    """NET-06: ``fill_sockaddr_un`` writes the path's UTF-8 bytes but the
+    reader turned every byte into ``chr(b)`` (Latin-1), so a path with
+    ``é`` (C3 A9) came back as ``Ã©``."""
+    var p = _tmp_uds_path("net06_é_日本")
+    _maybe_unlink(p)
+    var l = UnixListener.bind(p)
+    assert_equal(l.local_path(), p)
+    var queried = l.queried_local_path()
+    assert_equal(queried, p)
+    assert_equal(queried.byte_length(), p.byte_length())
+
+
+def test_sockaddr_un_round_trips_utf8() raises:
+    """NET-06: ``read_path_from_sockaddr_un`` inverts
+    ``fill_sockaddr_un`` for ASCII and non-ASCII paths, and ignores
+    whatever follows the NUL terminator."""
+    var paths = List[String]()
+    paths.append(String("/tmp/plain.sock"))
+    paths.append(String("/tmp/é.sock"))
+    paths.append(String("/tmp/日本語/ü.sock"))
+    for i in range(len(paths)):
+        var buf = stack_allocation[128, UInt8]()
+        for k in range(128):
+            buf.unsafe_offset(k).unsafe_write(UInt8(0x7F))  # junk after path
+        var used = fill_sockaddr_un(buf, paths[i])
+        var back = read_path_from_sockaddr_un(buf, used)
+        assert_equal(back, paths[i])
 
 
 def test_bind_unlinks_stale_socket_by_default() raises:
@@ -203,6 +243,135 @@ def test_connect_to_nonexistent_path_raises_refused() raises:
     _maybe_unlink(p)
     with assert_raises():
         var _u = UnixStream.connect(p)
+
+
+def test_bind_leaves_a_live_socket_and_a_plain_file_alone() raises:
+    """Bind unlinked whatever sat at the path: a regular file was
+    deleted, and a running server's socket was replaced under it."""
+    from flare.net import AddressInUse
+
+    var p = _tmp_uds_path("live_guard")
+    _maybe_unlink(p)
+    var first = UnixListener.bind(p)
+    var raised = False
+    try:
+        _ = UnixListener.bind(p)
+    except e:
+        raised = True
+    assert_true(raised, "bound over a live listener")
+    # The first listener still owns the path.
+    var c = UnixStream.connect(p)
+    _ = first.accept()
+    c.close()
+    first.close()
+    _maybe_unlink(p)
+
+    # A stale socket, left by a listener that did not clean up, is
+    # still replaced.
+    var gone = UnixListener.bind_with_options(p, cleanup_path=False)
+    gone.close()
+    _ = gone^
+    var again = UnixListener.bind(p)
+    assert_equal(again.local_path(), p)
+    again.close()
+    _ = again^
+
+    var f = _tmp_uds_path("plain_file")
+    _maybe_unlink(f)
+    with open(f, "w") as fh:
+        fh.write("keep me")
+    var raised2 = False
+    try:
+        _ = UnixListener.bind(f)
+    except:
+        raised2 = True
+    assert_true(raised2, "bound over a regular file")
+    assert_true(os.path.exists(f), "the regular file was deleted")
+    os.remove(f)
+
+
+def _chmod(var path: String, mode: Int) -> c_int:
+    return external_call["chmod", c_int](path.as_c_string_span(), c_int(mode))
+
+
+def _getuid() -> c_int:
+    return external_call["getuid", c_int]()
+
+
+def _bind_dgram(path: String) raises -> RawSocket:
+    """Bind an AF_UNIX *datagram* socket at ``path``: a live socket file
+    that a stream ``connect`` answers with ``EPROTOTYPE`` (neither a
+    success nor a refusal, whoever the caller is)."""
+    var sock = RawSocket(AF_UNIX, SOCK_DGRAM)
+    var sa = stack_allocation[Int(SOCKADDR_UN_SIZE), UInt8]()
+    for i in range(Int(SOCKADDR_UN_SIZE)):
+        (sa.unsafe_offset(i)).unsafe_write(0)
+    var used = fill_sockaddr_un(sa, path)
+    if _bind(sock.fd, sa, used) < 0:
+        raise Error("test setup: bind of the datagram socket failed")
+    return sock^
+
+
+def test_bind_refuses_when_liveness_probe_is_inconclusive() raises:
+    """NET-07: the probe's ``except: pass`` treated every connect failure as
+    "stale", so a live socket the caller could not connect to (EACCES, a
+    different socket type, ...) was unlinked and taken over. Only a refusal
+    proves a socket stale."""
+    # A live datagram socket: connect(SOCK_STREAM) fails with EPROTOTYPE.
+    var p = _tmp_uds_path("probe_dgram")
+    _maybe_unlink(p)
+    var live = _bind_dgram(p)
+    var raised = False
+    var in_use = False
+    try:
+        _ = UnixListener.bind(p)
+    except e:
+        raised = True
+        in_use = String(e).startswith("AddressInUse")
+    assert_true(raised, "bound over a socket whose liveness is unknown")
+    assert_true(in_use, "expected AddressInUse")
+    assert_true(os.path.exists(p), "the live socket file was unlinked")
+    live.close()
+    _maybe_unlink(p)
+
+
+def test_bind_refuses_unwritable_live_listener() raises:
+    """NET-07 (the original trigger): a live listener whose socket file the
+    caller may not write answers the probe with EACCES. root bypasses the
+    permission check, so this part only runs for a non-root user."""
+    if _getuid() == 0:
+        return
+    var p = _tmp_uds_path("probe_eacces")
+    _maybe_unlink(p)
+    var a = UnixListener.bind(p)
+    assert_equal(Int(_chmod(p, 0)), 0)
+    var raised = False
+    try:
+        _ = UnixListener.bind(p)
+    except:
+        raised = True
+    assert_true(raised, "took over a live listener it could not probe")
+    assert_true(os.path.exists(p), "the live socket file was unlinked")
+    assert_equal(a.local_path(), p)
+    a.close()
+    _ = a^
+    _maybe_unlink(p)
+
+
+def test_destructor_removes_only_its_own_socket() raises:
+    """An old listener's destructor unlinked by path, taking the socket
+    file of whatever server had bound the path since."""
+    var p = _tmp_uds_path("own_socket")
+    _maybe_unlink(p)
+    var old = UnixListener.bind(p)
+    _maybe_unlink(p)  # an operator clears the path
+    var new = UnixListener.bind(p)
+    old.close()
+    _ = old^
+    assert_true(os.path.exists(p), "old listener removed the new socket")
+    var c = UnixStream.connect(p)
+    _ = new.accept()
+    c.close()
 
 
 def main() raises:

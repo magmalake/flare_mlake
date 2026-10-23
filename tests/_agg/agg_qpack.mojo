@@ -22,6 +22,9 @@ from test_qpack import (
     test_static_table_find_full_match as test_qpack__test_static_table_find_full_match,
 )
 from test_qpack import (
+    test_static_table_every_entry_round_trips as test_qpack__test_static_table_every_entry_round_trips,
+)
+from test_qpack import (
     test_static_table_find_name_only as test_qpack__test_static_table_find_name_only,
 )
 from test_qpack import (
@@ -47,6 +50,27 @@ from test_qpack import (
 )
 from test_qpack import (
     test_round_trip_long_value_uses_huffman_when_shorter as test_qpack__test_round_trip_long_value_uses_huffman_when_shorter,
+)
+from test_qpack import (
+    test_raw_literal_value_that_is_not_utf8_is_refused as test_qpack__test_raw_literal_value_that_is_not_utf8_is_refused,
+)
+from test_qpack import (
+    test_huffman_literal_value_that_is_not_utf8_is_refused as test_qpack__test_huffman_literal_value_that_is_not_utf8_is_refused,
+)
+from test_qpack import (
+    test_literal_name_that_is_not_utf8_is_refused as test_qpack__test_literal_name_that_is_not_utf8_is_refused,
+)
+from test_qpack import (
+    test_valid_utf8_literal_value_is_still_accepted as test_qpack__test_valid_utf8_literal_value_is_still_accepted,
+)
+from test_qpack import (
+    test_decoded_size_is_capped_not_just_the_wire_size as test_qpack__test_decoded_size_is_capped_not_just_the_wire_size,
+)
+from test_qpack import (
+    test_default_cap_stops_a_small_section_that_expands_hugely as test_qpack__test_default_cap_stops_a_small_section_that_expands_hugely,
+)
+from test_qpack import (
+    test_literal_lines_count_toward_the_cap as test_qpack__test_literal_lines_count_toward_the_cap,
 )
 from test_qpack_dynamic import (
     test_entry_size as test_qpack_dynamic__test_entry_size,
@@ -78,6 +102,48 @@ from test_qpack_dynamic import (
 from test_qpack_dynamic import (
     test_blocked_section_raises as test_qpack_dynamic__test_blocked_section_raises,
 )
+from test_qpack_dynamic import (
+    test_encoder_references_no_unacknowledged_entry as test_qpack_dynamic__test_encoder_references_no_unacknowledged_entry,
+)
+from test_qpack_dynamic import (
+    test_encoder_refuses_an_insert_that_would_evict as test_qpack_dynamic__test_encoder_refuses_an_insert_that_would_evict,
+)
+from test_qpack_dynamic import (
+    test_capacity_above_the_advertised_limit_is_refused as test_qpack_dynamic__test_capacity_above_the_advertised_limit_is_refused,
+)
+from test_qpack_dynamic import (
+    test_non_utf8_literal_on_the_encoder_stream_is_an_error as test_qpack_dynamic__test_non_utf8_literal_on_the_encoder_stream_is_an_error,
+)
+from test_qpack_dynamic import (
+    test_name_ref_into_an_empty_table_is_an_encoder_stream_error as test_qpack_dynamic__test_name_ref_into_an_empty_table_is_an_encoder_stream_error,
+)
+from test_qpack_dynamic import (
+    test_name_ref_past_the_live_entries_is_an_encoder_stream_error as test_qpack_dynamic__test_name_ref_past_the_live_entries_is_an_encoder_stream_error,
+)
+from test_qpack_dynamic import (
+    test_duplicate_of_a_missing_entry_is_an_encoder_stream_error as test_qpack_dynamic__test_duplicate_of_a_missing_entry_is_an_encoder_stream_error,
+)
+from test_qpack_dynamic import (
+    test_truncated_valid_name_ref_still_waits_for_more_bytes as test_qpack_dynamic__test_truncated_valid_name_ref_still_waits_for_more_bytes,
+)
+from test_qpack_dynamic import (
+    test_ric_zero_section_cannot_read_the_dynamic_table as test_qpack_dynamic__test_ric_zero_section_cannot_read_the_dynamic_table,
+)
+from test_qpack_dynamic import (
+    test_sign_set_with_delta_base_not_below_ric_is_refused as test_qpack_dynamic__test_sign_set_with_delta_base_not_below_ric_is_refused,
+)
+from test_qpack_dynamic import (
+    test_post_base_reference_at_or_above_ric_is_refused as test_qpack_dynamic__test_post_base_reference_at_or_above_ric_is_refused,
+)
+from test_qpack_dynamic import (
+    test_pre_base_relative_index_beyond_base_is_refused as test_qpack_dynamic__test_pre_base_relative_index_beyond_base_is_refused,
+)
+from test_qpack_dynamic import (
+    test_truncated_prefix_without_sign_byte_is_refused as test_qpack_dynamic__test_truncated_prefix_without_sign_byte_is_refused,
+)
+from test_qpack_dynamic import (
+    test_repeated_reference_to_a_large_entry_is_capped as test_qpack_dynamic__test_repeated_reference_to_a_large_entry_is_capped,
+)
 
 
 def main() raises:
@@ -87,6 +153,7 @@ def main() raises:
     suite.test[test_qpack__test_static_table_lookup_known_indices]()
     suite.test[test_qpack__test_static_table_lookup_out_of_range]()
     suite.test[test_qpack__test_static_table_find_full_match]()
+    suite.test[test_qpack__test_static_table_every_entry_round_trips]()
     suite.test[test_qpack__test_static_table_find_name_only]()
     suite.test[test_qpack__test_round_trip_full_static_match]()
     suite.test[test_qpack__test_round_trip_literal_with_name_reference]()
@@ -100,6 +167,17 @@ def main() raises:
     suite.test[
         test_qpack__test_round_trip_long_value_uses_huffman_when_shorter
     ]()
+    suite.test[test_qpack__test_raw_literal_value_that_is_not_utf8_is_refused]()
+    suite.test[
+        test_qpack__test_huffman_literal_value_that_is_not_utf8_is_refused
+    ]()
+    suite.test[test_qpack__test_literal_name_that_is_not_utf8_is_refused]()
+    suite.test[test_qpack__test_valid_utf8_literal_value_is_still_accepted]()
+    suite.test[test_qpack__test_decoded_size_is_capped_not_just_the_wire_size]()
+    suite.test[
+        test_qpack__test_default_cap_stops_a_small_section_that_expands_hugely
+    ]()
+    suite.test[test_qpack__test_literal_lines_count_toward_the_cap]()
     # tests/qpack/test_qpack_dynamic.mojo
     suite.test[test_qpack_dynamic__test_entry_size]()
     suite.test[test_qpack_dynamic__test_table_insert_and_index]()
@@ -113,4 +191,46 @@ def main() raises:
     suite.test[test_qpack_dynamic__test_decoder_stream_instructions]()
     suite.test[test_qpack_dynamic__test_field_section_dynamic_roundtrip]()
     suite.test[test_qpack_dynamic__test_blocked_section_raises]()
+    suite.test[
+        test_qpack_dynamic__test_encoder_references_no_unacknowledged_entry
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_encoder_refuses_an_insert_that_would_evict
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_capacity_above_the_advertised_limit_is_refused
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_non_utf8_literal_on_the_encoder_stream_is_an_error
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_name_ref_into_an_empty_table_is_an_encoder_stream_error
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_name_ref_past_the_live_entries_is_an_encoder_stream_error
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_duplicate_of_a_missing_entry_is_an_encoder_stream_error
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_truncated_valid_name_ref_still_waits_for_more_bytes
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_ric_zero_section_cannot_read_the_dynamic_table
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_sign_set_with_delta_base_not_below_ric_is_refused
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_post_base_reference_at_or_above_ric_is_refused
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_pre_base_relative_index_beyond_base_is_refused
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_truncated_prefix_without_sign_byte_is_refused
+    ]()
+    suite.test[
+        test_qpack_dynamic__test_repeated_reference_to_a_large_entry_is_capped
+    ]()
     suite^.run()

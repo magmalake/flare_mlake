@@ -48,6 +48,7 @@ from flare.quic import (
     CryptoFrame,
     QuicListener,
     QuicServerConfig,
+    CidKey,
     cid_to_hex,
     encode_crypto,
     encode_long_header,
@@ -178,10 +179,10 @@ def _build_synth_initial_with_crypto(
     rustls will reject them as not-a-valid-ClientHello but the
     QUIC packet itself decrypts cleanly because the AEAD key is
     derived from the DCID per RFC 9001 §5.2."""
-    var crypto_bytes = _crypto_frame_bytes(crypto_payload^)
+    var crypto_bytes = _crypto_frame_bytes(crypto_payload)
     var plaintext = _padded_plaintext(crypto_bytes, 80)
     var prefix = _build_initial_prefix(dcid, scid, 1, len(plaintext))
-    return protect_initial_packet(
+    var dg = protect_initial_packet(
         Span[UInt8, _](prefix),
         packet_number=packet_number,
         pn_length=1,
@@ -190,8 +191,12 @@ def _build_synth_initial_with_crypto(
         is_server=False,
     )
 
-
-# ── 1. ConnectionEvents plumbing (sans-I/O) ─────────────────────────────
+    # ── 1. ConnectionEvents plumbing (sans-I/O) ─────────────────────────────
+    # RFC 9000 sec 14.1: the server drops an Initial in a datagram
+    # under 1200 bytes. Trailing zeros are datagram padding.
+    while len(dg) < 1200:
+        dg.append(UInt8(0))
+    return dg^
 
 
 def test_events_crypto_frames_starts_empty() raises:
@@ -429,7 +434,7 @@ def test_retransmit_does_not_grow_session_slab() raises:
         "egress queue slab must stay in lockstep with connections",
     )
     assert_equal(
-        listener.cid_table.lookup(cid_to_hex(dcid)),
+        listener.cid_table.lookup(CidKey(dcid)),
         0,
     )
     listener.shutdown()

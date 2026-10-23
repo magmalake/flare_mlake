@@ -43,6 +43,9 @@ from flare.quic import (
     FRAME_TYPE_STREAM_DATA_BLOCKED,
     FRAME_TYPE_STREAMS_BLOCKED_BIDI,
     FRAME_TYPE_STREAMS_BLOCKED_UNI,
+    AckFrequencyFrame,
+    encode_ack_frequency,
+    encode_immediate_ack,
     DatagramFrame,
     FrameHandler,
     HandshakeDoneFrame,
@@ -106,7 +109,6 @@ struct _Recorder(FrameHandler, Movable):
     var padding_count: Int
     var ping_count: Int
     var handshake_done_count: Int
-    var unknown_type: Int
 
     var ack: AckFrame
     var ack_seen: Bool
@@ -161,6 +163,8 @@ struct _Recorder(FrameHandler, Movable):
 
     var datagram: DatagramFrame
     var datagram_seen: Bool
+    var ack_frequency_seq: Int
+    var immediate_acks: Int
 
     def on_padding(mut self, count: Int) raises:
         self.padding_count += count
@@ -243,10 +247,11 @@ struct _Recorder(FrameHandler, Movable):
         self.datagram = dg.copy()
         self.datagram_seen = True
 
-    def on_unknown(mut self, type_id: UInt64) raises:
-        self.unknown_type = Int(type_id)
-        # Reject unknown codepoints — strict policy for tests.
-        raise Error("unknown frame type " + String(Int(type_id)))
+    def on_ack_frequency(mut self, f: AckFrequencyFrame) raises:
+        self.ack_frequency_seq = Int(f.sequence_number)
+
+    def on_immediate_ack(mut self) raises:
+        self.immediate_acks += 1
 
 
 def _empty_recorder() -> _Recorder:
@@ -254,7 +259,6 @@ def _empty_recorder() -> _Recorder:
         padding_count=0,
         ping_count=0,
         handshake_done_count=0,
-        unknown_type=-1,
         ack=AckFrame(
             largest_acknowledged=UInt64(0),
             ack_delay=UInt64(0),
@@ -326,6 +330,8 @@ def _empty_recorder() -> _Recorder:
         connection_close_seen=False,
         datagram=DatagramFrame(data=List[UInt8](), has_length=False),
         datagram_seen=False,
+        ack_frequency_seq=-1,
+        immediate_acks=0,
     )
 
 
@@ -730,14 +736,97 @@ def test_unknown_frame_type_rejected() raises:
     var rec = _empty_recorder()
     var raised = False
     try:
-        # 0x1F decodes as a 1-byte varint (high bits 00) but is
-        # outside the v1 master table (last codepoint is 0x1E).
-        # The dispatcher fires ``on_unknown`` and the strict
-        # recorder raises to terminate the connection.
-        _ = parse_frame_into(Span[UInt8, _](_bytes(0x1F)), rec)
-    except:
+        # 0x2F decodes as a 1-byte varint (high bits 00) but no frame
+        # type has it. The dispatcher itself raises FRAME_ENCODING_ERROR
+        # (RFC 9000 sec 12.4); no handler callback is involved.
+        _ = parse_frame_into(Span[UInt8, _](_bytes(0x2F)), rec)
+    except e:
         raised = True
+        assert_true("FRAME_ENCODING_ERROR" in String(e))
     assert_true(raised)
+
+
+def test_unknown_frame_type_rejected_for_every_codepoint() raises:
+    """QUIC-01: every codepoint outside the known table (the 0x20..0x2f
+    and 0x32.. gaps, and multi-byte varint types other than ACK_FREQUENCY)
+    is rejected, never consumed as a bare type varint."""
+    var cases = List[List[UInt8]]()
+    for t in range(0x20, 0x30):
+        cases.append(_bytes(t, 0x1C, 0x00, 0x00, 0x00))
+    cases.append(_bytes(0x32, 0x00))
+    cases.append(_bytes(0x40, 0x40, 0x00))  # 2-byte varint, type 0x40
+    cases.append(_bytes(0x7F, 0xFF, 0x00))  # 2-byte varint, type 0x3FFF
+    for i in range(len(cases)):
+        var rec = _empty_recorder()
+        var raised = False
+        try:
+            _ = parse_frame_into(Span[UInt8, _](cases[i]), rec)
+        except e:
+            raised = True
+            assert_true("FRAME_ENCODING_ERROR" in String(e))
+        assert_true(raised, "unknown frame type accepted, case " + String(i))
+        assert_equal(rec.handshake_done_count, 0)
+
+
+def test_ack_frequency_frames_round_trip() raises:
+    var wire = List[UInt8]()
+    encode_ack_frequency(AckFrequencyFrame(7, 3, 25_000, 1), wire)
+    encode_immediate_ack(wire)
+    var rec = _empty_recorder()
+    var n = parse_frame_into(Span[UInt8, _](wire), rec)
+    assert_equal(rec.ack_frequency_seq, 7)
+    _ = parse_frame_into(Span[UInt8, _](wire)[n:], rec)
+    assert_equal(rec.immediate_acks, 1)
+
+
+def test_stream_count_frames_above_2p60_rejected() raises:
+    """QUIC-02 (RFC 9000 sec 4.6, 19.11, 19.14): a MAX_STREAMS or
+    STREAMS_BLOCKED value above 2^60 is a FRAME_ENCODING_ERROR; 2^60
+    itself is the largest valid value."""
+    for t in [0x12, 0x13, 0x16, 0x17]:
+        var over = _bytes(t, 0xD0, 0, 0, 0, 0, 0, 0, 0x01)  # 2^60 + 1
+        var rec = _empty_recorder()
+        var raised = False
+        try:
+            _ = parse_frame_into(Span[UInt8, _](over), rec)
+        except e:
+            raised = True
+            assert_true("FRAME_ENCODING_ERROR" in String(e))
+        assert_true(raised, "2^60 + 1 accepted for frame type " + String(t))
+        var at = _bytes(t, 0xD0, 0, 0, 0, 0, 0, 0, 0x00)  # 2^60
+        var rec2 = _empty_recorder()
+        var n = parse_frame_into(Span[UInt8, _](at), rec2)
+        assert_equal(n, 9)
+
+
+def _ack_rejected(wire: List[UInt8]) raises -> Bool:
+    var rec = _empty_recorder()
+    try:
+        _ = parse_frame_into(Span[UInt8, _](wire), rec)
+    except e:
+        assert_true("FRAME_ENCODING_ERROR" in String(e))
+        return True
+    return False
+
+
+def test_ack_reaching_below_zero_rejected() raises:
+    """QUIC-03 (RFC 9000 sec 19.3.1): an ACK whose first range or any
+    later range computes a negative packet number is a
+    FRAME_ENCODING_ERROR; a range ending exactly at 0 is valid."""
+    # largest 0, first range 5 -> smallest -5.
+    assert_true(_ack_rejected(_bytes(0x02, 0, 0, 0, 5)))
+    assert_true(_ack_rejected(_bytes(0x03, 0, 0, 0, 5, 0, 0, 0)))
+    # largest 5, first range 5 -> smallest 0: valid.
+    assert_false(_ack_rejected(_bytes(0x02, 5, 0, 0, 5)))
+    # largest 10, first 2 (smallest 8), one range: next largest = 6 - gap.
+    # gap 0 / len 6 ends at 0; len 7 would end at -1.
+    assert_false(_ack_rejected(_bytes(0x02, 10, 0, 1, 2, 0, 6)))
+    assert_true(_ack_rejected(_bytes(0x02, 10, 0, 1, 2, 0, 7)))
+    # gap 6 puts the next largest at 0 (valid with len 0); gap 7 at -1.
+    assert_false(_ack_rejected(_bytes(0x02, 10, 0, 1, 2, 6, 0)))
+    assert_true(_ack_rejected(_bytes(0x02, 10, 0, 1, 2, 7, 0)))
+    # A second range that dips below 0 after a valid first one.
+    assert_true(_ack_rejected(_bytes(0x02, 20, 0, 2, 0, 0, 3, 0, 20)))
 
 
 def test_truncated_crypto_rejected() raises:
@@ -808,7 +897,11 @@ def main() raises:
     test_connection_close_application_round_trip()
     test_handshake_done_round_trip()
     test_unknown_frame_type_rejected()
+    test_unknown_frame_type_rejected_for_every_codepoint()
+    test_ack_frequency_frames_round_trip()
+    test_stream_count_frames_above_2p60_rejected()
+    test_ack_reaching_below_zero_rejected()
     test_truncated_crypto_rejected()
     test_datagram_with_length_round_trip()
     test_datagram_no_length_runs_to_end()
-    print("test_quic_frame: 28 passed")
+    print("test_quic_frame: 31 passed")

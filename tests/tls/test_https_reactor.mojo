@@ -1,7 +1,7 @@
 """HTTPS served by the unified reactor: concurrency, ALPN, workers.
 
-These cover the capability that ``serve_tls``'s sequential accept loop
-could not offer. The load-bearing case is
+These cover the capability that the old ``serve_tls`` sequential accept
+loop (removed in v0.12) could not offer. The load-bearing case is
 :func:`test_https_concurrent_connections`: it opens several TLS
 connections and sends a request on *every* one before reading *any*
 response. Against a one-connection-at-a-time server that deadlocks --
@@ -289,7 +289,7 @@ def test_https_multi_worker() raises:
     """HTTPS serves with ``num_workers > 1``.
 
     Before the reactor arm existed there was no multi-worker TLS path at
-    all -- ``serve_tls`` had no worker parameter.
+    all -- ``serve_tls`` (removed in v0.12) had no worker parameter.
     """
     var srv = HttpServer.bind_tls(
         SocketAddr(IpAddr.parse("127.0.0.1"), UInt16(0)),
@@ -333,18 +333,18 @@ def test_https_multi_worker() raises:
 
 
 def test_https_single_worker_explicit_serves_tls() raises:
-    """Regression: ``serve_tls(handler, 1)`` used to serve plaintext.
+    """Regression: ``serve(handler, 1)`` on a TLS server used to serve plaintext.
 
-    An explicit worker count routes ``serve_tls`` into
+    An explicit worker count routes ``serve`` into
     ``serve[H: Handler & Copyable]``, whose ``num_workers <= 1`` branch
     called the unified reactor loop without passing
     ``self._tls_ctx_addr()``. That parameter defaults to ``0``, so every
     accepted connection was registered as a plaintext ``ConnHandle`` and
     an HTTPS port answered ClientHello bytes in cleartext.
 
-    The arity-1 ``serve_tls`` and the ``num_workers >= 2`` path both
+    The arity-1 ``serve`` and the ``num_workers >= 2`` path both
     passed the context, which is why nothing caught it: before this test
-    no call site in the repo had ever given ``serve_tls`` a worker count.
+    no call site in the repo had ever given a TLS ``serve`` a worker count.
     """
     var srv = HttpServer.bind_tls(
         SocketAddr(IpAddr.parse("127.0.0.1"), UInt16(0)),
@@ -357,7 +357,7 @@ def test_https_single_worker_explicit_serves_tls() raises:
     var pid = fork()
     if pid == 0:
         try:
-            srv.serve_tls(FnHandler(_hello), 1)
+            srv.serve(FnHandler(_hello), 1)
         except:
             pass
         exit()
@@ -383,7 +383,7 @@ def test_https_single_worker_explicit_serves_tls() raises:
 
     _ = kill(pid, SIGKILL)
     waitpid(pid)
-    assert_true(not raised, "TLS handshake against serve_tls(h, 1) raised")
+    assert_true(not raised, "TLS handshake against serve(h, 1) raised")
     assert_true("200" in got, "expected 200, got: " + got)
     assert_true("hello https" in got, "expected body, got: " + got)
 
@@ -410,7 +410,7 @@ def test_https_single_worker_explicit_never_answers_cleartext() raises:
     var pid = fork()
     if pid == 0:
         try:
-            srv.serve_tls(FnHandler(_hello), 1)
+            srv.serve(FnHandler(_hello), 1)
         except:
             pass
         exit()
@@ -491,7 +491,7 @@ def test_https_alpn_negotiates_h2() raises:
         cfg.alpn = List[String]()
         cfg.alpn.append("h2")
         cfg.alpn.append("http/1.1")
-        var s = TlsStream.connect("localhost", port, cfg^)
+        var s = TlsStream.connect("localhost", port, cfg)
         negotiated = s.alpn_selected()
         s.close()
     except:
@@ -535,7 +535,7 @@ def test_alpn_is_offered_by_connect_timeout() raises:
         cfg.alpn = List[String]()
         cfg.alpn.append("h2")
         cfg.alpn.append("http/1.1")
-        var s = TlsStream.connect_timeout("localhost", port, cfg^, 5000)
+        var s = TlsStream.connect_timeout("localhost", port, cfg, 5000)
         negotiated = s.alpn_selected()
         s.close()
     except:
@@ -576,7 +576,7 @@ def test_alpn_is_offered_by_connect_over_tcp() raises:
         cfg.alpn.append("h2")
         cfg.alpn.append("http/1.1")
         var tcp = TcpStream.connect(SocketAddr(IpAddr.parse("127.0.0.1"), port))
-        var s = TlsStream.connect_over_tcp(tcp^, "localhost", cfg^)
+        var s = TlsStream.connect_over_tcp(tcp^, "localhost", cfg)
         negotiated = s.alpn_selected()
         s.close()
     except:
@@ -699,6 +699,49 @@ def test_bind_tls_constructs() raises:
     var addrs = srv.local_addrs()
     assert_true(len(addrs) == 1, "one bound address expected")
     assert_true(addrs[0].port > 0, "ephemeral port must be assigned")
+
+
+def test_https_connect_by_ip_verifies_the_ip_san() raises:
+    """Connecting to an IP literal set it as SNI, which RFC 6066 forbids,
+    and as a DNS name to match. It is now checked against the
+    certificate's IP addresses: ``tests/certs/server.crt`` carries
+    127.0.0.1 and localhost."""
+    var srv = HttpServer.bind_tls(
+        SocketAddr(IpAddr.parse("127.0.0.1"), UInt16(0)),
+        _SERVER_CRT,
+        _SERVER_KEY,
+        alpn=_alpn_h1(),
+    )
+    var port = UInt16(srv.local_addr().port)
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve(_hello)
+        except:
+            pass
+        exit()
+    usleep(300000)
+    var got = String("")
+    var err = String("")
+    try:
+        var cfg = TlsConfig(ca_bundle=_CA_CRT)
+        var s = TlsStream.connect("127.0.0.1", port, cfg)
+        s.write_all(
+            Span[UInt8, _](
+                _bytes(
+                    "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection:"
+                    " close\r\n\r\n"
+                )
+            )
+        )
+        got = _read_until_close(s)
+        s.close()
+    except e:
+        err = String(e)
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+    assert_equal(err, "")
+    assert_true("hello https" in got, "expected body, got: " + got)
 
 
 def main() raises:

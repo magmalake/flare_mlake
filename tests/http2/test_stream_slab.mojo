@@ -28,10 +28,10 @@ parametric ``S`` boundary without depending on the heavy
 
 from std.testing import assert_equal, assert_raises, assert_true
 
-from flare.http2.stream_slab import StreamSlab, FAST_CAPACITY
+from flare.http2.stream_slab import SlabEntry, StreamSlab, FAST_CAPACITY
 
 
-struct StreamLike(Copyable, Defaultable):
+struct StreamLike(Copyable, Defaultable, SlabEntry):
     """Minimal stand-in for ``Stream`` so the slab tests don't have
     to construct full ``HpackHeader`` lists or flow-control state.
     """
@@ -46,6 +46,12 @@ struct StreamLike(Copyable, Defaultable):
     def __init__(out self, id: Int, payload: Int):
         self.id = id
         self.payload = payload
+
+    def slab_active(self) -> Bool:
+        return self.payload % 2 == 1
+
+    def slab_ready(self) -> Bool:
+        return self.payload >= 10
 
 
 def test_empty_slab_is_empty() raises:
@@ -70,11 +76,11 @@ def test_fast_tier_roundtrip() raises:
     assert_true(5 in slab)
     assert_true(not (7 in slab))
 
-    var s1 = slab[1]
+    ref s1 = slab[1]
     assert_equal(s1.id, 1)
     assert_equal(s1.payload, 42)
 
-    var s3 = slab[3]
+    ref s3 = slab[3]
     assert_equal(s3.payload, 43)
 
 
@@ -87,7 +93,7 @@ def test_overflow_tier_roundtrip() raises:
     assert_true(big in slab)
     assert_true(not (big - 1 in slab))
 
-    var got = slab[big]
+    ref got = slab[big]
     assert_equal(got.id, big)
     assert_equal(got.payload, 99)
 
@@ -98,9 +104,9 @@ def test_both_tiers_coexist() raises:
     slab[FAST_CAPACITY + 7] = StreamLike(id=FAST_CAPACITY + 7, payload=20)
 
     assert_equal(len(slab), 2)
-    var fast = slab[1]
+    ref fast = slab[1]
     assert_equal(fast.payload, 10)
-    var slow = slab[FAST_CAPACITY + 7]
+    ref slow = slab[FAST_CAPACITY + 7]
     assert_equal(slow.payload, 20)
 
 
@@ -111,7 +117,7 @@ def test_overwrite_does_not_double_count() raises:
 
     slab[3] = StreamLike(id=3, payload=2)
     assert_equal(len(slab), 1)
-    var got = slab[3]
+    ref got = slab[3]
     assert_equal(got.payload, 2)
 
     var big = FAST_CAPACITY + 5
@@ -119,7 +125,7 @@ def test_overwrite_does_not_double_count() raises:
     assert_equal(len(slab), 2)
     slab[big] = StreamLike(id=big, payload=20)
     assert_equal(len(slab), 2)
-    var got_big = slab[big]
+    ref got_big = slab[big]
     assert_equal(got_big.payload, 20)
 
 
@@ -179,6 +185,18 @@ def test_items_lists_everything() raises:
     assert_equal(seen_payload_sum, 10)
 
 
+def test_ids_lists_both_tiers() raises:
+    var slab = StreamSlab[StreamLike]()
+    slab[5] = StreamLike(id=5, payload=0)
+    slab[1] = StreamLike(id=1, payload=0)
+    slab[FAST_CAPACITY + 1] = StreamLike(id=FAST_CAPACITY + 1, payload=0)
+    _ = slab.pop(5)
+    var ids = slab.ids()
+    assert_equal(len(ids), 2)
+    assert_equal(ids[0], 1)
+    assert_equal(ids[1], FAST_CAPACITY + 1)
+
+
 def test_stress_roundtrip() raises:
     # 200 ids straddling the fast / overflow boundary. Insert and
     # then pop; the slab must return to empty without leaking the
@@ -191,13 +209,39 @@ def test_stress_roundtrip() raises:
     assert_equal(len(slab), n)
     for i in range(n):
         assert_true(i in slab)
-        var got = slab[i]
+        ref got = slab[i]
         assert_equal(got.payload, i * 7)
 
     for i in range(n):
         var popped = slab.pop(i)
         assert_equal(popped.payload, i * 7)
     assert_equal(len(slab), 0)
+
+
+def test_active_and_ready_track_every_write() raises:
+    """The tracked count and ready list equal a full recount after
+    inserts, overwrites and pops in both tiers."""
+    var slab = StreamSlab[StreamLike]()
+    var ids = [3, 1, FAST_CAPACITY + 5, 7, FAST_CAPACITY + 1]
+    for i in range(len(ids)):
+        slab[ids[i]] = StreamLike(ids[i], 11)
+    slab[7] = StreamLike(7, 2)
+    slab[FAST_CAPACITY + 5] = StreamLike(FAST_CAPACITY + 5, 13)
+    _ = slab.pop(3)
+    _ = slab.pop(FAST_CAPACITY + 1)
+    var active = 0
+    var ready = List[Int]()
+    for entry in slab.items():
+        if entry[1].slab_active():
+            active += 1
+        if entry[1].slab_ready():
+            ready.append(entry[0])
+    assert_equal(slab.active_count(), active)
+    assert_equal(slab.active_count(), 2)
+    var got = slab.ready_ids()
+    assert_equal(len(got), len(ready))
+    assert_equal(got[0], 1)
+    assert_equal(got[1], FAST_CAPACITY + 5)
 
 
 def main() raises:
@@ -210,5 +254,7 @@ def main() raises:
     test_get_returns_optional()
     test_pop_clears_slot()
     test_items_lists_everything()
+    test_ids_lists_both_tiers()
     test_stress_roundtrip()
-    print("test_stream_slab: 10 passed")
+    test_active_and_ready_track_every_write()
+    print("test_stream_slab: 12 passed")

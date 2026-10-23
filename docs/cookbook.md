@@ -8,6 +8,14 @@ CI, so they stay green with the code. Run any single example with
 `pixi run example-<name>` (see [`pixi.toml`](../pixi.toml) for the
 full task list).
 
+## Imports and handler shapes
+
+`flare.prelude` and the root `flare` package export the same list: `Request`, `Response`, `Router`, `HttpServer`, the `ok` / `ok_json` / `not_found` / ... builders, `Method` / `Status`, the `Handler` family, `SocketAddr`, the extractors, the stock middleware, sessions, and the TCP / TLS / Unix / WebSocket types. A symbol is on it if another exported symbol's signature names it, or if the examples need it. Wire-format codecs, runtime primitives and anything in a `_`-prefixed module keep their own import, for example `from flare.http2 import Http2Connection`. Code meant to last is better off naming the module it takes things from.
+
+`srv.serve(r^)` accepts any `Handler`. Multi-worker (`num_workers=N`) needs a `Copyable` handler, since each worker gets its own `H.copy()`; `Router` qualifies because its routes sit behind an Arc-style refcount. `raises` on a handler is optional and tracks the body: drop it when the handler cannot fail, keep it when it parses input or does I/O (the server converts a raise to a sanitized 500). For stateful infallible handlers see [`HandlerInfallible`](../examples/intermediate/infallible_handler.mojo).
+
+Free with every server: 404 on unknown paths, 405 with `Allow`, sanitized 4xx/5xx, peer-FIN cancellation, RFC 7230 size limits, per-worker `kqueue` / `epoll` (opt-in `io_uring`).
+
 ## Basic — networking primitives, hello-world HTTP, simple WS
 
 The "first ten minutes with flare" surface. Plain functions, no
@@ -63,7 +71,7 @@ basics.
 | [`ok_json_typed.mojo`](../examples/intermediate/ok_json_typed.mojo) | Typed JSON request → typed JSON response via `ok_json_value` |
 | [`infallible_handler.mojo`](../examples/intermediate/infallible_handler.mojo) | `HandlerInfallible` + `WithRaises` adapter for provably no-`raises` paths |
 | [`trailers.mojo`](../examples/intermediate/trailers.mojo) | HTTP/1.1 trailer fields (gRPC-style status trailer): `Response.trailers`, `Trailer:` header, smuggling guard |
-| [`multi_listener.mojo`](../examples/intermediate/multi_listener.mojo) | `HttpServer.bind_many` over multiple distinct addresses, single accept loop |
+| [`multi_listener.mojo`](../examples/intermediate/multi_listener.mojo) | `HttpServer.bind(List[SocketAddr])` over multiple distinct addresses, single accept loop |
 | [`reliability.mojo`](../examples/intermediate/reliability.mojo) | `Retry[Inner]` + `PostHocDeadline[Inner]` + `RetryPolicy` -- RFC 9110 §9.2.2 idempotent-method gate (GET / HEAD / PUT / DELETE / OPTIONS), opt-in exponential backoff with jitter (`backoff_base_ms` / `backoff_max_ms` / `backoff_jitter_ms`), post-hoc 504 wall-clock guard |
 | [`http_cache.mojo`](../examples/intermediate/http_cache.mojo) | `Cache[Inner, S]` middleware over an `InMemoryCacheStore` -- RFC 9111 freshness check on `CacheEntry.is_fresh`, `Vary`-aware secondary key, conditional revalidation (`If-None-Match` / `If-Modified-Since` + 304 folding back into the cached entry) |
 | [`template_inheritance.mojo`](../examples/intermediate/template_inheritance.mojo) | Single-level template inheritance: parent layout + child overrides via `{% block %}` / `{% extends %}` / `Template.render_extending` |
@@ -85,7 +93,7 @@ natural.
 | [`streaming_proxy.mojo`](../examples/advanced/streaming_proxy.mojo) | streaming-proxy surface: `StreamHandler` + `attach_upstream(UpstreamChunkSource)` + `relay_upstream()` over `serve_streaming`, relaying a `FrameMux` backend with watermark backpressure, no fd, no `Span`, no per-connection table in front code |
 | [`cert_reload.mojo`](../examples/advanced/cert_reload.mojo) | `TlsAcceptor.reload()` for ACME / Let's Encrypt cert rotation without restart |
 | [`mtls.mojo`](../examples/advanced/mtls.mojo) | mTLS configuration + construction-time validation |
-| [`https_server.mojo`](../examples/advanced/https_server.mojo) | In-process HTTPS server: `HttpServer.bind_tls` / `serve_tls` (reactor-multiplexed, ALPN-dispatched h1 or h2) with a buffered handler and a `stream_response` chunked body over `SSL_write` |
+| [`https_server.mojo`](../examples/advanced/https_server.mojo) | In-process HTTPS server: `HttpServer.bind_tls` + `serve` (reactor-multiplexed, ALPN-dispatched h1 or h2) with a buffered handler and a `stream_response` chunked body over `SSL_write` |
 | [`http2.mojo`](../examples/advanced/http2.mojo) | `Http2Connection` driver, ALPN dispatch, h2c upgrade detection |
 | [`http2_config.mojo`](../examples/advanced/http2_config.mojo) | `Http2Config` SETTINGS knobs + validation |
 | [`http2_client.mojo`](../examples/advanced/http2_client.mojo) | `HttpClient(prefer_h2c=True)` GET + POST over h2c (cleartext HTTP/2 via prior knowledge) |
@@ -93,6 +101,7 @@ natural.
 | [`h2c_client.mojo`](../examples/advanced/h2c_client.mojo) | HTTP/2 cleartext client via the `Upgrade: h2c` + `HTTP2-Settings` dance (RFC 7540 §3.2): first request flows over h1 then carries forward to h2 |
 | [`client_pool.mojo`](../examples/advanced/client_pool.mojo) | `HttpClient.with_pool` — keyed idle reuse, per-origin caps, stale-conn retry |
 | [`ws_over_h2.mojo`](../examples/advanced/ws_over_h2.mojo) | RFC 8441 WebSockets-over-HTTP/2 (Extended CONNECT + `:protocol=websocket`) |
+| [`ws_over_h3.mojo`](../examples/advanced/ws_over_h3.mojo) | RFC 9220 WebSockets-over-HTTP/3: `attach_ws_h3` server and `WsOverH3Stream` client over live QUIC |
 | [`ws_permessage_deflate.mojo`](../examples/advanced/ws_permessage_deflate.mojo) | RFC 7692 `permessage-deflate` extension: offer / negotiate / compress / decompress |
 | [`alpn_dispatch_demo.mojo`](../examples/advanced/alpn_dispatch_demo.mojo) | ALPN -> wire-protocol dispatcher decisions: h1 / h2c / h2 / h3, including RFC 7301 §3.2 server-preference negotiation |
 | [`http3_server.mojo`](../examples/advanced/http3_server.mojo) | Serve the same `Handler` over HTTP/1.1 + HTTP/2 + HTTP/3 simultaneously: TCP listener for h1 / h2c / h2 alongside a UDP listener for h3 |
@@ -162,6 +171,7 @@ natural.
 | Speak h2c via the `Upgrade` dance from a client | [`h2c_client.mojo`](../examples/advanced/h2c_client.mojo) |
 | Reuse h1.1 connections via `HttpClient.with_pool` | [`client_pool.mojo`](../examples/advanced/client_pool.mojo) |
 | Tunnel WebSockets over HTTP/2 (RFC 8441) | [`ws_over_h2.mojo`](../examples/advanced/ws_over_h2.mojo) |
+| Tunnel WebSockets over HTTP/3 (RFC 9220) | [`ws_over_h3.mojo`](../examples/advanced/ws_over_h3.mojo) |
 | Compress WebSocket payloads with `permessage-deflate` | [`ws_permessage_deflate.mojo`](../examples/advanced/ws_permessage_deflate.mojo) |
 | Stand up a production-shaped server (RequestId + structured logs + graceful shutdown + healthz) | [`production_setup.mojo`](../examples/advanced/production_setup.mojo) |
 | Reuse markup via template inheritance (`{% block %}` / `{% extends %}`) | [`template_inheritance.mojo`](../examples/intermediate/template_inheritance.mojo) |

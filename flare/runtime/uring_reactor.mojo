@@ -354,8 +354,10 @@ struct UringReactor(Movable):
         if Int(slot) == 0:
             raise Error("UringReactor.arm_listener_multishot: SQ is full")
         var ud = pack_user_data(URING_OP_ACCEPT, conn_id)
+        # SOCK_CLOEXEC (0o2000000): accepted fds are close-on-exec, the
+        # same as the accept4 path.
         prep_multishot_accept(
-            slot, listener_fd, UInt64(0), UInt64(0), UInt32(0), ud
+            slot, listener_fd, UInt64(0), UInt64(0), UInt32(0o2000000), ud
         )
         self._driver.commit_sqe()
 
@@ -739,6 +741,7 @@ struct UringReactor(Movable):
         min_complete: Int,
         mut out: List[UringCompletion],
         max_completions: Int = 64,
+        timeout_ms: Int = -1,
     ) raises -> Int:
         """Submit any pending SQEs, drain ready CQEs, then
         optionally block for more.
@@ -782,24 +785,20 @@ struct UringReactor(Movable):
             max_completions: Per-poll budget so one slow op
                 doesn't starve the reactor (matches epoll's
                 ``max_events``).
+            timeout_ms: Longest the blocking phase may wait. Negative
+                (the default) waits for ``min_complete`` completions
+                however long they take; non-negative bounds the wait and
+                returns whatever arrived, so a loop can re-read its stop
+                flag (a ring with no wakeup channel needs this).
         """
         out.clear()
-        if self._cross_thread_wakeup and (not self._wake_armed):
-            # Lazy-arm the wakeup recv on first poll so the
-            # eventfd surfaces wakeups via the same drain loop.
-            # Skipped entirely when ``enable_wakeup=False`` was
-            # passed at construction (single-issuer bufring
-            # rings opt out -- they don't need cross-thread
-            # wakeup).
-            try:
-                self._arm_wakeup_recv()
-                self._wake_armed = True
-            except _e:
-                # If arming the wakeup fails (e.g. SQ full on a
-                # busy reactor), the poll still works -- wakeups
-                # just won't be honoured this round. Try again
-                # next poll.
-                pass
+        # Lazy-arm the wakeup read on first poll so the eventfd
+        # surfaces wakeups via the same drain loop. Skipped entirely
+        # when ``enable_wakeup=False`` was passed at construction
+        # (single-issuer bufring rings opt out -- they don't need
+        # cross-thread wakeup). If the SQ is full the arm fails; it
+        # is retried after phase 1 has flushed the SQ (RT-03).
+        self._try_arm_wakeup()
 
         # Phase 1: non-blocking submit + collect already-ready
         # CQEs. submit_and_wait(0) flushes the SQ tail to the
@@ -811,6 +810,10 @@ struct UringReactor(Movable):
             raise Error(
                 "UringReactor.poll: io_uring_enter(0) failed; rc=" + String(rc0)
             )
+
+        # Phase 1 emptied the SQ: retry a failed arm now so phase 3 never
+        # blocks with no read on the eventfd (RT-03).
+        self._try_arm_wakeup()
 
         # Phase 2: drain everything ready into ``out``. No
         # syscall. Tracks both the surfaced count (``n``) and
@@ -831,8 +834,13 @@ struct UringReactor(Movable):
         # until at least ``need`` more CQEs land.
         var need = min_complete - n
         if need > 0 and n < max_completions and raw_consumed == 0:
-            var rc1 = self._driver.submit_and_wait(need)
-            if rc1 < 0 and rc1 != -4:  # -EINTR
+            var rc1: Int
+            if timeout_ms >= 0:
+                rc1 = self._driver.submit_and_wait_timeout(need, timeout_ms)
+            else:
+                rc1 = self._driver.submit_and_wait(need)
+            # -EINTR: signal; -ETIME: the bounded wait ran out.
+            if rc1 < 0 and rc1 != -4 and rc1 != -62:
                 raise Error(
                     "UringReactor.poll: io_uring_enter("
                     + String(need)
@@ -919,6 +927,19 @@ struct UringReactor(Movable):
         _ = self._io.write(self._wake_fd, one, c_size_t(8))
 
     # ── Private helpers ──────────────────────────────────────────────────────
+
+    def _try_arm_wakeup(mut self):
+        """Arm the wakeup read when cross-thread wakeup is enabled and
+        no read is in flight. A failure (SQ full) is swallowed and
+        leaves ``_wake_armed`` False so the caller retries; ``poll``
+        retries after phase 1 has freed the SQ, before it may block.
+        """
+        if self._cross_thread_wakeup and (not self._wake_armed):
+            try:
+                self._arm_wakeup_recv()
+                self._wake_armed = True
+            except _e:
+                pass
 
     def _arm_wakeup_recv(mut self) raises -> None:
         """Submit a read SQE on the wakeup eventfd so the next

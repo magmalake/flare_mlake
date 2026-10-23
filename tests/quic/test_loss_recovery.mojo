@@ -186,6 +186,87 @@ def test_cc_reduces_window_on_loss() raises:
     assert_true(lr.window() < w0)
 
 
+def test_ack_of_an_unsent_packet_declares_nothing_lost() raises:
+    """An ACK naming packet 2^60 raised largest_acked to it, and every
+    packet in flight then counted as lost by the packet-number gap."""
+    var lr = LossRecovery(base_pto_ms=UInt64(100))
+    lr.on_sent(UInt64(0), _frames(0xA0), UInt64(2000))
+    lr.on_sent(UInt64(1), _frames(0xA1), UInt64(2000))
+    var acked = List[UInt64]()
+    acked.append(UInt64(1) << 60)
+    _ = lr.on_ack(acked, UInt64(2001), next_pn=UInt64(2))
+    assert_equal(len(lr.detect_lost(UInt64(2001))), 0)
+    assert_equal(lr.outstanding(), 2)
+
+
+def test_loss_deadline_is_the_time_threshold() raises:
+    """RFC 9002 sec 6.1.2: a packet below the largest acked that the
+    packet threshold has not caught is lost at sent + 9/8 RTT."""
+    var lr = LossRecovery()
+    lr.on_sent(UInt64(0), _frames(0xA0), UInt64(0))
+    lr.on_sent(UInt64(1), _frames(0xA1), UInt64(0))
+    assert_equal(lr.loss_deadline(), UInt64(0), "nothing acked yet")
+    var acked = List[UInt64]()
+    acked.append(UInt64(1))
+    _ = lr.on_ack(acked, UInt64(16))  # RTT sample 16 ms
+    assert_equal(lr.loss_deadline(), UInt64(18))  # 0 + 16 * 9 / 8
+    assert_equal(len(lr.detect_lost(UInt64(17))), 0)
+    assert_equal(len(lr.detect_lost(UInt64(18))), 1)
+    assert_equal(lr.loss_deadline(), UInt64(0))
+
+
+def test_one_ack_range_retires_a_large_window() raises:
+    """An ACK range covering 1000 in-flight packets retires all of them;
+    the ranges used to be expanded into at most 256 numbers, so the rest
+    stayed in flight and were later declared lost and re-sent."""
+    var lr = LossRecovery()
+    for pn in range(1000):
+        lr.on_sent(UInt64(pn), _frames(0xB0), UInt64(pn // 100))
+    var ranges = List[UInt64]()
+    ranges.append(UInt64(0))
+    ranges.append(UInt64(999))
+    assert_true(lr.on_ack_ranges(ranges, UInt64(20), UInt64(1000)))
+    assert_equal(lr.outstanding(), 0)
+    assert_equal(lr.bytes_in_flight, UInt64(0))
+    assert_equal(len(lr.detect_lost(UInt64(1000))), 0)
+
+
+def test_ack_ranges_with_a_gap_leave_only_the_gap() raises:
+    var lr = LossRecovery()
+    for pn in range(10):
+        lr.on_sent(UInt64(pn), _frames(UInt8(pn)), UInt64(0))
+    var ranges = List[UInt64]()  # [6, 9] then [0, 3]: 4 and 5 missing
+    ranges.append(UInt64(6))
+    ranges.append(UInt64(9))
+    ranges.append(UInt64(0))
+    ranges.append(UInt64(3))
+    _ = lr.on_ack_ranges(ranges, UInt64(5), UInt64(10))
+    assert_equal(lr.outstanding(), 2)
+    var lost = lr.detect_lost(UInt64(5))  # 9 - 4 and 9 - 5 >= 3
+    assert_equal(len(lost), 2)
+    assert_equal(Int(lost[0][0]), 4)
+    assert_equal(Int(lost[1][0]), 5)
+    assert_equal(lr.outstanding(), 0)
+
+
+def test_pacer_spreads_a_window_over_the_rtt() raises:
+    """RFC 9002 sec 7.7: ten datagrams go at once, then the rest wait at
+    5/4 of the window per smoothed RTT; a sub-4 ms RTT is not paced."""
+    var lr = LossRecovery()
+    assert_equal(lr.pace_admit(UInt64(100), UInt64(1452)), UInt64(0))
+    lr.has_rtt = True
+    lr.smoothed_rtt = UInt64(10)
+    var rate = lr.cc.window() * 5 // 4 // 10
+    for _ in range(10):  # the burst; unpaced sends charged nothing
+        assert_equal(lr.pace_admit(UInt64(100), UInt64(1452)), UInt64(0))
+    var wait = lr.pace_admit(UInt64(100), UInt64(1452))
+    assert_equal(wait, (UInt64(1452) + rate - 1) // rate)
+    assert_equal(lr.pace_admit(UInt64(100) + wait, UInt64(1452)), UInt64(0))
+    lr.smoothed_rtt = UInt64(3)
+    for _ in range(50):
+        assert_equal(lr.pace_admit(UInt64(200), UInt64(1452)), UInt64(0))
+
+
 def main() raises:
     test_ack_retires_and_resets_backoff()
     test_ack_gap_leaves_lost_packet_outstanding()
@@ -196,4 +277,9 @@ def main() raises:
     test_rtt_sample_drives_pto()
     test_ack_based_loss_detection_packet_threshold()
     test_cc_reduces_window_on_loss()
-    print("test_loss_recovery: 9 passed")
+    test_ack_of_an_unsent_packet_declares_nothing_lost()
+    test_loss_deadline_is_the_time_threshold()
+    test_one_ack_range_retires_a_large_window()
+    test_ack_ranges_with_a_gap_leave_only_the_gap()
+    test_pacer_spreads_a_window_over_the_rtt()
+    print("test_loss_recovery: 14 passed")

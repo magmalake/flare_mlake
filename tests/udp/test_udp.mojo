@@ -4,7 +4,13 @@ All tests use loopback (127.0.0.1) with OS-assigned ports. No external
 network access is required.
 """
 
-from std.testing import assert_equal, assert_not_equal, assert_raises, TestSuite
+from std.testing import (
+    assert_equal,
+    assert_not_equal,
+    assert_raises,
+    assert_true,
+    TestSuite,
+)
 from flare.udp import UdpSocket, DatagramTooLarge
 from flare.net import SocketAddr
 
@@ -199,6 +205,78 @@ def test_recv_timeout_raises() raises:
         raised = True
     assert_equal(raised, True, "recv_from must raise on timeout")
     s.close()
+
+
+def test_bind_ipv6_and_refuse_a_second_bind() raises:
+    """UDP sockets were always AF_INET, so an IPv6 bind failed, and set
+    SO_REUSEADDR, so a second socket could bind a port already in use
+    and take its datagrams."""
+    var a = UdpSocket.bind(SocketAddr.localhost(0))
+    var port = a.local_addr().port
+    var raised = False
+    try:
+        _ = UdpSocket.bind(SocketAddr.localhost(port))
+    except:
+        raised = True
+    assert_true(raised, "a second socket bound a UDP port in use")
+    _ = a^  # held until here: the port is only in use while it lives
+    var v6 = UdpSocket.bind(SocketAddr.parse("[::1]:0"))
+    var tx = UdpSocket.unbound(ipv6=True)
+    var msg = String("six")
+    _ = tx.send_to(msg.as_bytes(), v6.local_addr())
+    var buf = List[UInt8](length=16, fill=UInt8(0))
+    var got = v6.recv_from(Span[UInt8, _](buf))
+    assert_equal(got[0], 3)
+
+
+def test_recv_from_reports_ipv6_sender() raises:
+    """NET-01: ``recv_from`` handed the kernel a 16-byte sockaddr buffer, so
+    an IPv6 sender was truncated and ``sin6_addr`` read past the buffer."""
+    var rx = UdpSocket.bind(SocketAddr.parse("[::1]:0"))
+    var tx = UdpSocket.bind(SocketAddr.parse("[::1]:0"))
+    var want = tx.local_addr()
+    var msg = String("ping")
+    for _ in range(3):
+        _ = tx.send_to(msg.as_bytes(), rx.local_addr())
+        var buf = List[UInt8](length=64, fill=UInt8(0))
+        var got = rx.recv_from(Span[UInt8, _](buf))
+        assert_equal(got[0], 4)
+        assert_equal(String(got[1].ip), "::1")
+        assert_equal(got[1].port, want.port)
+        assert_true(got[1] == want, "recv_from reported the wrong sender")
+    tx.close()
+    rx.close()
+
+
+def test_try_recv_from_reports_ipv6_sender() raises:
+    """NET-01: same defect in the non-blocking ``try_recv_from``."""
+    var rx = UdpSocket.bind(SocketAddr.parse("[::1]:0"))
+    var tx = UdpSocket.bind(SocketAddr.parse("[::1]:0"))
+    var want = tx.local_addr()
+    var msg = String("pong")
+    _ = tx.send_to(msg.as_bytes(), rx.local_addr())
+    var buf = List[UInt8](length=64, fill=UInt8(0))
+    # The datagram may not be queued yet on every kernel: spin on the
+    # non-blocking call (bounded) instead of sleeping.
+    var n = 0
+    var sender = SocketAddr.parse("[::]:0")
+    var done = False
+    for _ in range(50_000_000):
+        try:
+            var r = rx.try_recv_from(Span[UInt8, _](buf))
+            n = r[0]
+            sender = r[1]
+            done = True
+            break
+        except:
+            continue
+    assert_true(done, "try_recv_from never saw the datagram")
+    var got = Tuple(n, sender)
+    assert_equal(got[0], 4)
+    assert_equal(String(got[1].ip), "::1")
+    assert_true(got[1] == want, "try_recv_from reported the wrong sender")
+    tx.close()
+    rx.close()
 
 
 def main() raises:

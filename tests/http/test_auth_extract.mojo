@@ -53,6 +53,7 @@ from flare.http.auth_extract import (
     CsrfToken,
     csrf_token_b64url,
     csrf_token_compare,
+    new_csrf_token,
     parse_basic_credentials,
     parse_bearer_token,
 )
@@ -286,27 +287,46 @@ def test_csrf_b64url_handles_two_byte_tail() raises:
     assert_equal(csrf_token_b64url(v), String("_-4"))
 
 
+comptime _T1 = "abcdefghij0123456789"
+comptime _T2 = "zyxwvutsrq9876543210"
+
+
 def test_csrf_compare_equal_returns_true() raises:
-    assert_true(csrf_token_compare(String("abc123"), String("abc123")))
+    assert_true(csrf_token_compare(String(_T1), String(_T1)))
 
 
 def test_csrf_compare_unequal_same_length_returns_false() raises:
-    assert_false(csrf_token_compare(String("abc123"), String("xyz999")))
+    assert_false(csrf_token_compare(String(_T1), String(_T2)))
 
 
 def test_csrf_compare_length_mismatch_returns_false() raises:
-    assert_false(csrf_token_compare(String("abc"), String("abcd")))
+    assert_false(csrf_token_compare(String(_T1), String(_T1) + "x"))
 
 
-def test_csrf_compare_empty_pair_returns_true() raises:
-    assert_true(csrf_token_compare(String(""), String("")))
+def test_csrf_compare_empty_pair_returns_false() raises:
+    """Two empty tokens used to match: no cookie + no form field
+    passed the check."""
+    assert_false(csrf_token_compare(String(""), String("")))
+    assert_false(CsrfToken(String(""), String("")).verify())
+
+
+def test_csrf_compare_short_tokens_return_false() raises:
+    assert_false(csrf_token_compare(String("abc123"), String("abc123")))
 
 
 def test_csrf_token_verify_pair() raises:
-    var t = CsrfToken(String("tok-cookie"), String("tok-cookie"))
+    var t = CsrfToken(String(_T1), String(_T1))
     assert_true(t.verify())
-    var bad = CsrfToken(String("tok-cookie"), String("tok-form"))
+    var bad = CsrfToken(String(_T1), String(_T2))
     assert_false(bad.verify())
+
+
+def test_new_csrf_token_is_long_and_fresh() raises:
+    var a = new_csrf_token()
+    var b = new_csrf_token()
+    assert_equal(a.byte_length(), 43)
+    assert_true(a != b)
+    assert_true(CsrfToken(a, a).verify())
 
 
 # ── AuthError shape ──────────────────────────────────────────────────────
@@ -389,6 +409,18 @@ def test_extracted_bearer_present_succeeds() raises:
     var resp = h.serve(req)
     assert_equal(resp.status, 200)
     assert_equal(resp.text(), String("token=abc.def"))
+
+
+def test_basic_credentials_are_utf8() raises:
+    """RFC 7617: "jörg:pässwörd" base64-encoded as UTF-8 bytes."""
+    from flare.crypto.base64 import base64_encode
+
+    var raw = String("jörg:pässwörd")
+    var creds = parse_basic_credentials(
+        "Basic " + base64_encode(Span[UInt8, _](raw.as_bytes()))
+    )
+    assert_equal(creds.username, String("jörg"))
+    assert_equal(creds.password, String("pässwörd"))
 
 
 def main() raises:

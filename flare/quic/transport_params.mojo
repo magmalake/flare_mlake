@@ -34,15 +34,17 @@ Parameter ids covered (RFC 9000 §18.2 + RFC 9221 §3 for datagram):
   - 0x0a ack_delay_exponent (default 3)
   - 0x0b max_ack_delay (default 25 ms)
   - 0x0c disable_active_migration (flag, zero-length value)
+  - 0x0d preferred_address (layout validated, value not kept)
   - 0x0e active_connection_id_limit (default 2; minimum 2)
   - 0x0f initial_source_connection_id
   - 0x10 retry_source_connection_id (server only)
   - 0x20 max_datagram_frame_size (RFC 9221 §3; enables DATAGRAM)
 
-The 0x0d preferred_address parameter is structurally more
-complex (carries a peer's preferred IP/port for migration); it is
-not currently handled and is skipped on decode like any other
-unknown id. Adding it is a strict superset change.
+The 0x0d preferred_address parameter carries a peer's preferred
+IP/port for migration, which flare does not use: decode checks its
+fixed layout (RFC 9000 §18.2: 4 + 2 + 16 + 2 bytes, a CID length of
+1..20, the CID, a 16-byte reset token) and raises on a violation, but
+does not store the value.
 
 Sans-I/O contract: zero I/O imports; registered in
 ``tests/tools/check_sans_io.sh`` so the contract is lint-enforced.
@@ -67,6 +69,9 @@ from .varint import (
 # ── Parameter id constants (RFC 9000 §18.2 master table) ──────────────────
 
 
+comptime _MAX_STREAMS_LIMIT: UInt64 = UInt64(1) << 60
+"""RFC 9000 §18.2: initial_max_streams_* cannot exceed 2^60."""
+
 comptime TP_ID_ORIGINAL_DCID: Int = 0x00
 comptime TP_ID_MAX_IDLE_TIMEOUT: Int = 0x01
 comptime TP_ID_STATELESS_RESET_TOKEN: Int = 0x02
@@ -87,6 +92,9 @@ comptime TP_ID_RETRY_SCID: Int = 0x10
 comptime TP_ID_MAX_DATAGRAM_FRAME_SIZE: Int = 0x20
 """RFC 9221 §3: max DATAGRAM frame size the endpoint will accept.
 Absent or 0 means the peer MUST NOT send DATAGRAM frames."""
+comptime TP_ID_MIN_ACK_DELAY: Int = 0xFF04DE1B
+"""The draft-ietf-quic-ack-frequency minimum: the smallest ACK delay (microseconds)
+the endpoint can honour; present means it accepts ACK_FREQUENCY."""
 
 # Default values from RFC 9000 §18.2 (used when a parameter is
 # absent on the wire). Encoders should NOT emit a parameter whose
@@ -136,6 +144,7 @@ struct TransportParameters(Copyable):
     """RFC 9221 §3 max_datagram_frame_size (id 0x20). When populated
     and non-zero, the peer may send DATAGRAM frames up to this size;
     absent / 0 disables datagrams for this connection."""
+    var min_ack_delay: Optional[UInt64]
 
 
 def empty_transport_parameters() -> TransportParameters:
@@ -162,6 +171,7 @@ def empty_transport_parameters() -> TransportParameters:
         initial_source_connection_id=List[UInt8](),
         retry_source_connection_id=List[UInt8](),
         max_datagram_frame_size=None,
+        min_ack_delay=None,
     )
 
 
@@ -392,6 +402,10 @@ def encode_transport_parameters(
             TP_ID_MAX_DATAGRAM_FRAME_SIZE,
             params.max_datagram_frame_size.value(),
         )
+    if Bool(params.min_ack_delay):
+        _emit_varint_param(
+            out, TP_ID_MIN_ACK_DELAY, params.min_ack_delay.value()
+        )
     return out^
 
 
@@ -480,13 +494,21 @@ def decode_transport_parameters(
                 _read_param_varint(value)
             )
         elif id == TP_ID_INITIAL_MAX_STREAMS_BIDI:
-            out.initial_max_streams_bidi = Optional[UInt64](
-                _read_param_varint(value)
-            )
+            var v = _read_param_varint(value)
+            if v > _MAX_STREAMS_LIMIT:
+                raise Error(
+                    "quic transport_params: initial_max_streams_bidi > 2^60"
+                    " (RFC 9000 §18.2)"
+                )
+            out.initial_max_streams_bidi = Optional[UInt64](v)
         elif id == TP_ID_INITIAL_MAX_STREAMS_UNI:
-            out.initial_max_streams_uni = Optional[UInt64](
-                _read_param_varint(value)
-            )
+            var v = _read_param_varint(value)
+            if v > _MAX_STREAMS_LIMIT:
+                raise Error(
+                    "quic transport_params: initial_max_streams_uni > 2^60"
+                    " (RFC 9000 §18.2)"
+                )
+            out.initial_max_streams_uni = Optional[UInt64](v)
         elif id == TP_ID_ACK_DELAY_EXPONENT:
             var v = _read_param_varint(value)
             if v > UInt64(20):
@@ -511,6 +533,26 @@ def decode_transport_parameters(
                     "quic transport_params: active_connection_id_limit < 2"
                 )
             out.active_connection_id_limit = Optional[UInt64](v)
+        elif id == TP_ID_PREFERRED_ADDRESS:
+            # RFC 9000 §18.2: IPv4 address (4) + port (2), IPv6 address
+            # (16) + port (2), CID length (1), CID (1..20), reset token
+            # (16). A violation is a TRANSPORT_PARAMETER_ERROR (§7.4).
+            if value_len < 25:
+                raise Error(
+                    "quic transport_params: preferred_address too short"
+                    " (RFC 9000 §18.2)"
+                )
+            var pa_cid_len = Int(value[24])
+            if pa_cid_len < 1 or pa_cid_len > 20:
+                raise Error(
+                    "quic transport_params: preferred_address connection ID"
+                    " length not in 1..20 (RFC 9000 §18.2)"
+                )
+            if value_len != 41 + pa_cid_len:
+                raise Error(
+                    "quic transport_params: preferred_address length does not"
+                    " match its connection ID (RFC 9000 §18.2)"
+                )
         elif id == TP_ID_INITIAL_SCID:
             for i in range(value_len):
                 out.initial_source_connection_id.append(value[i])
@@ -521,5 +563,150 @@ def decode_transport_parameters(
             out.max_datagram_frame_size = Optional[UInt64](
                 _read_param_varint(value)
             )
+        elif id == TP_ID_MIN_ACK_DELAY:
+            out.min_ack_delay = Optional[UInt64](_read_param_varint(value))
         # Any other id is silently dropped (RFC 9000 §7.4.2).
     return out^
+
+
+# ── Peer-parameter checks (RFC 9000 §7.3, §18.2) ───────────────────────────
+
+
+def transport_parameter_present(buf: Span[UInt8, _], id: Int) -> Bool:
+    """Whether parameter ``id`` occurs in the TLV list ``buf``.
+
+    :func:`decode_transport_parameters` stores a CID parameter as a list
+    that is empty both when the parameter is absent and when it is present
+    with length 0, so a check that must tell the two apart (RFC 9000 §7.3,
+    §18.2) scans the raw bytes instead. A malformed list reports ``False``:
+    the caller has already run (or will run) the decoder, which raises on it.
+    """
+    var pos = 0
+    var n = len(buf)
+    var found = False
+    try:
+        while pos < n:
+            var id_var = decode_varint(buf[pos:])
+            pos += id_var.consumed
+            if pos >= n:
+                return False
+            var len_var = decode_varint(buf[pos:])
+            pos += len_var.consumed
+            var value_len = Int(len_var.value)
+            if value_len < 0 or pos + value_len > n:
+                return False
+            pos += value_len
+            if Int(id_var.value) == id:
+                found = True
+    except:
+        return False
+    return found
+
+
+def check_client_transport_params(
+    buf: Span[UInt8, _], client_scid: List[UInt8]
+) raises:
+    """Validate the transport parameters a server received from a client.
+
+    Raises ``TRANSPORT_PARAMETER_ERROR`` (RFC 9000 §18.2, §7.3, §7.4) when
+    the blob does not decode (truncation, duplicates, invalid values), when
+    it carries a server-only parameter (``original_destination_connection_id``,
+    ``stateless_reset_token``, ``preferred_address`` or
+    ``retry_source_connection_id``), or when ``initial_source_connection_id``
+    is absent or differs from ``client_scid``, the Source Connection ID of
+    the client's Initial packet (which may legitimately be zero-length).
+    """
+    var tp: TransportParameters
+    try:
+        tp = decode_transport_parameters(buf)
+    except e:
+        raise Error("QUIC TRANSPORT_PARAMETER_ERROR: client " + String(e))
+    if transport_parameter_present(buf, TP_ID_ORIGINAL_DCID):
+        raise Error(
+            "QUIC TRANSPORT_PARAMETER_ERROR: client sent"
+            " original_destination_connection_id"
+        )
+    if transport_parameter_present(buf, TP_ID_STATELESS_RESET_TOKEN):
+        raise Error(
+            "QUIC TRANSPORT_PARAMETER_ERROR: client sent stateless_reset_token"
+        )
+    if transport_parameter_present(buf, TP_ID_PREFERRED_ADDRESS):
+        raise Error(
+            "QUIC TRANSPORT_PARAMETER_ERROR: client sent preferred_address"
+        )
+    if transport_parameter_present(buf, TP_ID_RETRY_SCID):
+        raise Error(
+            "QUIC TRANSPORT_PARAMETER_ERROR: client sent"
+            " retry_source_connection_id"
+        )
+    if not transport_parameter_present(buf, TP_ID_INITIAL_SCID):
+        raise Error(
+            "QUIC TRANSPORT_PARAMETER_ERROR: client sent no"
+            " initial_source_connection_id"
+        )
+    if tp.initial_source_connection_id != client_scid:
+        raise Error(
+            "QUIC TRANSPORT_PARAMETER_ERROR: client"
+            " initial_source_connection_id does not match its Initial"
+            " Source Connection ID"
+        )
+
+
+def check_server_transport_params(
+    buf: Span[UInt8, _],
+    first_dcid: List[UInt8],
+    server_scid: List[UInt8],
+    retried: Bool,
+    retry_scid: List[UInt8],
+) raises:
+    """Validate the transport parameters a client received from a server.
+
+    Raises ``TRANSPORT_PARAMETER_ERROR`` (RFC 9000 §7.3, §18.2) when the
+    blob does not decode, when ``original_destination_connection_id`` is
+    absent or is not the DCID of the client's first Initial, when
+    ``initial_source_connection_id`` is absent or is not the Source
+    Connection ID the server used (a zero-length one must still be
+    present), when ``retry_source_connection_id`` is present without a
+    Retry (or absent after one, or different from the Retry's Source
+    Connection ID), or when the server used a zero-length connection ID
+    and sent a ``preferred_address``.
+
+    Presence is read from the raw bytes (:func:`transport_parameter_present`)
+    because the decoded record stores an absent CID parameter and a
+    zero-length one alike as an empty list.
+    """
+    var tp: TransportParameters
+    try:
+        tp = decode_transport_parameters(buf)
+    except e:
+        raise Error("QUIC TRANSPORT_PARAMETER_ERROR: server " + String(e))
+    if (
+        not transport_parameter_present(buf, TP_ID_ORIGINAL_DCID)
+        or tp.original_destination_connection_id != first_dcid
+    ):
+        raise Error(
+            "QUIC TRANSPORT_PARAMETER_ERROR: server"
+            " original_destination_connection_id"
+        )
+    if (
+        not transport_parameter_present(buf, TP_ID_INITIAL_SCID)
+        or tp.initial_source_connection_id != server_scid
+    ):
+        raise Error(
+            "QUIC TRANSPORT_PARAMETER_ERROR: server"
+            " initial_source_connection_id"
+        )
+    var has_retry_scid = transport_parameter_present(buf, TP_ID_RETRY_SCID)
+    if has_retry_scid != retried or (
+        retried and tp.retry_source_connection_id != retry_scid
+    ):
+        raise Error(
+            "QUIC TRANSPORT_PARAMETER_ERROR: server retry_source_connection_id"
+        )
+    if len(server_scid) == 0 and transport_parameter_present(
+        buf, TP_ID_PREFERRED_ADDRESS
+    ):
+        raise Error(
+            "QUIC TRANSPORT_PARAMETER_ERROR: server sent preferred_address"
+            " with a zero-length connection ID"
+        )

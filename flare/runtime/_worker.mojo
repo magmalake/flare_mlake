@@ -12,11 +12,19 @@ from std.memory import Pointer, alloc
 
 from ..net import SocketAddr
 
-from threads.thread import pin_current_to_cpu
-
-from ._thread import ThreadHandle, num_cpus, _OpaquePtr
+from ._thread import (
+    ThreadHandle,
+    pin_target_cpu,
+    restore_thread_affinity,
+    save_thread_affinity,
+    _OpaquePtr,
+)
 from .frontend import Frontend
-from .scheduler_stats import load_stop_flag, store_worker_stat
+from .scheduler_stats import (
+    WORKER_STAT_DONE,
+    load_stop_flag,
+    store_worker_stat,
+)
 
 
 # ── Per-worker context ───────────────────────────────────────────────────────
@@ -94,7 +102,7 @@ struct _WorkerCtx[F: Frontend](Movable):
 
 
 def _worker_entry[F: Frontend](arg: _OpaquePtr) -> _OpaquePtr:
-    """Pthread start routine for one reactor worker.
+    """Start routine for one reactor worker.
 
     Casts ``arg`` back to a ``_WorkerCtx[F]`` pointer, optionally
     pins to a CPU, then delegates to :meth:`Frontend.run_worker`
@@ -116,15 +124,19 @@ def _worker_entry[F: Frontend](arg: _OpaquePtr) -> _OpaquePtr:
     # Linux an overly-ambitious CPU index might raise. Pinning
     # happens from the worker itself via pthread_self, so we
     # re-wrap the current thread id into a ThreadHandle just to
-    # reuse the ``pin_to_cpu`` helper.
+    # reuse the ``pin_to_cpu`` helper. This thread is usually a shared
+    # AsyncRT pool worker; the serving loop holds it until shutdown,
+    # so pinning it is safe as long as the original mask is put back
+    # before the task returns.
+    var saved_mask = 0
     if ctx_ptr[].pin_cores:
+        saved_mask = save_thread_affinity()
         try:
-            var cpu = ctx_ptr[].worker_idx % num_cpus()
-            # threads.mojo owns the pthread binding now, so the worker
-            # pins itself through it rather than re-declaring pthread_self
-            # here — a second declaration of the same symbol is exactly what
-            # stopped flare and threads.mojo linking together.
-            pin_current_to_cpu(cpu)
+            var cpu = pin_target_cpu(ctx_ptr[].worker_idx)
+            var self_handle = ThreadHandle(
+                _thread_id=external_call["pthread_self", UInt64]()
+            )
+            self_handle.pin_to_cpu(cpu)
         except:
             pass
 
@@ -146,6 +158,8 @@ def _worker_entry[F: Frontend](arg: _OpaquePtr) -> _OpaquePtr:
         ctx_ptr[].stats_addr,
         ctx_ptr[].extra_fds.copy(),
     )
+    restore_thread_affinity(saved_mask)
+    store_worker_stat(ctx_ptr[].stats_addr, WORKER_STAT_DONE, 1)
 
     # Ctx ownership: the Scheduler main thread destroys + frees every
     # ctx AFTER joining the worker, so we don't touch it here.

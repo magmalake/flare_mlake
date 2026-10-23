@@ -143,21 +143,47 @@ def _scalar_find_crlfcrlf(data: List[UInt8], start: Int) -> Int:
 @always_inline
 def _match_content_length_prefix(
     p: Pointer[UInt8, _], pos: Int, header_end: Int
-) -> Bool:
-    """Case-insensitive compare against ``"content-length:"`` at ``pos``.
+) -> Int:
+    """Match ``"content-length"`` + optional SP/HTAB + ``":"`` at ``pos``.
+
+    Returns the offset of the first byte of the value (just past the
+    colon), or ``-1`` when there is no match.
+
+    Matches only at the start of a header line, i.e. when the byte
+    before ``pos`` is LF. The request line always precedes the first
+    header, so ``pos == 0`` never matches either. Without the anchor a
+    ``content-length:`` inside the request target, inside another
+    field's name (``X-Content-Length:``) or inside a value decided the
+    framing, and the bytes the real header declared were dispatched as
+    a second request.
+
+    SP/HTAB between the name and the colon are skipped, because the
+    parser strips them under ``allow_ows_around_colon``; reading only
+    ``content-length:`` framed ``Content-Length : 5`` as an empty body
+    while the parser saw a 5-byte one. Strict mode still rejects such a
+    line in the parser.
 
     ``pos + 15 <= header_end`` is assumed by the caller; this function
-    does not re-check the bound.
+    bounds the whitespace skip itself.
     """
-    var needle = "content-length:"
+    if pos == 0 or p[unsafe_offset=pos - 1] != 10:
+        return -1
+    var needle = "content-length"
     var np = needle.unsafe_ptr()
-    for j in range(15):
+    for j in range(14):
         var c = p[unsafe_offset=pos + j]
         if c >= 65 and c <= 90:
             c = c + 32
         if c != np[unsafe_offset=j]:
-            return False
-    return True
+            return -1
+    var q = pos + 14
+    while q < header_end and (
+        p[unsafe_offset=q] == 32 or p[unsafe_offset=q] == 9
+    ):
+        q += 1
+    if q < header_end and p[unsafe_offset=q] == 58:
+        return q + 1
+    return -1
 
 
 def scan_content_length[
@@ -176,9 +202,10 @@ def scan_content_length[
             impossible.
 
     Returns:
-        The parsed ``Content-Length`` integer, or ``0`` when no header
-        is found. Ignores malformed values (matches legacy scalar
-        behaviour — the caller treats 0 as "no body").
+        The parsed ``Content-Length`` integer, ``0`` when no header is
+        found, or ``CONTENT_LENGTH_INVALID`` (-1) when the value is not
+        a plain decimal that fits in 18 digits. Callers must reject a
+        negative result with 400 rather than treat it as "no body".
     """
     var needle_len = 15  # "content-length:"
     if header_end < needle_len:
@@ -206,8 +233,9 @@ def scan_content_length[
                     var pos = i + off
                     if pos >= end:
                         break
-                    if _match_content_length_prefix(p, pos, header_end):
-                        return _parse_decimal(p, pos + needle_len, header_end)
+                    var vs = _match_content_length_prefix(p, pos, header_end)
+                    if vs >= 0:
+                        return _parse_decimal(p, vs, header_end)
                     bits &= bits - 1
             i += W
     elif W == 64:
@@ -223,31 +251,76 @@ def scan_content_length[
                     var pos = i + off
                     if pos >= end:
                         break
-                    if _match_content_length_prefix(p, pos, header_end):
-                        return _parse_decimal(p, pos + needle_len, header_end)
+                    var vs = _match_content_length_prefix(p, pos, header_end)
+                    if vs >= 0:
+                        return _parse_decimal(p, vs, header_end)
                     bits &= bits - 1
             i += W
 
     # Scalar tail.
     while i < end:
-        if _match_content_length_prefix(p, i, header_end):
-            return _parse_decimal(p, i + needle_len, header_end)
+        var vs = _match_content_length_prefix(p, i, header_end)
+        if vs >= 0:
+            return _parse_decimal(p, vs, header_end)
         i += 1
     return 0
 
 
+comptime CONTENT_LENGTH_INVALID: Int = -1
+"""Returned by the ``Content-Length`` parsers for a value that is not
+1-18 ASCII digits surrounded by optional whitespace."""
+
+comptime _CONTENT_LENGTH_MAX_DIGITS: Int = 18
+"""18 decimal digits always fit in a signed 64-bit Int; 19 may not."""
+
+
 @always_inline
-def _parse_decimal(p: Pointer[UInt8, _], start: Int, end: Int) -> Int:
-    """Skip leading SP / HTAB, parse an unsigned decimal up to ``end``."""
+def parse_content_length_bytes(
+    p: Pointer[UInt8, _], start: Int, end: Int
+) -> Int:
+    """Parse a ``Content-Length`` field value in ``p[start:end]``.
+
+    The value runs to the end of its line: parsing stops at CR, LF or
+    ``end``. RFC 9110 sec 8.6 allows only ``1*DIGIT``, so a sign, a
+    trailing letter, an empty value or more than 18 digits is
+    ``CONTENT_LENGTH_INVALID``. Accumulating without a digit cap let
+    ``18446744073709551606`` wrap to ``-10`` and slip under every
+    ``> max_body_size`` check.
+    """
     var pos = start
     while pos < end and (
         p[unsafe_offset=pos] == 32 or p[unsafe_offset=pos] == 9
     ):
         pos += 1
     var result = 0
+    var digits = 0
     while (
         pos < end and p[unsafe_offset=pos] >= 48 and p[unsafe_offset=pos] <= 57
     ):
         result = result * 10 + Int(p[unsafe_offset=pos]) - 48
+        digits += 1
+        if digits > _CONTENT_LENGTH_MAX_DIGITS:
+            return CONTENT_LENGTH_INVALID
         pos += 1
+    if digits == 0:
+        return CONTENT_LENGTH_INVALID
+    while pos < end and (
+        p[unsafe_offset=pos] == 32 or p[unsafe_offset=pos] == 9
+    ):
+        pos += 1
+    if pos < end and p[unsafe_offset=pos] != 13 and p[unsafe_offset=pos] != 10:
+        return CONTENT_LENGTH_INVALID
     return result
+
+
+def parse_content_length(value: String) -> Int:
+    """``parse_content_length_bytes`` over a whole field value."""
+    return parse_content_length_bytes(
+        value.unsafe_ptr(), 0, value.byte_length()
+    )
+
+
+@always_inline
+def _parse_decimal(p: Pointer[UInt8, _], start: Int, end: Int) -> Int:
+    """Strict ``Content-Length`` value; see ``parse_content_length_bytes``."""
+    return parse_content_length_bytes(p, start, end)

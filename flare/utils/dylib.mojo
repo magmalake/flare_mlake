@@ -30,17 +30,16 @@ flare bundles four FFI shims under ``$CONDA_PREFIX/lib/``:
   br``.
 * ``libflare_fs.so`` -- ``access(2)`` + ``open(2)`` +
   ``read(2)`` + ``close(2)`` thin wrappers consumed by
-  :mod:`flare.http.fs` (``FileServer`` static-file path) and
-  :mod:`flare.http.middleware._file_exists`.
+  :mod:`flare.http.fs` (``FileServer`` static-file path).
 
 Search order (used by every call site):
-
-1. ``$CONDA_PREFIX/lib/libflare_<name>.so`` -- the canonical
+1. ``$FLARE_LIB_DIR/libflare_<name>.so`` -- when ``FLARE_LIB_DIR`` is
+   an absolute path; for running outside pixi.
+2. ``$CONDA_PREFIX/lib/libflare_<name>.so`` -- the canonical
    install location, populated by ``flare/<sub>/ffi/build.sh``
    on pixi activation.
-2. ``build/libflare_<name>.so`` -- bare-checkout fallback when
-   running outside a conda/pixi environment.
-
+3. The bare ``libflare_<name>.so``, which ``dlopen`` resolves on the
+   system library path. Never the working directory.
 The path is built via ``String("") += prefix += literal``
 rather than the ``prefix + literal`` concat operator. See the
 :mod:`flare.tls.config` module docstring for the full rationale
@@ -52,10 +51,8 @@ Public API
 ----------
 
 ``find_flare_lib(name: String) -> String``
-    Returns ``$CONDA_PREFIX/lib/libflare_<name>.so`` when
-    ``CONDA_PREFIX`` is set, ``build/libflare_<name>.so``
-    otherwise. ``name`` is the bare suffix (``"tls"``,
-    ``"zlib"``, ``"brotli"``, ``"fs"``).
+    Resolves ``libflare_<name>.so`` in the order above. ``name`` is
+    the bare suffix (``"tls"``, ``"zlib"``, ``"brotli"``, ``"fs"``).
 
 ``dl_sym[FT](lib: OwnedDLHandle, name: String) raises -> FT``
     Resolve a C-ABI function symbol. ``OwnedDLHandle.get_function``
@@ -66,8 +63,8 @@ Public API
 """
 
 from std.os import getenv
-from std.ffi import OwnedDLHandle
-from std.memory import Pointer
+from std.ffi import OwnedDLHandle, _get_global
+from std.memory import Layout, OptionalPointer, Pointer, alloc
 
 
 def dl_sym[
@@ -86,35 +83,97 @@ def dl_sym[
     return Pointer(to=addr).unsafe_bitcast[FT]()[]
 
 
+def _lib_in(dir: String, name: String) -> String:
+    var out = String("")
+    out += dir
+    out += "/libflare_"
+    out += name
+    out += ".so"
+    return out^
+
+
 def find_flare_lib(name: String) -> String:
     """Return the path to ``libflare_<name>.so``.
 
     Search order:
-    1. ``$CONDA_PREFIX/lib/libflare_<name>.so`` -- canonical
-       install populated by ``flare/<sub>/ffi/build.sh`` on pixi
-       activation.
-    2. ``build/libflare_<name>.so`` -- bare-checkout fallback
-       when running outside a conda/pixi environment.
+
+    1. ``$FLARE_LIB_DIR/libflare_<name>.so``, when ``FLARE_LIB_DIR``
+       is an absolute path. For running outside pixi, e.g. a bare
+       checkout with ``FLARE_LIB_DIR=$PWD/build``.
+    2. ``$CONDA_PREFIX/lib/libflare_<name>.so``, when ``CONDA_PREFIX``
+       is absolute: the install that ``flare/<sub>/ffi/build.sh``
+       populates on pixi activation.
+    3. The bare file name, which ``dlopen`` looks up on the system
+       library path (``LD_LIBRARY_PATH`` / ``DYLD_LIBRARY_PATH``,
+       rpath, the system directories). It never looks in the working
+       directory.
+
+    The last step used to be ``build/libflare_<name>.so``, relative to
+    the working directory. A flare program started with no
+    ``CONDA_PREFIX`` from a directory someone else could write to (a
+    shared ``/tmp``, a checked-out repository) loaded whatever
+    ``build/libflare_tls.so`` it found there, and ran that code with the
+    program's privileges.
 
     Args:
         name: The bare suffix, e.g. ``"tls"`` for
               ``libflare_tls.so``.
 
     Returns:
-        Path string suitable for passing to
-        ``OwnedDLHandle(path)``. The bare-checkout fallback is
-        a relative path; the conda path is absolute.
+        Path string suitable for passing to ``OwnedDLHandle(path)``.
     """
+    var dir = getenv("FLARE_LIB_DIR", "")
+    if dir.startswith("/"):
+        return _lib_in(dir, name)
     var prefix = getenv("CONDA_PREFIX", "")
-    if prefix == "":
-        var local = String("")
-        local += "build/libflare_"
-        local += name
-        local += ".so"
-        return local^
-    var out = String("")
-    out += prefix
-    out += "/lib/libflare_"
-    out += name
-    out += ".so"
-    return out^
+    if prefix.startswith("/"):
+        var lib_dir = String("")
+        lib_dir += prefix
+        lib_dir += "/lib"
+        return _lib_in(lib_dir, name)
+    var bare = String("")
+    bare += "libflare_"
+    bare += name
+    bare += ".so"
+    return bare^
+
+
+def _pinned_init[
+    name: StaticString
+]() -> OptionalPointer[NoneType, UntrackedOrigin[mut=True]]:
+    try:
+        var lib = OwnedDLHandle(find_flare_lib(name))
+        var cell = alloc(Layout[OwnedDLHandle](count=1)).unsafe_leak()
+        cell.unsafe_write(lib^)
+        return Pointer[NoneType, UntrackedOrigin[mut=True]](
+            unsafe_from_address=Int(cell)
+        )
+    except:
+        return OptionalPointer[NoneType, UntrackedOrigin[mut=True]]()
+
+
+def _pinned_keep(p: OptionalPointer[NoneType, UntrackedOrigin[mut=True]]):
+    pass
+
+
+def pinned_flare_lib[
+    name: StaticString
+]() raises -> Pointer[OwnedDLHandle, MutUntrackedOrigin]:
+    """The process-wide handle to ``libflare_<name>.so``, opened once.
+
+    A per-call ``OwnedDLHandle`` costs a dlopen, symbol lookups and a
+    dlclose under the loader lock every worker shares, and unmaps the
+    library between calls when nothing else holds it. This one is opened
+    on first use and never closed.
+
+    Raises:
+        Error: If the library cannot be loaded.
+    """
+    var p = _get_global[
+        "flare_dylib_" + name, _pinned_init[name], _pinned_keep
+    ]()
+    if not p:
+        raise Error("flare: cannot load libflare_" + String(name) + ".so")
+    return Pointer[OwnedDLHandle, MutUntrackedOrigin](
+        unsafe_from_address=Int(p.value())
+    )

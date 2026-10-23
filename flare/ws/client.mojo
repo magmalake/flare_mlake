@@ -19,6 +19,8 @@ encoders).
 
 from std.ffi import OwnedDLHandle, c_int
 from .frame import (
+    DEFAULT_MAX_FRAME_BYTES,
+    WS_TOO_BIG_MARKER,
     WsFrame,
     WsOpcode,
     WsCloseCode,
@@ -113,26 +115,19 @@ def _sha1(data: String) raises -> List[UInt8]:
 # ── HTTP upgrade helpers ──────────────────────────────────────────────────────
 
 
-def _generate_ws_key() -> String:
+def _generate_ws_key() raises -> String:
     """Generate a random 16-byte nonce encoded as base64.
 
-    Reads from ``/dev/urandom`` for cryptographically secure randomness.
-    Falls back to a time-seeded deterministic generator if urandom is
-    unavailable (should not happen on Linux/macOS).
+    From the OS CSPRNG. There is no fallback: the one this replaced was a
+    constant, the same key for every handshake whenever /dev/urandom
+    could not be opened -- which is what running out of fds looks like.
 
     Returns:
         24-character base64 string suitable for ``Sec-WebSocket-Key``.
     """
-    var nonce = List[UInt8](capacity=16)
-    try:
-        with open("/dev/urandom", "r") as f:
-            var raw = f.read_bytes(16)
-            for i in range(16):
-                nonce.append(raw[i])
-    except:
-        # Fallback: use external_call to get some entropy from the clock
-        for i in range(16):
-            nonce.append(UInt8((i * 37 + 0x42) & 0xFF))
+    from flare.crypto.random import random_bytes
+
+    var nonce = random_bytes(16)
     return _base64_encode(Span[UInt8, _](nonce))
 
 
@@ -263,6 +258,87 @@ def _lower_local(s: String) -> String:
         else:
             out += chr(Int(c))
     return out^
+
+
+struct _UpgradeResponse(Movable):
+    """What the client needs from the server's ``101`` header fields.
+
+    RFC 6455 sec 4.1 makes the client fail the connection unless the
+    response has ``Upgrade: websocket``, a ``Connection`` field with the
+    ``upgrade`` token and the right ``Sec-WebSocket-Accept``, and names no
+    subprotocol or extension (flare's request offers none). Only the accept
+    value used to be read.
+    """
+
+    var accept: String
+    """The last ``Sec-WebSocket-Accept`` value (empty if none)."""
+    var upgrade_websocket: Bool
+    """Some ``Upgrade`` value is ``websocket`` (case-insensitive)."""
+    var connection_upgrade: Bool
+    """Some ``Connection`` value has the token ``upgrade``."""
+    var protocol_seen: Bool
+    """A ``Sec-WebSocket-Protocol`` field is present."""
+    var extensions_seen: Bool
+    """A ``Sec-WebSocket-Extensions`` field is present."""
+
+    def __init__(out self):
+        self.accept = String("")
+        self.upgrade_websocket = False
+        self.connection_upgrade = False
+        self.protocol_seen = False
+        self.extensions_seen = False
+
+    def observe(mut self, name: String, value: String):
+        """Record one header field (``name`` lower-cased, both stripped)."""
+        if name == "sec-websocket-accept":
+            self.accept = value
+        elif name == "upgrade":
+            if _lower_local(value) == "websocket":
+                self.upgrade_websocket = True
+        elif name == "connection":
+            for tok in value.split(","):
+                if _lower_local(String(String(tok).strip())) == "upgrade":
+                    self.connection_upgrade = True
+        elif name == "sec-websocket-protocol":
+            self.protocol_seen = True
+        elif name == "sec-websocket-extensions":
+            self.extensions_seen = True
+
+    def verify(self, expected_accept: String) raises:
+        """Raise ``WsHandshakeError`` unless the 101 completes the handshake.
+
+        Raises:
+            WsHandshakeError: On a missing or wrong ``Upgrade``,
+                ``Connection`` or ``Sec-WebSocket-Accept``, or on a
+                subprotocol or extension the request did not offer.
+        """
+        if not self.upgrade_websocket:
+            raise WsHandshakeError(
+                "101 response lacks 'Upgrade: websocket' (RFC 6455 sec 4.1)"
+            )
+        if not self.connection_upgrade:
+            raise WsHandshakeError(
+                "101 response lacks a 'Connection: Upgrade' token (RFC 6455"
+                " sec 4.1)"
+            )
+        if self.accept != expected_accept:
+            raise WsHandshakeError(
+                "Sec-WebSocket-Accept mismatch: got '"
+                + self.accept
+                + "', expected '"
+                + expected_accept
+                + "'"
+            )
+        if self.protocol_seen:
+            raise WsHandshakeError(
+                "101 response selects a subprotocol that was not requested"
+                " (RFC 6455 sec 4.1)"
+            )
+        if self.extensions_seen:
+            raise WsHandshakeError(
+                "101 response names an extension that was not requested"
+                " (RFC 6455 sec 4.1)"
+            )
 
 
 # ── Internal stream union for WebSocket I/O ───────────────────────────────────
@@ -437,10 +513,21 @@ struct WsClient(Movable):
 
     var _stream: _WsStream
     var _key: String
+    var max_frame_size: Int
+    """Largest frame payload :meth:`recv` accepts. A server frame that
+    declares more is answered with CLOSE 1009 (MESSAGE_TOO_BIG) and
+    :meth:`recv` raises, before any of the payload is buffered.
+    Defaults to :data:`DEFAULT_MAX_FRAME_BYTES`."""
+    var _prebuf: List[UInt8]
+    """Bytes read off the socket past the last decoded frame. A read can
+    carry more than one frame; ``_recv_one`` starts from these before it
+    reads again."""
 
     def __init__(out self, var stream: _WsStream, key: String):
         self._stream = stream^
         self._key = key
+        self.max_frame_size = DEFAULT_MAX_FRAME_BYTES
+        self._prebuf = List[UInt8]()
 
     def __deinit__(deinit self):
         self._stream.close()
@@ -548,7 +635,7 @@ struct WsClient(Movable):
         scratch.append(UInt8(0))
 
         if u.is_tls():
-            var tls = TlsStream.connect(u.host, u.port, tls_cfg^)
+            var tls = TlsStream.connect(u.host, u.port, tls_cfg)
             var req_bytes = req.as_bytes()
             tls.write_all(Span[UInt8, _](req_bytes))
 
@@ -559,7 +646,7 @@ struct WsClient(Movable):
                     "Expected 101 Switching Protocols, got: " + status_line
                 )
 
-            var accept_header = String("")
+            var upgrade = _UpgradeResponse()
             while True:
                 var line = _read_line_tls(tls, scratch)
                 if line.byte_length() == 0:
@@ -580,18 +667,10 @@ struct WsClient(Movable):
                             )
                         ).strip()
                     )
-                    if hk == "sec-websocket-accept":
-                        accept_header = hv
+                    upgrade.observe(hk, hv)
 
-            # ── 4. Verify Sec-WebSocket-Accept ────────────────────────────────
-            if accept_header != expected_accept:
-                raise WsHandshakeError(
-                    "Sec-WebSocket-Accept mismatch: got '"
-                    + accept_header
-                    + "', expected '"
-                    + expected_accept
-                    + "'"
-                )
+            # ── 4. Verify the handshake (RFC 6455 sec 4.1) ────────────────────
+            upgrade.verify(expected_accept)
 
             var ws_stream = _WsStream(tls^)
             return WsClient(ws_stream^, key)
@@ -606,7 +685,7 @@ struct WsClient(Movable):
                     "Expected 101 Switching Protocols, got: " + status_line
                 )
 
-            var accept_header = String("")
+            var upgrade = _UpgradeResponse()
             while True:
                 var line = _read_line_tcp(tcp, scratch)
                 if line.byte_length() == 0:
@@ -627,17 +706,9 @@ struct WsClient(Movable):
                             )
                         ).strip()
                     )
-                    if hk == "sec-websocket-accept":
-                        accept_header = hv
+                    upgrade.observe(hk, hv)
 
-            if accept_header != expected_accept:
-                raise WsHandshakeError(
-                    "Sec-WebSocket-Accept mismatch: got '"
-                    + accept_header
-                    + "', expected '"
-                    + expected_accept
-                    + "'"
-                )
+            upgrade.verify(expected_accept)
 
             var ws_stream = _WsStream(tcp^)
             return WsClient(ws_stream^, key)
@@ -709,15 +780,36 @@ struct WsClient(Movable):
             return frame^
 
     def _recv_one(mut self) raises -> WsFrame:
-        """Read raw bytes from the stream and decode one frame."""
-        # Read bytes incrementally until we have a full frame
-        var buf = List[UInt8](capacity=4096)
+        """Read raw bytes from the stream and decode one frame.
+
+        Raises:
+            WsProtocolError: If the server sent a masked frame (RFC 6455
+                sec 5.1).
+        """
+        # Read bytes incrementally until we have a full frame, starting
+        # from whatever the previous read carried past its frame.
+        var buf = self._prebuf.copy()
+        self._prebuf.clear()
         var tmp = List[UInt8](capacity=4096)
         tmp.resize(4096, 0)
 
         while True:
             try:
-                var result = WsFrame.decode_one(Span[UInt8, _](buf))
+                var result = WsFrame.decode_one(
+                    Span[UInt8, _](buf), max_payload=self.max_frame_size
+                )
+                # RFC 6455 sec 5.1: a server MUST NOT mask the frames it
+                # sends, and a client MUST close the connection if it
+                # detects a masked frame.
+                if result.frame.masked:
+                    raise WsProtocolError(
+                        "server sent a masked frame (RFC 6455 sec 5.1)"
+                    )
+                # A server may send several frames in one segment. They
+                # used to die with ``buf``: the second was lost and the
+                # next recv() waited for bytes already consumed.
+                for i in range(result.consumed, len(buf)):
+                    self._prebuf.append(buf[i])
                 return result^.take_frame()
             except e:
                 var msg = String(e)
@@ -735,15 +827,49 @@ struct WsClient(Movable):
                     for i in range(n):
                         buf.append(tmp[i])
                 else:
+                    if WS_TOO_BIG_MARKER in msg:
+                        # RFC 6455 sec 7.4.1: 1009 tells the server why.
+                        # Best effort: the raise below is what matters.
+                        try:
+                            var wire = WsFrame.close(
+                                WsCloseCode.MESSAGE_TOO_BIG
+                            ).encode(mask=True)
+                            self._stream.write_all(Span[UInt8, _](wire))
+                        except:
+                            pass
                     raise e^
+
+    def _recv_data_frame(mut self) raises -> WsFrame:
+        """Next TEXT, BINARY or CONTINUATION frame.
+
+        PING is answered by :meth:`recv`. PONG is dropped: an unsolicited
+        one is allowed and is not part of any message (RFC 6455 sec 5.5.3).
+
+        Raises:
+            NetworkError: If a CLOSE frame arrives or I/O fails.
+            WsProtocolError: On protocol violation.
+        """
+        while True:
+            var frame = self.recv()
+            if frame.opcode == WsOpcode.CLOSE:
+                raise NetworkError("WebSocket CLOSE received")
+            if frame.opcode == WsOpcode.PONG:
+                continue
+            return frame^
 
     def recv_message(mut self) raises -> WsMessage:
         """Receive the next complete message as a ``WsMessage``.
 
         A higher-level alternative to ``recv()`` that returns a
         ``WsMessage`` (Text or Binary) instead of a raw ``WsFrame``.
-        PING frames are handled transparently (PONG sent automatically).
-        CLOSE frames raise a ``NetworkError``.
+        A fragmented message (a TEXT or BINARY frame without FIN followed
+        by CONTINUATION frames up to one with FIN, RFC 6455 sec 5.4) is
+        reassembled and returned whole. PING frames are handled
+        transparently (PONG sent automatically), PONG frames are skipped,
+        and either may arrive between fragments. CLOSE frames raise a
+        ``NetworkError``. A text message is checked for valid UTF-8 as a
+        whole, so a code point may be split across fragments. The
+        reassembled payload is bounded by ``max_frame_size``.
 
         Returns:
             A ``WsMessage`` with ``is_text=True`` for text frames and
@@ -751,7 +877,11 @@ struct WsClient(Movable):
 
         Raises:
             NetworkError: If a CLOSE frame is received or I/O fails.
-            WsProtocolError: On protocol violation.
+            WsProtocolError: On protocol violation: a CONTINUATION with no
+                message to continue, a new data frame inside a fragmented
+                message, an unknown data opcode, invalid UTF-8 in a text
+                message, or a message over ``max_frame_size`` (CLOSE 1009
+                is sent first).
 
         Example:
             ```mojo
@@ -760,13 +890,48 @@ struct WsClient(Movable):
                 print(msg.as_text())
             ```
         """
-        var frame = self.recv()
-        if frame.opcode == WsOpcode.CLOSE:
-            raise NetworkError("WebSocket CLOSE received")
-        if frame.opcode == WsOpcode.BINARY:
-            return WsMessage(frame.payload)
-        # TEXT or anything else: return as text
-        return WsMessage(frame.text_payload())
+        var first = self._recv_data_frame()
+        var is_text = first.opcode == WsOpcode.TEXT
+        if not is_text and first.opcode != WsOpcode.BINARY:
+            if first.opcode == WsOpcode.CONTINUATION:
+                raise WsProtocolError(
+                    "CONTINUATION frame with no message to continue"
+                    " (RFC 6455 sec 5.4)"
+                )
+            raise WsProtocolError(
+                "unknown data opcode " + String(Int(first.opcode))
+            )
+        var fin = first.fin
+        var payload = first.payload.copy()
+        while not fin:
+            var next = self._recv_data_frame()
+            if next.opcode != WsOpcode.CONTINUATION:
+                raise WsProtocolError(
+                    "new data frame inside a fragmented message"
+                    " (RFC 6455 sec 5.4)"
+                )
+            if len(payload) + len(next.payload) > self.max_frame_size:
+                # RFC 6455 sec 7.4.1: 1009 tells the server why.
+                try:
+                    var wire = WsFrame.close(
+                        WsCloseCode.MESSAGE_TOO_BIG
+                    ).encode(mask=True)
+                    self._stream.write_all(Span[UInt8, _](wire))
+                except:
+                    pass
+                raise WsProtocolError(
+                    WS_TOO_BIG_MARKER
+                    + ": reassembled message exceeds "
+                    + String(self.max_frame_size)
+                    + " bytes"
+                )
+            payload.extend(Span[UInt8, _](next.payload))
+            fin = next.fin
+        if not is_text:
+            return WsMessage(payload)
+        return WsMessage(
+            WsFrame(opcode=WsOpcode.TEXT, payload=payload).text_payload()
+        )
 
     # ── Context manager ───────────────────────────────────────────────────────
 

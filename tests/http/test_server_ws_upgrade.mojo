@@ -9,9 +9,10 @@ a WS upgrade), so an app can now serve normal routes + a WS endpoint
 without a second port.
 
 Topology mirrors tests/http/test_unified_http_server.mojo: fork a child
-running ``HttpServer.serve_ws_upgrade(http_handler, ws_handler)``, drive both an
-HTTP/1.1 client and a ``flare.ws.WsClient`` from the parent over the
-same port, SIGKILL on test-end.
+running ``serve(http_handler)`` with ``ServerConfig.ws =
+WsUpgrade(ws_handler)``, drive both an HTTP/1.1 client and a
+``flare.ws.WsClient`` from the parent over the same port, SIGKILL on
+test-end.
 
 ``WsClient.connect`` cannot exercise the interesting half of the seam:
 it writes the handshake, waits for the 101, and only then sends a frame,
@@ -22,12 +23,13 @@ instead, which is the only way to reach the prebuf with real data.
 
 from std.ffi import c_int, c_size_t
 from std.memory import stack_allocation
-from std.testing import assert_equal, assert_true
+from std.testing import assert_equal, assert_false, assert_true
+from std.time import perf_counter_ns
 
 from flare.utils import SIGKILL, exit, fork, kill, usleep, waitpid
 
-from flare.http import HttpServer, Request, Response, ok
-from flare.net import SocketAddr
+from flare.http import HttpServer, Request, Response, WsUpgrade, ok
+from flare.net import IpAddr, SocketAddr
 from flare.net._libc import (
     AF_INET,
     MSG_NOSIGNAL,
@@ -45,6 +47,7 @@ from flare.net._libc import (
     _strerror,
     get_errno,
 )
+from flare.tls import TlsConfig, TlsStream
 from flare.ws import WsClient, WsConnection, WsFrame, WsOpcode
 
 
@@ -69,6 +72,41 @@ def _ws_handler(mut conn: WsConnection) raises -> None:
             conn.send_text("echo: " + frame.text_payload())
         else:
             conn.send_binary(frame.payload)
+
+
+def _ws_size_handler(mut conn: WsConnection) raises -> None:
+    var frame = conn.recv()
+    conn.send_text(String(len(frame.payload)))
+
+
+def test_a_16_mib_message_is_received_in_linear_time() raises:
+    """The receive buffer grew by exactly 4 KiB per read, so a 16 MiB
+    frame was copied about 4000 times: seconds on loopback."""
+    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var port = UInt16(srv.local_addr().port)
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.config.ws = WsUpgrade(_ws_size_handler)
+            srv.serve(_http_handler)
+        except:
+            pass
+        exit()
+    usleep(300000)
+    var got: String
+    var ms: Int
+    try:
+        var ws = WsClient.connect("ws://127.0.0.1:" + String(Int(port)) + "/ws")
+        var payload = List[UInt8](length=16 * 1024 * 1024, fill=7)
+        var t0 = perf_counter_ns()
+        ws.send_binary(payload)
+        got = ws.recv().text_payload()
+        ms = Int((perf_counter_ns() - t0) // 1_000_000)
+    finally:
+        _ = kill(pid, SIGKILL)
+        _ = waitpid(pid)
+    assert_equal(got, String(16 * 1024 * 1024))
+    assert_true(ms < 1500, "16 MiB took " + String(ms) + " ms")
 
 
 # ── Raw loopback connect helper (same as unified-server test) ─────────────────
@@ -103,7 +141,8 @@ def test_http_and_ws_on_one_port() raises:
     var pid = fork()
     if pid == 0:
         try:
-            srv.serve_ws_upgrade(_http_handler, _ws_handler)
+            srv.config.ws = WsUpgrade(_ws_handler, False)
+            srv.serve(_http_handler)
         except:
             pass
         exit()
@@ -315,7 +354,8 @@ def test_frames_pipelined_with_the_handshake_are_all_delivered() raises:
     var pid = fork()
     if pid == 0:
         try:
-            srv.serve_ws_upgrade(_http_handler, _ws_handler)
+            srv.config.ws = WsUpgrade(_ws_handler, False)
+            srv.serve(_http_handler)
         except:
             pass
         exit()
@@ -379,8 +419,298 @@ def test_frames_pipelined_with_the_handshake_are_all_delivered() raises:
     )
 
 
+# ── Defaults and version negotiation ───────────────────────────────────────
+
+
+def test_ws_upgrade_offloads_by_default() raises:
+    from flare.http import WsUpgrade
+
+    assert_true(WsUpgrade(_ws_handler).offload)
+    assert_false(WsUpgrade(_ws_handler, offload=False).offload)
+
+
+def test_unsupported_ws_version_gets_426() raises:
+    from flare.http import ServerConfig, WsUpgrade
+
+    var cfg = ServerConfig()
+    cfg.ws = WsUpgrade(_ws_handler)
+    var srv = HttpServer.bind(SocketAddr.localhost(0), cfg^)
+    var port = UInt16(srv.local_addr().port)
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve(_http_handler)
+        except:
+            pass
+        exit()
+    usleep(300000)
+    var got = String("")
+    try:
+        var fd = _connect_loopback(port)
+        var req = String(
+            "GET /chat HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade:"
+            " websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key:"
+            " dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n"
+        )
+        var rb = req.as_bytes()
+        _ = _send(
+            fd,
+            rb.unsafe_ptr(),
+            c_size_t(req.byte_length()),
+            c_int(MSG_NOSIGNAL),
+        )
+        var buf = stack_allocation[4096, UInt8]()
+        var attempts = 0
+        while attempts < 20:
+            attempts += 1
+            var n = _recv(fd, buf, c_size_t(4096), c_int(0))
+            if Int(n) <= 0:
+                break
+            for i in range(Int(n)):
+                got += chr(Int(buf[unsafe_offset=i]))
+        _ = _close(fd)
+    except:
+        pass
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+    assert_true(got.startswith("HTTP/1.1 426"), "got: " + got)
+    assert_true("Sec-WebSocket-Version: 13" in got, "got: " + got)
+    assert_false("hello http" in got, "reached the HTTP handler: " + got)
+
+
+def _exchange(port: UInt16, req: String, needle: String) raises -> String:
+    """Send ``req`` on a fresh connection; read until ``needle`` shows up."""
+    var fd = _connect_loopback(port)
+    var rb = req.as_bytes()
+    _ = _send(
+        fd, rb.unsafe_ptr(), c_size_t(req.byte_length()), c_int(MSG_NOSIGNAL)
+    )
+    _set_recv_timeout(fd, 3000)
+    var got = String("")
+    var buf = stack_allocation[4096, UInt8]()
+    var attempts = 0
+    while attempts < 20 and needle not in got:
+        attempts += 1
+        var n = _recv(fd, buf, c_size_t(4096), c_int(0))
+        if Int(n) <= 0:
+            break
+        for i in range(Int(n)):
+            got += chr(Int(buf[unsafe_offset=i]))
+    _ = _close(fd)
+    return got^
+
+
+def test_shared_listener_checks_the_whole_handshake() raises:
+    """WS-07: Connection is matched as a token and the key must decode.
+
+    The reactor tested ``"upgrade" in connection`` and a non-empty key, so
+    ``Connection: noupgrade`` and ``Sec-WebSocket-Key: x`` got a 101. A
+    request that is not a valid handshake is ordinary HTTP here; the
+    standalone ``WsServer`` applies the same rule (WS-05).
+    """
+    from flare.http import ServerConfig, WsUpgrade
+
+    var cfg = ServerConfig()
+    cfg.ws = WsUpgrade(_ws_handler)
+    var srv = HttpServer.bind(SocketAddr.localhost(0), cfg^)
+    var port = UInt16(srv.local_addr().port)
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve(_http_handler)
+        except:
+            pass
+        exit()
+    usleep(300000)
+
+    var head = String(
+        "GET /chat HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+    )
+    var key = String("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n")
+    var ver = String("Sec-WebSocket-Version: 13\r\n")
+    var valid = String("")
+    var no_token = String("")
+    var bad_key = String("")
+    var two_keys = String("")
+    var post = String("")
+    try:
+        valid = _exchange(
+            port,
+            head + "Connection: keep-alive, Upgrade\r\n" + key + ver + "\r\n",
+            "101",
+        )
+        no_token = _exchange(
+            port,
+            head + "Connection: noupgrade, close\r\n" + key + ver + "\r\n",
+            "hello http",
+        )
+        bad_key = _exchange(
+            port,
+            head
+            + "Connection: Upgrade, close\r\nSec-WebSocket-Key: x\r\n"
+            + ver
+            + "\r\n",
+            "hello http",
+        )
+        two_keys = _exchange(
+            port,
+            head
+            + "Connection: Upgrade, close\r\n"
+            + key
+            + "Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n"
+            + ver
+            + "\r\n",
+            "hello http",
+        )
+        post = _exchange(
+            port,
+            "POST /chat HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length:"
+            " 0\r\nUpgrade: websocket\r\nConnection: Upgrade,"
+            " close\r\n"
+            + key
+            + ver
+            + "\r\n",
+            "hello http",
+        )
+    except e:
+        print("exchange failed: " + String(e))
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+
+    assert_true("101" in valid, "valid handshake: " + valid)
+    assert_false("101" in no_token, "Connection: noupgrade got: " + no_token)
+    assert_true("hello http" in no_token, no_token)
+    assert_false("101" in bad_key, "key 'x' got: " + bad_key)
+    assert_true("hello http" in bad_key, bad_key)
+    assert_false("101" in two_keys, "two keys got: " + two_keys)
+    assert_true("hello http" in two_keys, two_keys)
+    assert_false("101" in post, "POST got: " + post)
+
+
+def _origin_ws_handler(mut conn: WsConnection) raises -> None:
+    conn.send_text("origin=[" + conn.origin + "]")
+
+
+def test_shared_listener_upgrade_carries_origin() raises:
+    """The shared-listener seam built its ``WsConnection`` with no
+    origin, so a handler's allow-list check saw "" for every client."""
+    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var port = UInt16(srv.local_addr().port)
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.config.ws = WsUpgrade(_origin_ws_handler, False)
+            srv.serve(_http_handler)
+        except:
+            pass
+        exit()
+    usleep(300000)
+    var got = String("")
+    try:
+        var fd = _connect_loopback(port)
+        _set_recv_timeout(fd, 3000)
+        var handshake = String(
+            "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade:"
+            " websocket\r\nConnection: Upgrade\r\nOrigin:"
+            " https://app.test\r\nSec-WebSocket-Key:"
+            " dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        _send_all(fd, handshake.as_bytes())
+        var buf = stack_allocation[4096, UInt8]()
+        var attempts = 0
+        while attempts < 20 and "]" not in got:
+            attempts += 1
+            var n = _recv(fd, buf, c_size_t(4096), c_int(0))
+            if Int(n) <= 0:
+                break
+            for i in range(Int(n)):
+                got += chr(Int(buf[unsafe_offset=i]))
+        _ = _close(fd)
+    except:
+        pass
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+    assert_true("origin=[https://app.test]" in got, "got: " + got)
+
+
+# ── WebSocket upgrade on a TLS connection (APP-48) ───────────────────────────
+
+
+def _tls_http_handler(req: Request) raises -> Response:
+    return ok("hello https")
+
+
+def _tls_secret_ws_handler(mut conn: WsConnection) raises -> None:
+    conn.send_text("secret-token")
+
+
+def test_ws_handshake_on_tls_is_never_upgraded_in_cleartext() raises:
+    """With ``bind_tls`` and a WebSocket handler configured, a handshake
+    sent inside the TLS session must not be answered in cleartext: the
+    connection stays inside TLS and the request is served as plain HTTP.
+
+    Before the fix ``on_readable`` took the WebSocket branch on a TLS
+    connection, wrote the 101 and the handler's frame on the raw fd, and the
+    client's TLS read failed on the first non-record byte.
+    """
+    var alpn = List[String]()
+    alpn.append("http/1.1")
+    var srv = HttpServer.bind_tls(
+        SocketAddr(IpAddr.parse("127.0.0.1"), UInt16(0)),
+        "tests/certs/server.crt",
+        "tests/certs/server.key",
+        alpn=alpn^,
+    )
+    srv.config.ws = WsUpgrade(_tls_secret_ws_handler, False)
+    var port = UInt16(srv.local_addr().port)
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve(_tls_http_handler)
+        except:
+            pass
+        exit()
+    usleep(300000)
+
+    var plain = String("")
+    var err = String("")
+    try:
+        var cfg = TlsConfig(ca_bundle="tests/certs/ca.crt")
+        var s = TlsStream.connect("localhost", port, cfg)
+        var hs = String(
+            "GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade:"
+            " websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key:"
+            " dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version:"
+            " 13\r\n\r\n"
+        )
+        s.write_all(hs.as_bytes())
+        s.set_recv_timeout(2000)
+        var buf = List[UInt8](length=4096, fill=UInt8(0))
+        for _ in range(10):
+            var got = s.read(buf.unsafe_ptr(), len(buf))
+            if got <= 0:
+                break
+            plain += String(unsafe_from_utf8=Span[UInt8, _](buf)[:got])
+            if "hello https" in plain:
+                break
+        s.close()
+    except e:
+        err = String(e)
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+    assert_true(plain.startswith("HTTP/1.1 200"), "got: " + plain + " " + err)
+    assert_true("hello https" in plain, "got: " + plain)
+    assert_false("secret-token" in plain, "WS handler ran: " + plain)
+
+
 def main() raises:
     test_http_and_ws_on_one_port()
     test_upgrade_request_is_ordinary_traffic_without_a_ws_handler()
     test_frames_pipelined_with_the_handshake_are_all_delivered()
-    print("test_server_ws_upgrade: 3 passed")
+    test_ws_upgrade_offloads_by_default()
+    test_unsupported_ws_version_gets_426()
+    test_shared_listener_checks_the_whole_handshake()
+    test_shared_listener_upgrade_carries_origin()
+    test_ws_handshake_on_tls_is_never_upgraded_in_cleartext()
+    test_a_16_mib_message_is_received_in_linear_time()
+    print("test_server_ws_upgrade: 9 passed")

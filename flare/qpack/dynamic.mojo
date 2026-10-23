@@ -36,9 +36,11 @@ room) and does not track per-entry reference counts -- a decoder mirror
 trusts the peer encoder not to evict an entry a not-yet-acknowledged
 field section still references (RFC 9204 section 2.2 makes that the
 encoder's responsibility). Blocked-stream handling (a field section
-referencing inserts that have not arrived) is surfaced as a decode error
-for the caller to treat as "needs more inserts"; full stream-parking is
-the upgrade path.
+referencing inserts that have not arrived) is surfaced as a decode error;
+the HTTP/3 server advertises 0 blocked streams, so it treats that error
+(like every undecodable field section) as a connection error of type
+``QPACK_DECOMPRESSION_FAILED`` (RFC 9204 section 2.1.2). Stream-parking
+for a non-zero budget is the upgrade path.
 
 References: RFC 9204 sections 2-4; RFC 7541 Appendix B (Huffman).
 """
@@ -52,8 +54,19 @@ from flare.http2.hpack import (
     encode_integer,
 )
 
-from .codec import _decode_string_literal, _encode_string_literal
-from .static_table import QPACK_STATIC_TABLE_SIZE, _qpack_static_table
+from .codec import (
+    QPACK_DEFAULT_MAX_FIELD_SECTION_SIZE,
+    _charge_field,
+    _decode_string_literal,
+    _encode_string_literal,
+)
+from .static_table import (
+    QPACK_STATIC_TABLE_SIZE,
+    static_name,
+    static_table_find,
+    static_table_find_name,
+    static_value,
+)
 
 
 comptime _ENTRY_OVERHEAD: UInt64 = 32
@@ -83,12 +96,17 @@ struct QpackDynamicTable(Copyable):
 
     var entries: List[QpackHeader]
     var capacity: UInt64
+    var max_capacity: UInt64
+    """The ceiling :meth:`set_capacity` may raise ``capacity`` to: the
+    SETTINGS_QPACK_MAX_TABLE_CAPACITY this side advertised (RFC 9204
+    sec 3.2.3)."""
     var size: UInt64
     var dropped: UInt64
 
     def __init__(out self, capacity: UInt64 = 0):
         self.entries = List[QpackHeader]()
         self.capacity = capacity
+        self.max_capacity = capacity
         self.size = 0
         self.dropped = 0
 
@@ -100,9 +118,21 @@ struct QpackDynamicTable(Copyable):
         """RFC 9204 section 3.2.2 MaxEntries = floor(capacity / 32)."""
         return self.capacity // _ENTRY_OVERHEAD
 
-    def set_capacity(mut self, cap: UInt64):
+    def set_capacity(mut self, cap: UInt64) raises:
         """Set the table capacity, evicting the oldest entries until the
-        size fits (RFC 9204 section 4.3.1)."""
+        size fits (RFC 9204 section 4.3.1).
+
+        Raises ``QPACK_ENCODER_STREAM_ERROR`` above :attr:`max_capacity`
+        (sec 4.3.1). Any value was accepted, so a peer could grow our
+        dynamic table past the limit we advertised, which is 0 by
+        default, and fill it with inserts of any size."""
+        if cap > self.max_capacity:
+            raise Error(
+                "QPACK_ENCODER_STREAM_ERROR: capacity "
+                + String(cap)
+                + " above the advertised "
+                + String(self.max_capacity)
+            )
         self.capacity = cap
         self._evict_to(cap)
 
@@ -251,11 +281,12 @@ def apply_encoder_instructions_partial(
     returns ``(inserts_applied, bytes_consumed)`` so the caller can keep
     the unconsumed tail and retry once more bytes arrive.
 
-    An incomplete *and* a corrupt trailing instruction look the
-    same here (both raise mid-parse), so both stop consumption. A truly
-    corrupt encoder stream therefore stalls rather than erroring; the
-    QUIC idle timeout closes such a connection. The upgrade path is to
-    distinguish truncation from corruption per instruction."""
+    An instruction cut short by the chunk boundary (an untagged
+    parse error) stops consumption and is retried. A real encoder-stream
+    error (a reference to a missing or evicted entry, a capacity above the
+    advertised limit, a literal that is not UTF-8, an insert that does not
+    fit) is tagged ``QPACK_ENCODER_STREAM_ERROR`` and is re-raised, so the
+    connection fails instead of stalling."""
     var consumed = 0
     var inserts = 0
     while consumed < len(buf):
@@ -265,7 +296,19 @@ def apply_encoder_instructions_partial(
             var step = _apply_one_encoder_instruction(table, buf, instr_start)
             inserts += step[0]
             consumed = step[1]
-        except:
+        except e:
+            # A real encoder-stream error is a connection error, not a
+            # truncated instruction to retry. It was treated as one, so
+            # a bad instruction stalled the stream while its bytes piled
+            # up in the caller's carry.
+            if "QPACK_ENCODER_STREAM_ERROR" in String(e):
+                raise e^
+            # A literal that is not valid UTF-8 is corruption, not
+            # truncation (QPACK-03): more bytes cannot repair it.
+            if "literal is not valid UTF-8" in String(e):
+                raise Error(
+                    "QPACK_ENCODER_STREAM_ERROR: literal is not valid UTF-8"
+                )
             # Roll back any partial table mutation is not needed: a single
             # instruction either fully applies (advancing consumed) or
             # raises before mutating. Stop at the instruction boundary.
@@ -275,12 +318,31 @@ def apply_encoder_instructions_partial(
     return Tuple[Int, Int](inserts, consumed)
 
 
+def _relative_to_abs(table: QpackDynamicTable, rel: Int) raises -> UInt64:
+    """Resolve an encoder-stream relative index (RFC 9204 section 3.2.5:
+    0 is the most recent insert) to an absolute index.
+
+    A relative index that names no live entry (an empty table, or an
+    entry already evicted) is a ``QPACK_ENCODER_STREAM_ERROR``
+    (sections 4.3.2 and 4.3.4). The range is checked before the
+    subtraction: ``insert_count() - 1 - rel`` wrapped in ``UInt64``, and
+    the untagged ``get_abs`` failure that followed was read as a
+    truncated instruction, stalling the stream (QPACK-04)."""
+    var live = UInt64(len(table.entries))
+    if rel < 0 or UInt64(rel) >= live:
+        raise Error(
+            "QPACK_ENCODER_STREAM_ERROR: relative index "
+            + String(rel)
+            + " names no live dynamic-table entry"
+        )
+    return table.insert_count() - 1 - UInt64(rel)
+
+
 def _apply_one_encoder_instruction(
     mut table: QpackDynamicTable, buf: Span[UInt8, _], pos: Int
 ) raises -> Tuple[Int, Int]:
     """Apply the single encoder instruction at ``pos``; return
     ``(inserts, new_pos)``."""
-    var stbl = _qpack_static_table()
     var b0 = buf[pos]
     if (b0 & UInt8(0x80)) != UInt8(0):
         var is_static = (b0 & UInt8(0x40)) != UInt8(0)
@@ -288,20 +350,21 @@ def _apply_one_encoder_instruction(
         var name: String
         if is_static:
             if ip.value < 0 or ip.value >= QPACK_STATIC_TABLE_SIZE:
-                raise Error("qpack: insert static name index out of range")
-            name = stbl[ip.value].name
+                raise Error(
+                    "QPACK_ENCODER_STREAM_ERROR: static name index out of range"
+                )
+            name = String(static_name(ip.value))
         else:
-            var abs_idx = table.insert_count() - 1 - UInt64(ip.value)
-            name = table.get_abs(abs_idx).name
+            name = table.get_abs(_relative_to_abs(table, ip.value)).name
         var lit = _decode_string_literal(buf, ip.offset, 7, UInt8(0x80))
         if not table.insert(QpackHeader(name, lit[0])):
-            raise Error("qpack: insert exceeds table capacity")
+            raise Error("QPACK_ENCODER_STREAM_ERROR: insert exceeds capacity")
         return Tuple[Int, Int](1, lit[1])
     elif (b0 & UInt8(0x40)) != UInt8(0):
         var name_lit = _decode_string_literal(buf, pos, 5, UInt8(0x20))
         var value_lit = _decode_string_literal(buf, name_lit[1], 7, UInt8(0x80))
         if not table.insert(QpackHeader(name_lit[0], value_lit[0])):
-            raise Error("qpack: insert exceeds table capacity")
+            raise Error("QPACK_ENCODER_STREAM_ERROR: insert exceeds capacity")
         return Tuple[Int, Int](1, value_lit[1])
     elif (b0 & UInt8(0x20)) != UInt8(0):
         var ip = decode_integer(buf, pos, 5)
@@ -309,10 +372,11 @@ def _apply_one_encoder_instruction(
         return Tuple[Int, Int](0, ip.offset)
     else:
         var ip = decode_integer(buf, pos, 5)
-        var abs_idx = table.insert_count() - 1 - UInt64(ip.value)
-        var dup = table.get_abs(abs_idx)
+        var dup = table.get_abs(_relative_to_abs(table, ip.value))
         if not table.insert(dup^):
-            raise Error("qpack: duplicate exceeds table capacity")
+            raise Error(
+                "QPACK_ENCODER_STREAM_ERROR: duplicate exceeds capacity"
+            )
         return Tuple[Int, Int](1, ip.offset)
 
 
@@ -389,7 +453,6 @@ def encode_field_section_dynamic(
     (0 when no dynamic entry is referenced), and Base is set equal to it
     (delta_base 0), so every reference is pre-base.
     """
-    var stbl = _qpack_static_table()
     var max_abs: Int = -1
     # First pass: decide ric (max referenced abs + 1).
     for i in range(len(headers)):
@@ -422,19 +485,11 @@ def encode_field_section_dynamic(
             _encode_string_literal(out, h.value, UInt8(0x00), 7, UInt8(0x80))
             continue
         # Static-table fallbacks.
-        var s_full = -1
-        for j in range(QPACK_STATIC_TABLE_SIZE):
-            if stbl[j].name == h.name and stbl[j].value == h.value:
-                s_full = j
-                break
+        var s_full = static_table_find(h.name, h.value)
         if s_full >= 0:
             encode_integer(out, s_full, 6, UInt8(0xC0))
             continue
-        var s_name = -1
-        for j in range(QPACK_STATIC_TABLE_SIZE):
-            if stbl[j].name == h.name:
-                s_name = j
-                break
+        var s_name = static_table_find_name(h.name)
         if s_name >= 0:
             encode_integer(out, s_name, 4, UInt8(0x50))
             _encode_string_literal(out, h.value, UInt8(0x00), 7, UInt8(0x80))
@@ -443,33 +498,97 @@ def encode_field_section_dynamic(
         _encode_string_literal(out, h.value, UInt8(0x00), 7, UInt8(0x80))
 
 
+def _pre_base_abs(base: UInt64, ric: UInt64, rel: Int) raises -> UInt64:
+    """Absolute index of a pre-base relative index (RFC 9204 4.5.2): it
+    must name an entry below Base and below the Required Insert Count.
+    ``base - 1 - rel`` wrapped for ``rel >= base`` (QPACK-01)."""
+    if rel < 0 or UInt64(rel) >= base:
+        raise Error(
+            "qpack: QPACK_DECOMPRESSION_FAILED: relative index "
+            + String(rel)
+            + " not below Base "
+            + String(base)
+        )
+    var abs_idx = base - 1 - UInt64(rel)
+    if abs_idx >= ric:
+        raise Error(
+            "qpack: QPACK_DECOMPRESSION_FAILED: absolute index "
+            + String(abs_idx)
+            + " not below Required Insert Count "
+            + String(ric)
+        )
+    return abs_idx
+
+
+def _post_base_abs(base: UInt64, ric: UInt64, ip: Int) raises -> UInt64:
+    """Absolute index of a post-base index (RFC 9204 4.5.3): ``base + ip``
+    must stay below the Required Insert Count (QPACK-01)."""
+    if ip < 0 or UInt64(ip) >= ric or base >= ric - UInt64(ip):
+        raise Error(
+            "qpack: QPACK_DECOMPRESSION_FAILED: post-base index "
+            + String(ip)
+            + " with Base "
+            + String(base)
+            + " reaches the Required Insert Count "
+            + String(ric)
+        )
+    return base + UInt64(ip)
+
+
 def decode_field_section_dynamic(
     buf: Span[UInt8, _],
     table: QpackDynamicTable,
+    max_field_section_size: UInt64 = QPACK_DEFAULT_MAX_FIELD_SECTION_SIZE,
 ) raises -> List[QpackHeader]:
     """Decode a field section against ``table``, resolving dynamic
     indexed / name-reference / post-base lines (RFC 9204 section 4.5).
     Static-only inputs (Required Insert Count 0) decode without touching
-    the table."""
+    the table: every dynamic reference must resolve to an absolute index
+    below the Required Insert Count (and a Sign-1 Delta Base below it),
+    otherwise the section is a ``QPACK_DECOMPRESSION_FAILED`` error.
+
+    The decoded size (``name + value + 32`` per line, RFC 9114 section
+    4.2.2) is capped at ``max_field_section_size`` and checked as each
+    line is decoded, so a one-byte reference to a large dynamic-table entry
+    repeated thousands of times is refused after the first few instead of
+    being expanded in full. The caller's limit on the compressed section
+    does not do this."""
     var headers = List[QpackHeader]()
+    var used = UInt64(0)
     if len(buf) < 2:
         raise Error("qpack: field section prefix truncated")
     var ric_enc = decode_integer(buf, 0, 8)
     var ric = decode_required_insert_count(
         UInt64(ric_enc.value), table.insert_count(), table.max_entries()
     )
+    # The prefix is two fields. A Required Insert Count that ends the
+    # section (``FF 01``) leaves no Sign / Delta Base byte; reading it
+    # indexed one past the end and aborted the process (QPACK-02).
+    if ric_enc.offset >= len(buf):
+        raise Error(
+            "qpack: QPACK_DECOMPRESSION_FAILED: field section prefix"
+            " truncated before Sign / Delta Base"
+        )
     # Sign + Delta Base (1-bit sign + 7-bit prefix).
     var sign_set = (buf[ric_enc.offset] & UInt8(0x80)) != UInt8(0)
     var delta = decode_integer(buf, ric_enc.offset, 7)
     var base: UInt64
     if sign_set:
+        # RFC 9204 4.5.1.2: Sign 1 with Required Insert Count <= Delta
+        # Base is invalid. Unchecked, Base wrapped to 2^64 - 1 (QPACK-01).
+        if UInt64(delta.value) >= ric:
+            raise Error(
+                "qpack: QPACK_DECOMPRESSION_FAILED: Delta Base "
+                + String(delta.value)
+                + " not below Required Insert Count "
+                + String(ric)
+            )
         base = ric - UInt64(delta.value) - 1
     else:
         base = ric + UInt64(delta.value)
     # Blocked-stream guard: a reference past what we've received fails.
     if ric > table.insert_count():
         raise Error("qpack: field section blocked on missing inserts")
-    var stbl = _qpack_static_table()
     var pos = delta.offset
     while pos < len(buf):
         var b0 = buf[pos]
@@ -480,10 +599,24 @@ def decode_field_section_dynamic(
             if t_static:
                 if ip.value < 0 or ip.value >= QPACK_STATIC_TABLE_SIZE:
                     raise Error("qpack: static index out of range")
-                headers.append(stbl[ip.value].copy())
+                var sname = String(static_name(ip.value))
+                var svalue = String(static_value(ip.value))
+                _charge_field(
+                    used,
+                    sname.byte_length(),
+                    svalue.byte_length(),
+                    max_field_section_size,
+                )
+                headers.append(QpackHeader(sname^, svalue^))
             else:
-                var abs_idx = base - 1 - UInt64(ip.value)
-                headers.append(table.get_abs(abs_idx))
+                var dyn = table.get_abs(_pre_base_abs(base, ric, ip.value))
+                _charge_field(
+                    used,
+                    dyn.name.byte_length(),
+                    dyn.value.byte_length(),
+                    max_field_section_size,
+                )
+                headers.append(dyn^)
             pos = ip.offset
             continue
         if (b0 & UInt8(0x40)) != UInt8(0):
@@ -494,11 +627,16 @@ def decode_field_section_dynamic(
             if t_static:
                 if ip.value < 0 or ip.value >= QPACK_STATIC_TABLE_SIZE:
                     raise Error("qpack: static name index out of range")
-                name = stbl[ip.value].name
+                name = String(static_name(ip.value))
             else:
-                var abs_idx = base - 1 - UInt64(ip.value)
-                name = table.get_abs(abs_idx).name
+                name = table.get_abs(_pre_base_abs(base, ric, ip.value)).name
             var lit = _decode_string_literal(buf, ip.offset, 7, UInt8(0x80))
+            _charge_field(
+                used,
+                name.byte_length(),
+                lit[0].byte_length(),
+                max_field_section_size,
+            )
             headers.append(QpackHeader(name, lit[0]))
             pos = lit[1]
             continue
@@ -508,21 +646,38 @@ def decode_field_section_dynamic(
             var value_lit = _decode_string_literal(
                 buf, name_lit[1], 7, UInt8(0x80)
             )
+            _charge_field(
+                used,
+                name_lit[0].byte_length(),
+                value_lit[0].byte_length(),
+                max_field_section_size,
+            )
             headers.append(QpackHeader(name_lit[0], value_lit[0]))
             pos = value_lit[1]
             continue
         if (b0 & UInt8(0x10)) != UInt8(0):
             # Indexed Field Line With Post-Base Index: 0001xxxx
             var ip = decode_integer(buf, pos, 4)
-            var abs_idx = base + UInt64(ip.value)
-            headers.append(table.get_abs(abs_idx))
+            var dyn = table.get_abs(_post_base_abs(base, ric, ip.value))
+            _charge_field(
+                used,
+                dyn.name.byte_length(),
+                dyn.value.byte_length(),
+                max_field_section_size,
+            )
+            headers.append(dyn^)
             pos = ip.offset
             continue
         # Literal Field Line With Post-Base Name Reference: 0000Nxxx
         var ip = decode_integer(buf, pos, 3)
-        var abs_idx = base + UInt64(ip.value)
-        var name = table.get_abs(abs_idx).name
+        var name = table.get_abs(_post_base_abs(base, ric, ip.value)).name
         var lit = _decode_string_literal(buf, ip.offset, 7, UInt8(0x80))
+        _charge_field(
+            used,
+            name.byte_length(),
+            lit[0].byte_length(),
+            max_field_section_size,
+        )
         headers.append(QpackHeader(name, lit[0]))
         pos = lit[1]
     return headers^
@@ -558,21 +713,41 @@ struct QpackDecoder(Copyable):
         self.pending_increment = 0
         return True
 
-    def decode(self, buf: Span[UInt8, _]) raises -> List[QpackHeader]:
-        """Decode a field section against the dynamic table."""
-        return decode_field_section_dynamic(buf, self.table)
+    def decode(
+        self,
+        buf: Span[UInt8, _],
+        max_field_section_size: UInt64 = QPACK_DEFAULT_MAX_FIELD_SECTION_SIZE,
+    ) raises -> List[QpackHeader]:
+        """Decode a field section against the dynamic table, capped at
+        ``max_field_section_size`` decoded bytes."""
+        return decode_field_section_dynamic(
+            buf, self.table, max_field_section_size
+        )
 
 
 struct QpackEncoder(Copyable):
     """Owns the outbound dynamic table; ``insert`` appends an
-    encoder-stream instruction and updates the local table mirror."""
+    encoder-stream instruction and updates the local table mirror.
+
+    The encoder does not track acknowledgments yet: it has no Known
+    Received Count, never sees Section Acknowledgment or Insert Count
+    Increment instructions, and is not told the peer's
+    ``SETTINGS_QPACK_BLOCKED_STREAMS``. Until it does, every entry is
+    unacknowledged, so (RFC 9204 sections 2.1.1 and 2.1.2):
+
+    * :meth:`encode` references no dynamic entry (Required Insert Count
+      0), so no stream can block a decoder that allows none; and
+    * :meth:`insert` never evicts: an entry that does not fit in the
+      free space is refused, so no entry a decoder may still need
+      disappears.
+    """
 
     var table: QpackDynamicTable
 
     def __init__(out self, capacity: UInt64 = 0):
         self.table = QpackDynamicTable(capacity)
 
-    def set_capacity(mut self, cap: UInt64, mut enc_stream: List[UInt8]):
+    def set_capacity(mut self, cap: UInt64, mut enc_stream: List[UInt8]) raises:
         encode_set_capacity(enc_stream, cap)
         self.table.set_capacity(cap)
 
@@ -580,13 +755,18 @@ struct QpackEncoder(Copyable):
         mut self, name: String, value: String, mut enc_stream: List[UInt8]
     ) -> Bool:
         """Insert (name, value), emitting an Insert With Literal Name
-        instruction. Returns False if it does not fit the capacity."""
+        instruction. Returns False, emitting nothing, if the entry does
+        not fit in the table's free space: inserting it would evict an
+        entry that is not known to be unreferenced (QPACK-06)."""
         var h = QpackHeader(name, value)
-        if entry_size(h) > self.table.capacity:
+        if self.table.size + entry_size(h) > self.table.capacity:
             return False
         encode_insert_with_literal_name(enc_stream, name, value)
         return self.table.insert(h^)
 
     def encode(self, headers: List[QpackHeader], mut out: List[UInt8]) raises:
-        """Encode a field section referencing the local table."""
-        encode_field_section_dynamic(headers, self.table, out)
+        """Encode a field section against no dynamic entries (Required
+        Insert Count 0): static references and literals only, until
+        acknowledgments are tracked (QPACK-06)."""
+        var no_entries = QpackDynamicTable(UInt64(0))
+        encode_field_section_dynamic(headers, no_entries, out)

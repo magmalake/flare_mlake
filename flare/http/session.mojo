@@ -21,6 +21,12 @@ and (de)serialises it through a user-supplied ``SessionCodec[T]``.
   reference backend; a shared/Redis/SQL backend implements the same four
   methods (``get`` / ``set`` / ``delete`` / ``sweep``).
 
+Sessions expire server-side by default: every store takes a ``ttl_s``
+(default :data:`DEFAULT_SESSION_TTL_S`, one day; ``0`` opts out). The
+cookie stores read the wall clock themselves and also offer ``encode_at`` /
+``load_at`` / ``insert_at`` forms that take the time as an argument, the
+way ``BackedSessionStore`` takes ``now_s``.
+
 The two cookie stores share the ``SessionStore`` read trait
 (``cookie_name`` + ``load``) so handler code can be generic over them.
 Keys are rotated by passing ``previous_keys``; valid signatures under any
@@ -48,6 +54,8 @@ from std.collections import Optional
 from std.time import perf_counter_ns
 
 from .request import Request
+from .proto.utf8 import utf8_lossy_string
+from ..runtime.date_cache import _realtime_seconds
 from ..crypto import (
     base64url_decode,
     base64url_encode,
@@ -60,8 +68,8 @@ from ..crypto import (
 
 
 def new_session_id(n_bytes: Int = 32) raises -> String:
-    """Return a fresh unguessable session id: ``n_bytes`` from
-    ``/dev/urandom`` rendered as lowercase hex.
+    """Return a fresh unguessable session id: ``n_bytes`` from the OS
+    CSPRNG rendered as lowercase hex.
 
     32 bytes (256 bits) is the default -- well above the 128-bit floor
     for a session identifier that a signed cookie carries opaquely. The
@@ -70,11 +78,9 @@ def new_session_id(n_bytes: Int = 32) raises -> String:
     raises if the entropy source is unavailable (which should not happen
     on Linux / macOS).
     """
-    var raw: List[UInt8]
-    with open("/dev/urandom", "r") as f:
-        raw = f.read_bytes(n_bytes)
-    if len(raw) < n_bytes:
-        raise Error("new_session_id: short read from /dev/urandom")
+    from flare.crypto.random import random_bytes
+
+    var raw = random_bytes(n_bytes)
     var hex = String(capacity_bytes=n_bytes * 2 + 1)
     comptime digits = "0123456789abcdef"
     for i in range(n_bytes):
@@ -89,7 +95,43 @@ def session_now_s() -> Int:
     return Int(perf_counter_ns() // 1_000_000_000)
 
 
+comptime DEFAULT_SESSION_TTL_S: Int = 86400
+"""Default server-side lifetime of a session, in seconds (one day).
+
+Every store in this module expires its sessions server-side after this
+long unless told otherwise, so a stolen session cookie cannot be replayed
+for as long as the signing key lives (``docs/threat-model.md``). Pass
+``ttl_s=0`` to a store to opt out of expiry, or another value to change
+the lifetime."""
+
+
+def _wall_clock_s() -> Int:
+    """Epoch seconds (``CLOCK_REALTIME``): the clock the cookie-borne
+    expiry of :class:`CookieSessionStore` is compared with. It must be a
+    wall clock, not :func:`session_now_s`: the cookie outlives the process
+    that issued it."""
+    return _realtime_seconds()
+
+
 # ── SignedCookie: stateless payload carrier ───────────────────────────────
+
+
+comptime MIN_SESSION_KEY_BYTES: Int = 16
+"""Shortest HMAC key a session store or signed cookie will use, for
+signing or for verifying. A shorter key -- above all an empty one, which
+is what an unset environment variable produces -- makes every cookie
+forgeable by anyone who knows the payload format."""
+
+
+def _require_session_key(key: List[UInt8], who: String) raises:
+    if len(key) < MIN_SESSION_KEY_BYTES:
+        raise Error(
+            who
+            + ": signing key must be at least "
+            + String(MIN_SESSION_KEY_BYTES)
+            + " bytes, got "
+            + String(len(key))
+        )
 
 
 def signed_cookie_encode(
@@ -133,6 +175,12 @@ def signed_cookie_decode(
         Error: When the cookie is malformed or the MAC fails to
                verify under ``key``.
     """
+    # Verifying under a short key is how the bypass worked: the stores
+    # kept an empty key as an "invalid" marker, refused to *sign* with
+    # it, and happily *verified* with it. HMAC under an empty key is
+    # computable by anyone.
+    if len(key) < MIN_SESSION_KEY_BYTES:
+        raise Error("signed_cookie_decode: key shorter than 16 bytes")
     var dot = -1
     var src = cookie.unsafe_ptr()
     var n = cookie.byte_length()
@@ -226,10 +274,7 @@ struct StringSessionCodec(Copyable, Defaultable, SessionCodec):
     def decode(data: List[UInt8]) raises -> String:
         if len(data) == 0:
             return ""
-        var out = String(capacity_bytes=len(data) + 1)
-        for b in data:
-            out += chr(Int(b))
-        return out^
+        return utf8_lossy_string(Span[UInt8, _](data))
 
 
 # ── Session[T] + SessionStore ─────────────────────────────────────────────
@@ -292,41 +337,64 @@ struct Session(Copyable, Defaultable):
 # ── CookieSessionStore: encode payload directly into a signed cookie ──────
 
 
-struct CookieSessionStore(Copyable, Defaultable, SessionStore):
+struct CookieSessionStore(Copyable, SessionStore):
     """Stateless store: the entire session is encoded into the
     signed cookie. Suitable for small payloads (< 4 KiB).
 
     Stores no server-side state; payload size is bounded by the
     cookie size limit (RFC 6265 paragraph 6.1 recommends >= 4096
     bytes per cookie).
+
+    The signed payload is ``"<expiry>|<value>"``, where ``<expiry>`` is
+    the absolute epoch second after which :meth:`load` refuses the cookie
+    (``0`` = never; only with ``ttl_s <= 0``). The expiry is covered by
+    the MAC, so a client cannot extend it, and a validly signed payload
+    without one -- such as a cookie issued before expiry existed -- is
+    refused: its holder is treated as anonymous and signs in again.
     """
 
     var _key: List[UInt8]
     var _previous_keys: List[List[UInt8]]
     var _cookie_name: String
-
-    def __init__(out self):
-        self._key = List[UInt8]()
-        self._previous_keys = List[List[UInt8]]()
-        self._cookie_name = "flare_session"
+    var _ttl_s: Int
 
     def __init__(
-        out self, key: List[UInt8], cookie_name: String = "flare_session"
-    ):
-        if len(key) < 16:
-            self._key = List[UInt8]()  # marker for invalid
-        else:
-            self._key = key.copy()
+        out self,
+        key: List[UInt8],
+        cookie_name: String = "flare_session",
+        ttl_s: Int = DEFAULT_SESSION_TTL_S,
+    ) raises:
+        """Sign and verify with ``key``.
+
+        Args:
+            key: HMAC key, at least ``MIN_SESSION_KEY_BYTES`` bytes.
+            cookie_name: Name of the session cookie.
+            ttl_s: Lifetime of a cookie in seconds, counted from
+                :meth:`encode`. ``0`` (or negative) issues cookies that
+                never expire.
+
+        Raises:
+            Error: If ``key`` is shorter than ``MIN_SESSION_KEY_BYTES``.
+                There is no default constructor: a store without a real
+                key cannot be made.
+        """
+        _require_session_key(key, "CookieSessionStore")
+        self._key = key.copy()
         self._previous_keys = List[List[UInt8]]()
         self._cookie_name = cookie_name
+        self._ttl_s = ttl_s
 
-    def add_previous_key(mut self, key: List[UInt8]):
+    def add_previous_key(mut self, key: List[UInt8]) raises:
         """Accept ``key`` as a valid signing key for inbound cookies.
 
         Used during key rotation: set ``self._key`` to the new key,
         keep the old key here so existing browsers' cookies still
         verify until their natural expiry.
+
+        Raises:
+            Error: If ``key`` is shorter than ``MIN_SESSION_KEY_BYTES``.
         """
+        _require_session_key(key, "CookieSessionStore.add_previous_key")
         self._previous_keys.append(key.copy())
 
     def cookie_name(self) -> String:
@@ -336,8 +404,15 @@ struct CookieSessionStore(Copyable, Defaultable, SessionStore):
         """Look up the session cookie on ``req`` and return a Session.
 
         Returns ``Session.empty()`` for any failure mode (cookie
-        missing, malformed, MAC fails). Never raises — handlers can
-        treat the result as authoritative.
+        missing, malformed, MAC fails, expired, no expiry). Never
+        raises -- handlers can treat the result as authoritative.
+        """
+        return self.load_at(req, _wall_clock_s())
+
+    def load_at(self, req: Request, now_s: Int) -> Session:
+        """:meth:`load` with the current epoch second given by the caller.
+
+        A cookie whose expiry is ``<= now_s`` is refused.
         """
         var cookie_value = req.cookie(self._cookie_name)
         if cookie_value.byte_length() == 0:
@@ -348,25 +423,49 @@ struct CookieSessionStore(Copyable, Defaultable, SessionStore):
             keys.append(k.copy())
         try:
             var payload = signed_cookie_decode_keys(cookie_value, keys)
-            var out = String(capacity_bytes=len(payload) + 1)
-            for b in payload:
-                out += chr(Int(b))
-            return Session(out^)
+            # "<expiry>|<value>": digits up to the first '|'.
+            var bar = -1
+            var exp = 0
+            for i in range(len(payload)):
+                var c = Int(payload[i])
+                if c == 124:  # '|'
+                    bar = i
+                    break
+                if c < 48 or c > 57 or i >= 18:
+                    return Session.empty()
+                exp = exp * 10 + (c - 48)
+            if bar < 1:
+                return Session.empty()
+            if exp != 0 and now_s >= exp:
+                return Session.empty()
+            var out = utf8_lossy_string(Span[UInt8, _](payload)[bar + 1 :])
+            return Session(out)
         except:
             return Session.empty()
 
     def encode(self, value: String) raises -> String:
-        """Return a signed-cookie value carrying ``value`` as payload."""
+        """Return a signed-cookie value carrying ``value`` as payload,
+        expiring ``ttl_s`` seconds from now."""
+        return self.encode_at(value, _wall_clock_s())
+
+    def encode_at(self, value: String, now_s: Int) raises -> String:
+        """:meth:`encode` with the current epoch second given by the caller."""
         if len(self._key) < 16:
             raise Error("CookieSessionStore: signing key shorter than 16 bytes")
-        return signed_cookie_encode(List[UInt8](value.as_bytes()), self._key)
+        var exp = 0 if self._ttl_s <= 0 else now_s + self._ttl_s
+        var payload = String(exp) + "|" + value
+        return signed_cookie_encode(List[UInt8](payload.as_bytes()), self._key)
 
 
 # ── InMemorySessionStore: signed cookie carries an opaque id ──────────────
 
 
-struct InMemorySessionStore(Copyable, Defaultable, SessionStore):
+struct InMemorySessionStore(Copyable, SessionStore):
     """Server-side session table keyed by signed session id.
+
+    Entries expire ``ttl_s`` seconds after they are inserted (default
+    :data:`DEFAULT_SESSION_TTL_S`; ``0`` = never). :meth:`load` refuses an
+    expired entry and :meth:`sweep` evicts them.
 
     Concurrency note: the implementation is single-worker; for
     multi-worker mode the store is per-worker (each worker keeps
@@ -379,37 +478,55 @@ struct InMemorySessionStore(Copyable, Defaultable, SessionStore):
     var _cookie_name: String
     var _ids: List[String]
     var _values: List[String]
-
-    def __init__(out self):
-        self._key = List[UInt8]()
-        self._previous_keys = List[List[UInt8]]()
-        self._cookie_name = "flare_session"
-        self._ids = List[String]()
-        self._values = List[String]()
+    var _expiry: List[Int]
+    var _ttl_s: Int
 
     def __init__(
-        out self, key: List[UInt8], cookie_name: String = "flare_session"
-    ):
-        if len(key) < 16:
-            self._key = List[UInt8]()
-        else:
-            self._key = key.copy()
+        out self,
+        key: List[UInt8],
+        cookie_name: String = "flare_session",
+        ttl_s: Int = DEFAULT_SESSION_TTL_S,
+    ) raises:
+        """Sign and verify session ids with ``key``.
+
+        Args:
+            key: HMAC key, at least ``MIN_SESSION_KEY_BYTES`` bytes.
+            cookie_name: Name of the session cookie.
+            ttl_s: Lifetime of an entry in seconds, counted from
+                :meth:`insert`. ``0`` (or negative) = never expires.
+
+        Raises:
+            Error: If ``key`` is shorter than ``MIN_SESSION_KEY_BYTES``.
+        """
+        _require_session_key(key, "InMemorySessionStore")
+        self._key = key.copy()
         self._previous_keys = List[List[UInt8]]()
         self._cookie_name = cookie_name
         self._ids = List[String]()
         self._values = List[String]()
+        self._expiry = List[Int]()
+        self._ttl_s = ttl_s
 
     def cookie_name(self) -> String:
         return self._cookie_name
 
     def insert(mut self, id: String, value: String):
-        """Replace any existing entry for ``id`` with ``value``."""
+        """Replace any existing entry for ``id`` with ``value``; it
+        expires ``ttl_s`` seconds from now."""
+        self.insert_at(id, value, _wall_clock_s())
+
+    def insert_at(mut self, id: String, value: String, now_s: Int):
+        """:meth:`insert` with the current epoch second given by the
+        caller. Replacing an entry restarts its lifetime."""
+        var exp = 0 if self._ttl_s <= 0 else now_s + self._ttl_s
         for i in range(len(self._ids)):
             if self._ids[i] == id:
                 self._values[i] = value
+                self._expiry[i] = exp
                 return
         self._ids.append(id)
         self._values.append(value)
+        self._expiry.append(exp)
 
     def remove(mut self, id: String) -> Bool:
         """Drop the entry for ``id``. Returns ``True`` if present."""
@@ -417,8 +534,23 @@ struct InMemorySessionStore(Copyable, Defaultable, SessionStore):
             if self._ids[i] == id:
                 _ = self._ids.pop(i)
                 _ = self._values.pop(i)
+                _ = self._expiry.pop(i)
                 return True
         return False
+
+    def sweep(mut self, now_s: Int) -> Int:
+        """Evict every entry expired at ``now_s``; return the count."""
+        var removed = 0
+        var i = 0
+        while i < len(self._ids):
+            if self._expiry[i] != 0 and now_s >= self._expiry[i]:
+                _ = self._ids.pop(i)
+                _ = self._values.pop(i)
+                _ = self._expiry.pop(i)
+                removed += 1
+            else:
+                i += 1
+        return removed
 
     def encode_id(self, id: String) raises -> String:
         """Wrap ``id`` in a signed cookie value."""
@@ -429,6 +561,12 @@ struct InMemorySessionStore(Copyable, Defaultable, SessionStore):
         return signed_cookie_encode(List[UInt8](id.as_bytes()), self._key)
 
     def load(self, req: Request) -> Session:
+        """Look up the session for ``req``; empty if the cookie is
+        missing, forged, unknown or expired."""
+        return self.load_at(req, _wall_clock_s())
+
+    def load_at(self, req: Request, now_s: Int) -> Session:
+        """:meth:`load` with the current epoch second given by the caller."""
         var cookie_value = req.cookie(self._cookie_name)
         if cookie_value.byte_length() == 0:
             return Session.empty()
@@ -438,11 +576,11 @@ struct InMemorySessionStore(Copyable, Defaultable, SessionStore):
             keys.append(k.copy())
         try:
             var payload = signed_cookie_decode_keys(cookie_value, keys)
-            var id_str = String(capacity_bytes=len(payload) + 1)
-            for b in payload:
-                id_str += chr(Int(b))
+            var id_str = utf8_lossy_string(Span[UInt8, _](payload))
             for i in range(len(self._ids)):
                 if self._ids[i] == id_str:
+                    if self._expiry[i] != 0 and now_s >= self._expiry[i]:
+                        return Session.empty()
                     return Session(self._values[i])
             return Session.empty()
         except:
@@ -579,10 +717,24 @@ struct BackedSessionStore[B: SessionBackend](Copyable):
         var backend: Self.B,
         key: List[UInt8],
         cookie_name: String = "flare_session",
-        ttl_s: Int = 0,
-    ):
+        ttl_s: Int = DEFAULT_SESSION_TTL_S,
+    ) raises:
+        """Sign session ids with ``key`` and keep values in ``backend``.
+
+        Args:
+            backend: The storage backend (ownership transferred).
+            key: HMAC key, at least ``MIN_SESSION_KEY_BYTES`` bytes.
+            cookie_name: Name of the session cookie.
+            ttl_s: Lifetime of a saved session in seconds (default
+                :data:`DEFAULT_SESSION_TTL_S`). ``0`` (or negative) saves
+                sessions that never expire.
+
+        Raises:
+            Error: If ``key`` is shorter than ``MIN_SESSION_KEY_BYTES``.
+        """
+        _require_session_key(key, "BackedSessionStore")
         self._backend = backend^
-        self._key = key.copy() if len(key) >= 16 else List[UInt8]()
+        self._key = key.copy()
         self._cookie_name = cookie_name
         self._ttl_s = ttl_s
 
@@ -595,9 +747,7 @@ struct BackedSessionStore[B: SessionBackend](Copyable):
             return Optional[String]()
         try:
             var payload = signed_cookie_decode(cv, self._key)
-            var id = String(capacity_bytes=len(payload) + 1)
-            for b in payload:
-                id += chr(Int(b))
+            var id = utf8_lossy_string(Span[UInt8, _](payload))
             return Optional[String](id^)
         except:
             return Optional[String]()

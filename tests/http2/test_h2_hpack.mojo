@@ -312,6 +312,158 @@ def test_encoder_status_uses_static_name_index() raises:
     assert_true(len(wire) <= 6)
 
 
+def test_decode_keeps_non_ascii_octets_exact() raises:
+    """UTF-8 values used to be rebuilt byte by byte through chr(), which
+    double-encoded them and made the dynamic table count more bytes
+    than the peer's."""
+    var dec = HpackDecoder()
+    var b = List[UInt8]()
+    b.append(UInt8(0x40))  # literal with incremental indexing, new name
+    var name = String("x-name")
+    b.append(UInt8(name.byte_length()))
+    for c in name.as_bytes():
+        b.append(c)
+    var v = String("café 世界")
+    b.append(UInt8(v.byte_length()))
+    for c in v.as_bytes():
+        b.append(c)
+    var hdrs = dec.decode(Span[UInt8, _](b))
+    assert_equal(hdrs[0].value, v)
+    assert_equal(hdrs[0].value.byte_length(), v.byte_length())
+    # RFC 7541 sec 4.1: entry size is name + value octets + 32.
+    assert_equal(dec.dynamic_size, name.byte_length() + v.byte_length() + 32)
+
+
+def test_default_decoder_accepts_a_real_servers_huffman_headers() raises:
+    """A response header block captured from httpbin.org over h2. It is
+    Huffman-coded, as every real server's is; the default decoder
+    rejected it with "Huffman-coded string not supported", which the
+    HTTP client turned into COMPRESSION_ERROR."""
+    from flare.http2.client import Http2ClientConfig
+
+    var hx = String(
+        "886196d07abe9413ca6e2d6a080271410ae09fb80754c5a37f5f8b1d75d0620d"
+        "263d4c7441ea5c033432390085416cee5b3f8b9ada8c43d953017d77d707"
+    )
+    var b = hx.as_bytes()
+    var blk = List[UInt8]()
+    var i = 0
+    while i + 1 < len(b):
+        var hi = Int(b[i])
+        var lo = Int(b[i + 1])
+        hi = hi - 48 if hi < 58 else hi - 87
+        lo = lo - 48 if lo < 58 else lo - 87
+        blk.append(UInt8(hi * 16 + lo))
+        i += 2
+    var dec = HpackDecoder()
+    var hs = dec.decode(Span[UInt8, _](blk))
+    var ct = String("")
+    var server = String("")
+    for h in hs:
+        if h.name == "content-type":
+            ct = h.value.copy()
+        if h.name == "server":
+            server = h.value.copy()
+    assert_equal(ct, "application/json")
+    assert_equal(server, "gunicorn/19.9.0")
+    assert_true(Http2ClientConfig().allow_huffman_decode)
+
+
+def _literal_with_indexing(name: String, value: List[UInt8]) -> List[UInt8]:
+    """Literal Header Field with Incremental Indexing, new name, no Huffman."""
+    var b = List[UInt8]()
+    b.append(UInt8(0x40))
+    b.append(UInt8(name.byte_length()))
+    for c in name.as_bytes():
+        b.append(c)
+    b.append(UInt8(0x7F))  # H=0, length prefix saturated: 127 + extension
+    var rest = len(value) - 127
+    while rest >= 128:
+        b.append(UInt8(0x80 | (rest & 0x7F)))
+        rest >>= 7
+    b.append(UInt8(rest))
+    for c in value:
+        b.append(c)
+    return b^
+
+
+def test_invalid_utf8_value_keeps_the_table_in_step_with_the_peer() raises:
+    """HPACK-01: a legal value made of 0xFF octets must be stored byte for
+    byte. Rebuilding it as lossy UTF-8 (each bad octet becomes U+FFFD, 3
+    octets) made the entry bigger than the peer's, evicted entries the peer
+    still indexes, and killed the connection on the next block (RFC 7541
+    sec 4.1)."""
+    var dec = HpackDecoder()
+    var v1 = List[UInt8](length=500, fill=UInt8(ord("a")))
+    var v2 = List[UInt8](length=1300, fill=UInt8(0xFF))
+    _ = dec.decode(Span[UInt8, _](_literal_with_indexing("x-1", v1)))
+    var h2 = dec.decode(Span[UInt8, _](_literal_with_indexing("x-2", v2)))
+    # Stored and returned exactly as sent.
+    assert_equal(h2[0].value.byte_length(), 1300)
+    var raw = h2[0].value.as_bytes()
+    for i in range(1300):
+        assert_equal(Int(raw[i]), 0xFF)
+    # The peer's table: 535 + 1335 octets, both entries still present.
+    assert_equal(dec.dynamic_size, (3 + 500 + 32) + (3 + 1300 + 32))
+    var idx = List[UInt8]()
+    idx.append(UInt8(0x80 | 63))  # the second dynamic entry: x-1
+    var h3 = dec.decode(Span[UInt8, _](idx))
+    assert_equal(len(h3), 1)
+    assert_equal(h3[0].name, "x-1")
+    assert_equal(h3[0].value.byte_length(), 500)
+
+
+def _literal_block(name: String, value_len: Int) -> List[UInt8]:
+    """One Literal-without-Indexing field with a new name: the field is
+    ``name.byte_length() + value_len + 32`` octets by RFC 7541 sec 4.1."""
+    var block = List[UInt8]()
+    block.append(UInt8(0x00))
+    block.append(UInt8(name.byte_length()))
+    for i in range(name.byte_length()):
+        block.append(name.as_bytes()[i])
+    block.append(UInt8(value_len))
+    for _ in range(value_len):
+        block.append(UInt8(ord("a")))
+    return block^
+
+
+def test_the_last_field_of_a_block_counts_against_the_budget() raises:
+    """HPACK-02: every decoded field is charged, the last one included. A
+    one-field block of 133 octets used to pass a budget of 50, since a
+    field was only charged when the next one was about to be decoded."""
+    var dec = HpackDecoder()
+    var block = _literal_block("x", 100)
+    with assert_raises():
+        _ = dec.decode(Span[UInt8, _](block), 50)
+
+
+def test_the_budget_is_inclusive_and_covers_the_whole_block() raises:
+    """HPACK-02: a block exactly at the budget decodes; one octet under
+    is refused, whether the overrun is the first, the last or the sum."""
+    var block = _literal_block("x", 100)  # 133
+    var dec = HpackDecoder()
+    assert_equal(len(dec.decode(Span[UInt8, _](block), 133)), 1)
+    var dec2 = HpackDecoder()
+    with assert_raises():
+        _ = dec2.decode(Span[UInt8, _](block), 132)
+    # Two fields of 33 + 33 = 66 octets: the sum, not one field, trips it.
+    var two = _literal_block("x", 0)
+    two.extend(_literal_block("y", 0))
+    var dec3 = HpackDecoder()
+    assert_equal(len(dec3.decode(Span[UInt8, _](two), 66)), 2)
+    var dec4 = HpackDecoder()
+    with assert_raises():
+        _ = dec4.decode(Span[UInt8, _](two), 65)
+
+
+def test_no_budget_means_unlimited() raises:
+    """HPACK-02: budget 0 (the default) keeps the old unbounded behaviour."""
+    var dec = HpackDecoder()
+    var block = _literal_block("x", 100)
+    assert_equal(len(dec.decode(Span[UInt8, _](block))), 1)
+    assert_equal(len(dec.decode(Span[UInt8, _](block), 0)), 1)
+
+
 def main() raises:
     test_decode_integer_short()
     test_rfc_7541_c1_5bit_1337()
@@ -328,4 +480,10 @@ def main() raises:
     test_encoder_decoder_roundtrip_with_huffman()
     test_encoder_huffman_picks_shorter_form()
     test_encoder_status_uses_static_name_index()
-    print("test_h2_hpack: 15 passed")
+    test_decode_keeps_non_ascii_octets_exact()
+    test_default_decoder_accepts_a_real_servers_huffman_headers()
+    test_invalid_utf8_value_keeps_the_table_in_step_with_the_peer()
+    test_the_last_field_of_a_block_counts_against_the_budget()
+    test_the_budget_is_inclusive_and_covers_the_whole_block()
+    test_no_budget_means_unlimited()
+    print("test_h2_hpack: 21 passed")

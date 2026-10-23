@@ -101,6 +101,7 @@ struct StepResult(Copyable, ImplicitlyCopyable):
     var done: Bool
     var idle_timeout_ms: Int
     var h2c_upgrade: Bool
+    var ws_upgrade: Bool
 
     def __init__(
         out self,
@@ -109,6 +110,7 @@ struct StepResult(Copyable, ImplicitlyCopyable):
         done: Bool = False,
         idle_timeout_ms: Int = -1,
         h2c_upgrade: Bool = False,
+        ws_upgrade: Bool = False,
     ):
         """Construct a StepResult.
 
@@ -121,12 +123,14 @@ struct StepResult(Copyable, ImplicitlyCopyable):
             h2c_upgrade: True when the unified reactor should migrate
                 this fd from ``KIND_H1`` to ``KIND_H2`` after the 101
                 Switching Protocols response has been flushed.
+            ws_upgrade: Likewise, to ``KIND_WS`` after a WebSocket 101.
         """
         self.want_read = want_read
         self.want_write = want_write
         self.done = done
         self.idle_timeout_ms = idle_timeout_ms
         self.h2c_upgrade = h2c_upgrade
+        self.ws_upgrade = ws_upgrade
 
 
 # ── Monotonic clock + small ASCII helpers ─────────────────────────────────────
@@ -348,6 +352,49 @@ def _compact_read_buf_drop_prefix(
 
 
 @always_inline
+def _eq_lower_lit(data: Span[UInt8, _], at: Int, lit: StaticString) -> Bool:
+    """True when ``data[at : at + len(lit)]`` equals the lowercase literal
+    ``lit`` ignoring ASCII case. The caller guarantees the bounds."""
+    var lp = lit.unsafe_ptr()
+    for j in range(lit.byte_length()):
+        var c = data[at + j]
+        if c >= 65 and c <= 90:
+            c = c + 32
+        if c != lp[unsafe_offset=j]:
+            return False
+    return True
+
+
+def _conn_token_mask(data: Span[UInt8, _], start: Int, end: Int) -> Int:
+    """Scan the ``Connection`` option list ``data[start:end]``
+    (RFC 9110 sec 7.6.1: ``#connection-option``): split on ``,``, trim
+    spaces / tabs, compare each option case-insensitively.
+
+    Returns a bit mask: ``1`` when some option is ``close``, ``2`` when some
+    option is ``keep-alive``.
+    """
+    var mask = 0
+    var i = start
+    while i <= end:
+        var j = i
+        while j < end and data[j] != 44:
+            j += 1
+        var a = i
+        var b = j
+        while a < b and (data[a] == 32 or data[a] == 9):
+            a += 1
+        while b > a and (data[b - 1] == 32 or data[b - 1] == 9):
+            b -= 1
+        var n = b - a
+        if n == 5 and _eq_lower_lit(data, a, "close"):
+            mask |= 1
+        elif n == 10 and _eq_lower_lit(data, a, "keep-alive"):
+            mask |= 2
+        i = j + 1
+    return mask
+
+
+@always_inline
 def _compute_close_after(req_headers: HeaderMap, req_version: String) -> Bool:
     """Decide whether to close the connection after this request,
     based on RFC 9112 keep-alive policy.
@@ -357,19 +404,13 @@ def _compute_close_after(req_headers: HeaderMap, req_version: String) -> Bool:
     ``Connection: keep-alive`` and ``Connection: close`` short-
     circuit the per-request ``_ascii_lower`` allocation when the
     header value matches the lowercase wire form most HTTP/1.1
-    clients send. Mixed-case + uncommon values fall through to
-    the slow allocation path.
+    clients send. Mixed-case values and option lists
+    (``keep-alive, close``) fall through to the token scan.
 
     Caller still needs to combine this with config.max_keepalive_-
     requests + config.keep_alive (those are per-server policy, not
     per-request).
     """
-    # Imported lazily to keep this module's top-level import block
-    # free of ``flare.http.server`` -- the helper only fires on the
-    # mixed-case slow path so the deferred import never bites the
-    # hot-path lowercase branch.
-    from flare.http.server import _ascii_lower
-
     var conn_hdr = req_headers.get("connection")
     var is_http10 = req_version == "HTTP/1.0"
     if _connection_is_close(conn_hdr):
@@ -380,13 +421,37 @@ def _compute_close_after(req_headers: HeaderMap, req_version: String) -> Bool:
         # No Connection header. RFC 9112: HTTP/1.1 is keep-alive
         # by default; HTTP/1.0 is close by default.
         return is_http10
-    # Slow path: lowercase + compare. Reachable on mixed-case
-    # ``Keep-Alive`` etc.
-    var lo = _ascii_lower(conn_hdr)
-    if lo == "close":
+    # Slow path: the value is an option list (``keep-alive, close``,
+    # ``TE, close``) or a mixed-case single option. Split on commas.
+    var mask = _conn_token_mask(conn_hdr.as_bytes(), 0, conn_hdr.byte_length())
+    if mask & 1 != 0:
         return True
-    if is_http10 and lo != "keep-alive":
+    if is_http10 and mask & 2 == 0:
         return True
+    return False
+
+
+def _has_header_line(
+    data: List[UInt8], header_end: Int, lower_name: StaticString
+) -> Bool:
+    """Whether a header line in ``data[:header_end]`` starts with
+    ``lower_name`` (which ends in ``:``), compared case-insensitively."""
+    var np = lower_name.unsafe_ptr()
+    var nn = lower_name.byte_length()
+    var i = 1
+    while i + nn <= header_end:
+        if data[i - 1] == 10:
+            var found = True
+            for j in range(nn):
+                var c = data[i + j]
+                if c >= 65 and c <= 90:
+                    c = c + 32
+                if c != np[unsafe_offset=j]:
+                    found = False
+                    break
+            if found:
+                return True
+        i += 1
     return False
 
 
@@ -396,7 +461,9 @@ def _wants_close(data: List[UInt8], header_end: Int) -> Bool:
 
     Returns True when the request line declares HTTP/1.0 without a
     ``Connection: keep-alive`` override, or when any ``Connection:``
-    header value equals ``close`` (case-insensitive).
+    header line (``connection:`` at the start of a line, so not
+    ``X-Connection:``; every such line is examined) lists the option
+    ``close`` (case-insensitive, comma-separated option list).
 
     Operates directly on bytes so the static fast path doesn't need to
     construct a ``Request`` / ``HeaderMap``.
@@ -426,8 +493,11 @@ def _wants_close(data: List[UInt8], header_end: Int) -> Bool:
         if is_match:
             version_is_10 = True
             break
-    # 2. Connection header. Case-insensitive name match, value compared
-    # against "close" and "keep-alive" (lowercase).
+    # 2. Connection header. Case-insensitive name match at the START OF A
+    # HEADER LINE only (so ``X-Connection:`` does not count), value
+    # compared against "close" and "keep-alive" (case-insensitive). Every
+    # ``Connection`` line is examined and the verdicts are OR-ed
+    # (RFC 9110 sec 7.6.1: the field may repeat).
     var needle = "connection:"
     var np = needle.unsafe_ptr()
     var nn = needle.byte_length()
@@ -435,6 +505,9 @@ def _wants_close(data: List[UInt8], header_end: Int) -> Bool:
     var conn_keepalive = False
     var i = first_eol + 1
     while i < n - nn:
+        if data[i - 1] != 10:  # not at a line start
+            i += 1
+            continue
         var found = True
         for j in range(nn):
             var c = data[i + j]
@@ -447,35 +520,16 @@ def _wants_close(data: List[UInt8], header_end: Int) -> Bool:
             var pos = i + nn
             while pos < n and (data[pos] == 32 or data[pos] == 9):
                 pos += 1
-            # Compare value until CR, LF, or end-of-header-block.
+            # Value runs until CR, LF, or end-of-header-block.
             var v_end = pos
             while v_end < n and data[v_end] != 13 and data[v_end] != 10:
                 v_end += 1
-            # Lowercase slice compare against "close" and "keep-alive".
-            var val_len = v_end - pos
-            if val_len == 5:
-                var ck = True
-                for j in range(5):
-                    var c = data[pos + j]
-                    if c >= 65 and c <= 90:
-                        c = c + 32
-                    if c != UInt8(ord("close"[byte=j])):
-                        ck = False
-                        break
-                if ck:
-                    conn_close = True
-            if val_len == 10:
-                var ck2 = True
-                for j in range(10):
-                    var c = data[pos + j]
-                    if c >= 65 and c <= 90:
-                        c = c + 32
-                    if c != UInt8(ord("keep-alive"[byte=j])):
-                        ck2 = False
-                        break
-                if ck2:
-                    conn_keepalive = True
-            break
+            # Option-list scan (``keep-alive, close`` closes).
+            var mask = _conn_token_mask(Span(data), pos, v_end)
+            if mask & 1 != 0:
+                conn_close = True
+            if mask & 2 != 0:
+                conn_keepalive = True
         i += 1
     if conn_close:
         return True

@@ -35,8 +35,8 @@ Linux, opt-in ``io_uring`` on Linux >= 6.0 via
 or compiled-down structs, an RFC 7230 parser under continuous fuzzing (62
 fuzz harnesses across the tree, 9M+ runs combined, zero known crashes), and a ``Cancel`` token plumbed to handlers via
 ``CancelHandler``. ``num_workers=1`` is a single-threaded
-reactor; ``num_workers=N`` with ``N >= 2`` runs N pthread
-workers behind per-worker ``SO_REUSEPORT`` listeners by default
+reactor; ``num_workers=N`` with ``N >= 2`` runs N
+workers (on Mojo's AsyncRT pool) behind per-worker ``SO_REUSEPORT`` listeners by default
 (matches actix_web's listener strategy and gives the highest
 steady-state throughput). Set ``FLARE_REUSEPORT_WORKERS=0`` to
 opt into the single shared listener with ``EPOLLEXCLUSIVE`` --
@@ -44,7 +44,7 @@ trades 7-22 % req/s (handler vs static fast path) for a
 uniformly tighter p99.99 tail under sustained load. See
 ``docs/benchmark.md`` for the head-to-head numbers. Static
 endpoints can skip the parser entirely with
-``serve_static(resp)``.
+``serve_static(resp, num_workers=N)``.
 
 The operational core: per-request / handler / body-read deadlines,
 ``HttpServer.drain(timeout_ms)`` for graceful shutdown, sanitised
@@ -54,7 +54,7 @@ streaming response primitives (``Body`` / ``ChunkSource`` /
 ``StreamingResponse[B]``; ``stream_response(source)`` streams the same
 handler byte-identically over h1 / h2 / h3 / https), and server-side
 TLS (``TlsAcceptor`` over OpenSSL, plus in-process HTTPS termination
-via ``HttpServer.bind_tls`` / ``serve_tls``).
+via ``HttpServer.bind_tls`` + ``serve``).
 
 The application layer: ``Router`` with path params, typed
 extractors (``PathInt`` / ``QueryInt`` /
@@ -69,8 +69,8 @@ HMAC-SHA256 signed cookies, and signed ``Session`` stores.
 ```
 flare.io       - BufReader
 flare.ws       - WebSocket client + server (RFC 6455, permessage-deflate
-                 with context-takeover, WS-over-h2 via RFC 8441
-                 Extended CONNECT)
+                 with context-takeover, WS-over-h2 via RFC 8441 and
+                 WS-over-h3 via RFC 9220 Extended CONNECT)
 flare.http2    - HTTP/2 frame codec + HPACK (with table-driven Huffman
                  fast decoder) + h2c upgrade (RFC 9113 / 7541)
 flare.http     - HTTP/1.1 client + reactor server + Router /
@@ -110,7 +110,8 @@ flare.quic     - Sans-I/O QUIC v1 codec primitives (varint, long /
                  §13 connection + stream state machines, plus the live
                  ``QuicListener`` UDP reactor, the ``QuicClientConnection``
                  client driver (incl. resumption + 0-RTT EarlyData
-                 send flight), and the rustls QUIC TLS drive that
+                 send flight, NEW_TOKEN, ECN, ACK_FREQUENCY and path-MTU
+                 discovery), and the rustls QUIC TLS drive that
                  carry HTTP/3 end-to-end
 flare.http3       - Sans-I/O HTTP/3 frame codec, SETTINGS payload,
                  request-stream reader (``Http3RequestReader`` +
@@ -130,7 +131,8 @@ flare.qpack    - Sans-I/O static-only QPACK encoder / decoder for
                  HTTP/3 field sections (RFC 9204 Appendix A static
                  table + literal + Huffman, shared with HPACK)
 flare.crypto   - HMAC-SHA256, base64url
-flare.tls      - TLS 1.2/1.3 (OpenSSL, client + server, ALPN, session resumption)
+flare.tls      - TLS 1.2/1.3 (OpenSSL, client + server, ALPN, session resumption,
+                 SNI certificates, certificate hot reload)
 flare.tcp      - TcpStream + TcpListener (IPv4 + IPv6)
 flare.udp      - UdpSocket (IPv4 + IPv6)
 flare.uds      - UnixListener + UnixStream (AF_UNIX sidecar IPC);
@@ -329,7 +331,7 @@ def main() raises:
 
 Every server example above takes an optional ``num_workers``. At
 ``1`` (the default) it's the single-threaded reactor. Set it to
-``default_worker_count()`` and flare runs N pthread workers,
+``default_worker_count()`` and flare runs N workers,
 each with its own reactor + timer wheel, with per-core pinning
 on Linux. The handler type is unchanged.
 
@@ -389,14 +391,14 @@ def main() raises:
 
 Keep-alive and ``Connection: close`` wire forms are both pre-encoded;
 the reactor picks the right one per request from the parsed Connection
-header.
+header. ``serve_static(resp, num_workers=N)`` fans the same fast path
+out across ``N`` worker threads, each with its own listener.
 
-## Comptime handler + config
+## Comptime config checks
 
-For single-handler servers, ``serve_comptime[handler, config]`` specialises
-the reactor loop at compile time and enforces configuration invariants via
-Mojo ``comptime assert`` so misconfigured servers fail the build rather
-than the first request:
+``ServerConfig.check[config]()`` validates a comptime ``ServerConfig``
+through Mojo ``comptime assert`` so misconfigured servers fail the
+build rather than the first request:
 
 ```mojo
 from flare.http import HttpServer, Request, Response, ok
@@ -407,7 +409,6 @@ from flare.net import SocketAddr
 def hello(req: Request) raises -> Response:
     return ok("hello")
 
-comptime HELLO: FnHandler = FnHandler(hello)
 comptime CONFIG: ServerConfig = ServerConfig(
     max_header_size=4096,
     max_body_size=64 * 1024, # must be >= max_header_size (compile time)
@@ -416,8 +417,9 @@ comptime CONFIG: ServerConfig = ServerConfig(
 )
 
 def main() raises:
-    var srv = HttpServer.bind(SocketAddr.localhost(8080))
-    srv.serve_comptime[HELLO, CONFIG]()
+    ServerConfig.check[CONFIG]()
+    var srv = HttpServer.bind(SocketAddr.localhost(8080), materialize[CONFIG]())
+    srv.serve(FnHandler(hello))
 ```
 
 Break any invariant (e.g. ``max_body_size < max_header_size``) and Mojo
@@ -714,7 +716,7 @@ from .http.session import (
 
 # TLS
 from .tls.config import TlsConfig
-from .tls.acceptor import TlsAcceptor, TlsServerConfig
+from .tls.acceptor import TlsAcceptor, TlsServerConfig, TlsSniCert
 
 # Networking
 from .net.address import IpAddr, SocketAddr

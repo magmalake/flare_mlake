@@ -35,6 +35,7 @@ from flare.quic import (
 )
 from flare.tls import QuicEncryptionLevel, RustlsQuicConfig
 from flare.quic.server import _ack_record, _ack_from_ranges
+from flare.quic._server_support import _ACK_MAX_RANGES, _ack_contains
 
 
 def _load_fixture_pem() raises -> Tuple[String, String]:
@@ -180,7 +181,7 @@ def test_handle_inbound_drops_handshake_without_sentinel() raises:
     for i in range(40):
         dg.append(UInt8(i))
     # Must not raise (silent drop).
-    listener._handle_inbound(0, Span[UInt8, _](dg))
+    _ = listener._handle_inbound(0, Span[UInt8, _](dg))
     assert_true(listener.connections[0].alive)
     assert_equal(len(listener.connections[0].conn.streams), 0)
     listener.shutdown()
@@ -204,7 +205,7 @@ def test_handle_inbound_drops_1rtt_without_sentinel() raises:
         dg.append(dcid.bytes[i])
     for i in range(40):
         dg.append(UInt8(i))
-    listener._handle_inbound(0, Span[UInt8, _](dg))
+    _ = listener._handle_inbound(0, Span[UInt8, _](dg))
     assert_true(listener.connections[0].alive)
     assert_equal(len(listener.connections[0].conn.streams), 0)
     listener.shutdown()
@@ -254,6 +255,88 @@ def test_ack_ranges_duplicate_pn_is_idempotent() raises:
     assert_equal(len(ack.ranges), 0)
 
 
+def test_duplicate_packet_numbers_are_recognised() raises:
+    """1-RTT packets were dispatched without a duplicate check, so a
+    retransmit that crossed our ACK ran its request a second time."""
+    var flat = List[UInt64]()
+    for pn in [0, 1, 2, 5]:
+        _ack_record(flat, UInt64(pn))
+    assert_true(_ack_contains(flat, UInt64(1)))
+    assert_true(_ack_contains(flat, UInt64(5)))
+    assert_false(_ack_contains(flat, UInt64(3)))
+    assert_false(_ack_contains(flat, UInt64(6)))
+    # Once the range list is full, anything older than it counts as
+    # seen: it can no longer be told apart from a replay.
+    var full = List[UInt64]()
+    for k in range(_ACK_MAX_RANGES + 4):
+        _ack_record(full, UInt64(100 + 2 * k))
+    assert_true(_ack_contains(full, UInt64(1)))
+
+
+def test_dropped_ack_ranges_are_not_forgotten() raises:
+    """QUIC-14: packets 0, 2, 4, ..., 64 make 33 ranges, so [0, 0] is
+    dropped at the cap. A later packet 3 merges [2,2], [3,3] and [4,4]
+    (31 ranges left); packet 0 must still read as received, or the
+    server would dispatch it a second time (RFC 9000 sec 13.2.3)."""
+    var flat = List[UInt64]()
+    for k in range(_ACK_MAX_RANGES + 1):
+        _ack_record(flat, UInt64(2 * k))
+    assert_true(_ack_contains(flat, UInt64(0)))
+    _ack_record(flat, UInt64(3))
+    assert_true(_ack_contains(flat, UInt64(0)), "packet 0 forgotten")
+    # Every packet that was received still reads as seen.
+    for k in range(_ACK_MAX_RANGES + 1):
+        assert_true(_ack_contains(flat, UInt64(2 * k)))
+    assert_true(_ack_contains(flat, UInt64(3)))
+    # A number above the floor that was never received is still new.
+    assert_false(_ack_contains(flat, UInt64(5)))
+    assert_false(_ack_contains(flat, UInt64(65)))
+    # The floor is not an ACK range: the frame claims only stored ranges.
+    var ack = _ack_from_ranges(flat, UInt64(0))
+    assert_equal(Int(ack.largest_acknowledged), 64)
+    assert_equal(len(ack.ranges), 30)
+
+
+def test_ack_floor_only_moves_up() raises:
+    """Dropping more ranges raises the floor; merging never lowers it."""
+    var flat = List[UInt64]()
+    for k in range(_ACK_MAX_RANGES + 10):
+        _ack_record(flat, UInt64(2 * k))
+    # Ten ranges ([0,0] .. [18,18]) were dropped: all read as seen, as
+    # does the gap number 17 below the floor (19), but 19 and 21 (kept
+    # gaps) are new.
+    for k in range(10):
+        assert_true(_ack_contains(flat, UInt64(2 * k)))
+    assert_true(_ack_contains(flat, UInt64(17)))
+    assert_false(_ack_contains(flat, UInt64(19)))
+    assert_false(_ack_contains(flat, UInt64(21)))
+    # Filling a kept gap and its neighbour merges ranges but keeps the floor.
+    _ack_record(flat, UInt64(21))
+    _ack_record(flat, UInt64(23))
+    assert_true(_ack_contains(flat, UInt64(0)))
+    assert_true(_ack_contains(flat, UInt64(18)))
+    assert_true(_ack_contains(flat, UInt64(17)))
+    assert_false(_ack_contains(flat, UInt64(19)))
+
+
+def test_packet_number_spaces_are_separate() raises:
+    """One largest-received counter served Initial, Handshake and 1-RTT,
+    so each space's truncated numbers were expanded against another
+    space's largest (RFC 9000 sec 12.3)."""
+    from flare.quic import QuicConnection
+    from flare.quic.packet import ConnectionId
+
+    var qc = QuicConnection(
+        ConnectionId(bytes=List[UInt8](length=8, fill=UInt8(1))),
+        ConnectionId(bytes=List[UInt8](length=8, fill=UInt8(2))),
+    )
+    qc._note_received(0, UInt64(900))
+    qc._note_received(2, UInt64(3))
+    assert_equal(Int(qc.rx_largest[0]), 900)
+    assert_equal(Int(qc.rx_largest[1]), 0)
+    assert_equal(Int(qc.rx_largest[2]), 3)
+
+
 def main() raises:
     test_decrypt_post_initial_raises_slot_out_of_range()
     test_decrypt_post_initial_raises_on_truncated_handshake()
@@ -262,4 +345,8 @@ def main() raises:
     test_ack_ranges_exclude_skipped_pn()
     test_ack_ranges_contiguous_single_range()
     test_ack_ranges_duplicate_pn_is_idempotent()
-    print("test_quic_post_initial_decrypt: 7 passed")
+    test_duplicate_packet_numbers_are_recognised()
+    test_dropped_ack_ranges_are_not_forgotten()
+    test_ack_floor_only_moves_up()
+    test_packet_number_spaces_are_separate()
+    print("test_quic_post_initial_decrypt: 11 passed")

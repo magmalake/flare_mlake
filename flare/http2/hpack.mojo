@@ -33,6 +33,8 @@ inserts evict the oldest entry until ``size <= max_size``.
 
 from std.collections import Optional
 
+from flare.http.hpack_huffman_simd import huffman_decode_simd
+from std.memory import unsafe_memcpy
 from flare.http.hpack_huffman import (
     huffman_decode,
     huffman_encode,
@@ -41,6 +43,35 @@ from flare.http.hpack_huffman import (
 
 
 # ── Integer codec (§5.1) ─────────────────────────────────────────────────
+
+
+def _octets_to_string(b: Span[UInt8, _]) -> String:
+    """A header string's octets as a ``String``, byte for byte.
+
+    The octets are stored unchanged. RFC 7541 sec 4.1 sizes a dynamic table
+    entry as ``name + value + 32`` *octets*, and the encoder and decoder
+    must evict in lockstep, so the decoder must not change a field's
+    length. Two earlier versions did: ``s += chr(byte)`` turned every byte
+    >= 0x80 into a two-byte code point, and the lossy-UTF-8 version
+    replaced each malformed byte by U+FFFD (3 octets). Either way the
+    stored entry was larger than the peer's, the decoder evicted entries
+    the peer still indexed, and a legal block failed with
+    COMPRESSION_ERROR (HPACK-01).
+
+    The result is therefore an octet string that is not necessarily valid
+    UTF-8: RFC 9113 sec 8.2.1 allows any octet in a field value except NUL,
+    CR and LF. Consumers that need text must validate or convert it
+    themselves.
+    """
+    var s = String(unsafe_uninit_length=len(b))
+    if len(b) > 0:
+        unsafe_memcpy(dest=s.unsafe_ptr_mut(), src=b.unsafe_ptr(), count=len(b))
+    return s^
+
+
+comptime HPACK_BUDGET_ERROR: String = (
+    "hpack: header block exceeds decode budget"
+)
 
 
 struct StringPair(Copyable, Defaultable):
@@ -230,13 +261,14 @@ struct HpackDecoder(Copyable, Defaultable):
     A decoder must be reused across all HEADERS frames on a single
     connection so the dynamic table tracks the peer's encoder.
 
-    ``allow_huffman`` gates ``H=1`` literal decoding: when ``False``
-    (default) the decoder raises on Huffman-coded strings, matching
-    the legacy raw-literal-only behaviour byte-for-byte. When
-    ``True`` the decoder routes ``H=1`` literals through the
-    RFC 7541 Appendix B codec in ``flare.http.hpack_huffman``.
-    ``Http2Config.with_config`` plumbs the flag through from user
-    config; tests can flip it directly.
+    ``allow_huffman`` gates ``H=1`` literal decoding. It defaults to
+    ``True``: RFC 7541 sec 5.2 lets any encoder Huffman-code any
+    literal, and real peers (curl, browsers, every CDN front end) do,
+    so a decoder that refuses them cannot talk to them. It used to
+    default to ``False``, which left every ``HpackDecoder()`` -- the
+    HTTP client's among them -- answering a real server's first
+    response with COMPRESSION_ERROR. Setting it ``False`` still makes
+    the decoder raise on ``H=1`` strings, for tests.
     """
 
     var dynamic: List[HpackHeader]
@@ -248,15 +280,24 @@ struct HpackDecoder(Copyable, Defaultable):
     RFC 7541 sec 6.3 bounds an update by the value the decoder
     advertised in SETTINGS_HEADER_TABLE_SIZE, not by the current
     ``max_size``. Comparing against ``max_size`` alone would reject the
-    legal shrink-then-restore pair (``0`` followed by ``4096``)."""
+    legal shrink-then-restore pair (``0`` followed by ``4096``).
+
+    A connection sets this to the SETTINGS_HEADER_TABLE_SIZE it
+    advertises but leaves ``max_size`` at 4096: the peer's encoder keeps
+    that table until it has received the SETTINGS and sent a size update
+    (RFC 7541 sec 4.2, RFC 9113 sec 6.5.3), and only that update lowers
+    ``max_size``."""
     var allow_huffman: Bool
+    var static: List[HpackHeader]
+    """RFC 7541 Appendix A, built once per decoder rather than per block."""
 
     def __init__(out self):
         self.dynamic = List[HpackHeader]()
         self.dynamic_size = 0
         self.max_size = 4096
         self.settings_max_size = 4096
-        self.allow_huffman = False
+        self.allow_huffman = True
+        self.static = _static_table()
 
     def _entry_size(self, h: HpackHeader) -> Int:
         return h.name.byte_length() + h.value.byte_length() + 32
@@ -289,13 +330,11 @@ struct HpackDecoder(Copyable, Defaultable):
         self.dynamic[0] = ins^
         self.dynamic_size += sz
 
-    def _lookup(
-        self, idx: Int, static: Span[HpackHeader, _]
-    ) raises -> HpackHeader:
+    def _lookup(self, idx: Int) raises -> HpackHeader:
         if idx <= 0:
             raise Error("hpack: index 0")
         if idx <= STATIC_TABLE_LEN:
-            return static[idx].copy()
+            return self.static[idx].copy()
         var d = idx - STATIC_TABLE_LEN - 1
         if d >= len(self.dynamic):
             raise Error("hpack: dynamic index out of range")
@@ -319,30 +358,57 @@ struct HpackDecoder(Copyable, Defaultable):
             var encoded = buf[off : off + slen]
             var decoded = List[UInt8]()
             try:
-                huffman_decode(encoded, decoded)
+                huffman_decode_simd(encoded, decoded)
             except e:
                 raise Error("hpack: Huffman decode failed: " + String(e))
-            var s = String(capacity_bytes=len(decoded) + 1)
-            for i in range(len(decoded)):
-                s += chr(Int(decoded[i]))
-            return StringPair(s^, off + slen)
-        var s = String(capacity_bytes=slen + 1)
-        for i in range(slen):
-            s += chr(Int(buf[off + i]))
-        return StringPair(s^, off + slen)
+            return StringPair(
+                _octets_to_string(Span[UInt8, _](decoded)), off + slen
+            )
+        return StringPair(_octets_to_string(buf[off : off + slen]), off + slen)
 
-    def decode(mut self, buf: Span[UInt8, _]) raises -> List[HpackHeader]:
-        """Decode a HEADERS / CONTINUATION block into header pairs."""
-        var static = _static_table()
-        var headers = List[HpackHeader]()
+    def decode(
+        mut self, buf: Span[UInt8, _], budget: Int = 0
+    ) raises -> List[HpackHeader]:
+        """Decode a HEADERS / CONTINUATION block into header pairs.
+
+        Args:
+            buf: The complete header block.
+            budget: When positive, the most decoded bytes (RFC 7541
+                entry size: name + value + 32, summed) the block may
+                expand to. Past it decoding stops with
+                ``HPACK_BUDGET_ERROR``. A one-byte indexed field can name
+                a 4 KiB table entry, so 16 KiB of block is 64 MiB of
+                headers; checking the size only after a full decode let
+                that be allocated first. Stopping midway leaves the
+                dynamic table out of step with the peer, so the caller
+                must end the connection.
+        """
+        var headers = List[HpackHeader](capacity=16)
         var off = 0
+        var decoded = 0
+        # Fields [0, charged) are already counted against the budget. A
+        # field is charged before the next one is decoded and, for the
+        # last one, after the loop; it used to be charged only at the top
+        # of the next iteration, so a block's last field was never
+        # counted (HPACK-02).
+        var charged = 0
         while off < len(buf):
+            if budget > 0:
+                while charged < len(headers):
+                    decoded += (
+                        headers[charged].name.byte_length()
+                        + headers[charged].value.byte_length()
+                        + 32
+                    )
+                    charged += 1
+                    if decoded > budget:
+                        raise Error(HPACK_BUDGET_ERROR)
             var b0 = Int(buf[off])
             if (b0 & 0x80) != 0:
                 # 6.1 Indexed Header Field
                 var pair = decode_integer(buf, off, 7)
                 off = pair.offset
-                var h = self._lookup(pair.value, Span[HpackHeader, _](static))
+                var h = self._lookup(pair.value)
                 headers.append(h^)
             elif (b0 & 0x40) != 0:
                 # 6.2.1 Literal w/ Incremental Indexing
@@ -355,9 +421,7 @@ struct HpackDecoder(Copyable, Defaultable):
                     name = p.value.copy()
                     off = p.offset
                 else:
-                    name = self._lookup(
-                        idx, Span[HpackHeader, _](static)
-                    ).name.copy()
+                    name = self._lookup(idx).name.copy()
                 var v = self._decode_string(buf, off)
                 off = v.offset
                 var h = HpackHeader(name, v.value.copy())
@@ -386,12 +450,20 @@ struct HpackDecoder(Copyable, Defaultable):
                     name = p.value.copy()
                     off = p.offset
                 else:
-                    name = self._lookup(
-                        idx, Span[HpackHeader, _](static)
-                    ).name.copy()
+                    name = self._lookup(idx).name.copy()
                 var v = self._decode_string(buf, off)
                 off = v.offset
                 headers.append(HpackHeader(name, v.value.copy()))
+        if budget > 0:
+            while charged < len(headers):
+                decoded += (
+                    headers[charged].name.byte_length()
+                    + headers[charged].value.byte_length()
+                    + 32
+                )
+                charged += 1
+                if decoded > budget:
+                    raise Error(HPACK_BUDGET_ERROR)
         return headers^
 
 
@@ -427,9 +499,12 @@ struct HpackEncoder(Copyable, Defaultable):
     """
 
     var allow_huffman: Bool
+    var static: List[HpackHeader]
+    """RFC 7541 Appendix A, built once per encoder rather than per block."""
 
     def __init__(out self):
         self.allow_huffman = False
+        self.static = _static_table()
 
     def _encode_string(self, mut out_buf: List[UInt8], s: String):
         var n = s.byte_length()
@@ -446,8 +521,15 @@ struct HpackEncoder(Copyable, Defaultable):
             out_buf.append(src[unsafe_offset=i])
 
     def encode(self, headers: Span[HpackHeader, _]) -> List[UInt8]:
-        var out = List[UInt8]()
-        var static = _static_table()
+        var need = 0
+        for i in range(len(headers)):
+            need += (
+                headers[i].name.byte_length()
+                + headers[i].value.byte_length()
+                + 4
+            )
+        var out = List[UInt8](capacity=need)
+        ref static = self.static
         for i in range(len(headers)):
             var h = headers[i].copy()
             # Try a static-table lookup for the *name only*. If the

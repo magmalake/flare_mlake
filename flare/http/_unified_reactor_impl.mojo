@@ -11,7 +11,7 @@
 # (`_run_unified_loop_for_fd[H, is_shared]`). The
 # multi-listener variant retains its own outer loop because it
 # discriminates accept events by ``fd in listener_fds_dict``
-# instead of ``token == 0``; that fd-set discriminator is
+# instead of ``token == LISTENER_TOKEN``; that fd-set discriminator is
 # structurally distinct and unifying it would add complexity
 # rather than remove it.
 
@@ -72,7 +72,10 @@ from flare.runtime import (
     TimerWheel,
     INTEREST_READ,
     INTEREST_WRITE,
+    LISTENER_TOKEN,
 )
+from flare.runtime._balance import Balancer
+from flare.runtime.pool import Pool
 from flare.runtime.scheduler import (
     load_stop_flag,
     store_worker_stat,
@@ -83,6 +86,7 @@ from flare.runtime.scheduler import (
 )
 from flare.tcp import TcpListener, TcpStream, accept_fd
 from flare.ws.server_h2 import WsH2Hooks
+from ._ws_conn_handle import _drive_ws, _migrate_h1_to_ws, _ws_conn_free_addr
 
 from ._h2_conn_handle import (
     Http2ConnHandle,
@@ -98,6 +102,12 @@ from ._h2_conn_handle import (
     _pending_conn_free_addr,
     _pending_conn_ptr_from_int,
 )
+from ._reactor.lifecycle import (
+    _collect_fired_timers,
+    _expired_idle_conns,
+    _hand_off_stream,
+    ListenerGate,
+)
 from ._server_reactor_impl import (
     ConnHandle,
     StepResult,
@@ -110,6 +120,7 @@ from ._server_reactor_impl import (
     _monotonic_ms,
     _poll_timeout_ms,
     _accept_errno_is_retry,
+    _arm_accept_timer,
 )
 
 
@@ -124,6 +135,7 @@ from ._reactor.tagged_dispatch import (
     KIND_H1,
     KIND_H2,
     KIND_TLS,
+    KIND_WS,
     _pack,
     _kind,
     _addr,
@@ -177,7 +189,7 @@ def _drive_h1[
         var cycles = 0
         while (not step_done) and cycles < 3:
             cycles += 1
-            if last_step.h2c_upgrade:
+            if last_step.h2c_upgrade or last_step.ws_upgrade:
                 break
             if (
                 last_step.want_write
@@ -194,6 +206,10 @@ def _drive_h1[
                 step_done = last_step.done
             else:
                 break
+        if last_step.ws_upgrade and not step_done:
+            return _migrate_h1_to_ws(
+                fd, config.ws.reactor.value(), conns, reactor, wheel, timers
+            )
         if last_step.h2c_upgrade and not step_done:
             # The h1 ConnHandle has flushed the 101 response. Migrate
             # to the h2 handle in place; the conn-dict entry swaps
@@ -222,6 +238,16 @@ def _drive_h1[
                     )
                     return done_h2
             return False
+        if (
+            not step_done
+            and last_step.want_read
+            and ch_ptr[].has_buffered_request()
+        ):
+            # Cycle cap hit with a whole request still buffered: a
+            # writable edge (immediate on a level-triggered socket)
+            # brings the connection back through the writable branch,
+            # which re-parses. See ConnHandle.has_buffered_request.
+            last_step.want_write = True
         if not step_done:
             _apply_step(fd, last_step, reactor, wheel, timers, ch_ptr)
     except:
@@ -347,18 +373,12 @@ def _cleanup_conn_unified(
 ):
     """Unregister, cancel timers, and free whichever per-conn handle
     owns ``fd``. Single-dict variant -- dispatches by the kind tag
-    packed into ``conns[fd]``.
-
-    The wheel entry is cancelled, not merely forgotten. Dropping the
-    ``timers`` entry alone leaves the timer armed, and a fired timer
-    carries nothing but an fd number: the kernel hands that number to
-    the next connection, so the dead connection's timeout reaps a live
-    one. It presents as every other request dying mid-response with a
-    healthy server and nothing in its log -- the timeout closes the
-    socket without anybody raising."""
+    packed into ``conns[fd]``."""
+    # Cancel, not just forget. A timer left in the wheel fires later
+    # with this fd number as its payload; if the kernel has handed the
+    # number to a new connection by then, the expiry closed *that*
+    # connection mid-request.
     if fd in timers:
-        # Two blocks, because the Dict lookup and the wheel raise
-        # different error types and one `except` cannot cover both.
         var tid = UInt64(0)
         try:
             tid = timers.pop(fd)
@@ -386,6 +406,8 @@ def _cleanup_conn_unified(
             _h2_conn_free_addr(a)
         elif k == KIND_TLS:
             _tls_conn_free_addr(a)
+        elif k == KIND_WS:
+            _ws_conn_free_addr(a)
     except:
         pass
 
@@ -635,6 +657,9 @@ def _migrate_pending(
         var addr = _conn_alloc_addr(stream^)
         conns[fd] = _pack(KIND_H1, addr)
         var ch_ptr = _conn_ptr_from_int(addr)
+        # Cleartext, and this loop can migrate to h2: the one case
+        # where Upgrade: h2c may be honoured.
+        ch_ptr[].h2c_upgrade_allowed = True
         if len(prefaced) > 0:
             for i in range(len(prefaced)):
                 ch_ptr[].read_buf.append(prefaced[i])
@@ -650,21 +675,103 @@ def _migrate_pending(
 # ── Accept loop with deferred-protocol handles ─────────────────────────────
 
 
+def _adopt_unified_stream(
+    var stream: TcpStream,
+    mut reactor: Reactor,
+    mut conns: Dict[Int, Int],
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+    idle_timeout_ms: Int,
+    tls_ctx_addr: Int,
+):
+    """Register an accepted (non-blocking) stream on this worker.
+
+    Cleartext listeners produce a KIND_PENDING
+    :class:`PendingConnHandle` that peeks for the HTTP/2 preface. When
+    ``tls_ctx_addr`` is non-zero the connection starts as a KIND_TLS
+    :class:`TlsConnHandle` instead and the protocol is settled by ALPN
+    at the end of the handshake. A failed allocation or registration
+    drops the stream, which closes it.
+    """
+    var client_fd = Int(stream._socket.fd)
+    var addr: Int
+    var kind: Int
+    if tls_ctx_addr != 0:
+        var ctx_ptr = Pointer[UInt8, MutUntrackedOrigin](
+            unsafe_from_address=tls_ctx_addr
+        ).unsafe_bitcast[ServerCtx]()
+        try:
+            addr = _tls_conn_alloc_addr(stream^, ctx_ptr[])
+        except:
+            return
+        kind = KIND_TLS
+    else:
+        try:
+            addr = _pending_conn_alloc_addr(stream^)
+        except:
+            return
+        kind = KIND_PENDING
+    conns[client_fd] = _pack(kind, addr)
+    try:
+        reactor.register(c_int(client_fd), UInt64(client_fd), INTEREST_READ)
+    except:
+        if kind == KIND_TLS:
+            _tls_conn_free_addr(addr)
+        else:
+            _pending_conn_free_addr(addr)
+        try:
+            _ = conns.pop(client_fd)
+        except:
+            pass
+        return
+    _arm_accept_timer(client_fd, wheel, timers, idle_timeout_ms)
+
+
+def _adopt_handed_off(
+    bal: Balancer,
+    mut reactor: Reactor,
+    mut conns: Dict[Int, Int],
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+    idle_timeout_ms: Int,
+    max_connections: Int,
+    tls_ctx_addr: Int,
+):
+    """Register every stream peers left in this worker's inbox."""
+    while True:
+        var addr = bal.pop()
+        if addr == 0:
+            break
+        var cell = Pool[TcpStream].get_ptr(addr)
+        var stream = cell.unsafe_take_pointee()
+        cell.unsafe_free()
+        if max_connections > 0 and len(conns) >= max_connections:
+            continue
+        _adopt_unified_stream(
+            stream^,
+            reactor,
+            conns,
+            wheel,
+            timers,
+            idle_timeout_ms,
+            tls_ctx_addr,
+        )
+    bal.publish(len(conns))
+
+
 def _accept_loop_unified_fd(
     listener_fd: Int,
     mut reactor: Reactor,
     mut conns: Dict[Int, Int],
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+    idle_timeout_ms: Int,
     max_connections: Int = 0,
     tls_ctx_addr: Int = 0,
+    bal: Balancer = Balancer(),
 ):
     """Accept every available connection on ``listener_fd`` and
     register it in the shared ``conns`` table.
-
-    Cleartext listeners produce a KIND_PENDING
-    :class:`PendingConnHandle` that peeks for the HTTP/2 preface. When
-    ``tls_ctx_addr`` is non-zero the listener is TLS-terminating, so the
-    connection starts as a KIND_TLS :class:`TlsConnHandle` instead and
-    the protocol is settled by ALPN at the end of the handshake.
 
     Used by every single-listener unified loop variant (dedicated,
     shared/EPOLLEXCLUSIVE, multi-listener); the dedicated variant
@@ -673,6 +780,11 @@ def _accept_loop_unified_fd(
     ``max_connections`` (0 = unlimited) caps the per-worker live table
     and the errno decides the stop/skip action -- same admission
     contract as the HTTP/1.1 ``_accept_loop_fd`` (D8).
+
+    When ``bal`` is enabled and this worker holds clearly more
+    connections than the least-loaded peer, the new stream goes to that
+    peer instead (see ``flare.runtime._balance``); otherwise it stays
+    here, as before.
     """
     while True:
         if max_connections > 0 and len(conns) >= max_connections:
@@ -688,36 +800,23 @@ def _accept_loop_unified_fd(
             stream._socket.set_nonblocking(True)
         except:
             pass
-        var client_fd = Int(stream._socket.fd)
-        var addr: Int
-        var kind: Int
-        if tls_ctx_addr != 0:
-            var ctx_ptr = Pointer[UInt8, MutUntrackedOrigin](
-                unsafe_from_address=tls_ctx_addr
-            ).unsafe_bitcast[ServerCtx]()
-            try:
-                addr = _tls_conn_alloc_addr(stream^, ctx_ptr[])
-            except:
-                continue
-            kind = KIND_TLS
-        else:
-            try:
-                addr = _pending_conn_alloc_addr(stream^)
-            except:
-                continue
-            kind = KIND_PENDING
-        conns[client_fd] = _pack(kind, addr)
-        try:
-            reactor.register(c_int(client_fd), UInt64(client_fd), INTEREST_READ)
-        except:
-            if kind == KIND_TLS:
-                _tls_conn_free_addr(addr)
-            else:
-                _pending_conn_free_addr(addr)
-            try:
-                _ = conns.pop(client_fd)
-            except:
-                pass
+        if bal.enabled():
+            var target = bal.pick(len(conns))
+            if target >= 0:
+                var back = _hand_off_stream(stream^, target, bal)
+                if not back:
+                    continue
+                stream = back.take()
+        _adopt_unified_stream(
+            stream^,
+            reactor,
+            conns,
+            wheel,
+            timers,
+            idle_timeout_ms,
+            tls_ctx_addr,
+        )
+        bal.publish(len(conns))
 
 
 # ── Shared per-event dispatch + lifecycle helpers ──────────────────────────
@@ -731,27 +830,6 @@ def _accept_loop_unified_fd(
 # listener, multi listener, EPOLLEXCLUSIVE-shared listener) and
 # each becomes a ~30-line wrapper that polls + advances timers
 # + delegates per-event dispatch + drains on shutdown.
-
-
-@always_inline
-def _advance_timer_wheel_unified(
-    now_ms: UInt64,
-    mut wheel: TimerWheel,
-    mut conns: Dict[Int, Int],
-    mut timers: Dict[Int, UInt64],
-    mut reactor: Reactor,
-) raises:
-    """Step the timer wheel and reap any connections whose timeout
-    fired this tick.
-
-    Centralises the three-line pattern (advance + iterate fired +
-    cleanup) that was duplicated in every loop variant.
-    """
-    var fired = List[UInt64]()
-    wheel.advance(now_ms, fired)
-    for i in range(len(fired)):
-        var fd_tok = Int(fired[i])
-        _cleanup_conn_unified(fd_tok, conns, timers, reactor, wheel)
 
 
 def _unified_handle_conn_event[
@@ -769,6 +847,7 @@ def _unified_handle_conn_event[
     mut wheel: TimerWheel,
     mut timers: Dict[Int, UInt64],
     ws_hooks: Optional[WsH2Hooks] = None,
+    peer_hup: Bool = False,
 ) raises:
     """Dispatch one reactor event for an already-known connection fd.
 
@@ -793,11 +872,26 @@ def _unified_handle_conn_event[
         # returning WANT_WRITE only clears once the socket drains, and
         # only _drive_h1 carries the handler needed to finish the
         # request. Cleartext never sets the flag.
+        #
+        # A pending h2c upgrade also goes to the *read* driver on a
+        # writable edge: only `_drive_h1` migrates the connection once
+        # the 101 has flushed. `_drive_h1_writable` applies the step
+        # without migrating, so a 101 held back by a full send buffer
+        # would leave the connection write-armed and re-announcing the
+        # upgrade on every poll (APP-47). With the handle in
+        # STATE_WRITING, `on_readable` is a no-op that hands over to
+        # `on_writable` inside `_drive_h1`.
         var h1_ptr = _conn_ptr_from_int(_addr(packed))
         var tls_cross = h1_ptr[].tls_cross_interest
         if tls_cross:
             h1_ptr[].tls_cross_interest = False
-        if is_readable or (tls_cross and is_writable):
+        if (
+            is_readable
+            or (tls_cross and is_writable)
+            or h1_ptr[]._h2c_upgrade_pending
+            or h1_ptr[]._ws_upgrade_pending
+        ):
+            h1_ptr[].short_read_ok = not peer_hup
             done3 = _drive_h1(
                 fd,
                 _addr(packed),
@@ -819,7 +913,35 @@ def _unified_handle_conn_event[
                 wheel,
                 timers,
             )
+            # The flush finished with a pipelined request already in
+            # read_buf: serve it now rather than wait for a readable
+            # event that will not come.
+            if (
+                not done3
+                and fd in conns
+                and _kind(conns[fd]) == KIND_H1
+                and _conn_ptr_from_int(
+                    _addr(conns[fd])
+                )[].has_buffered_request()
+            ):
+                done3 = _drive_h1(
+                    fd,
+                    _addr(conns[fd]),
+                    handler,
+                    config,
+                    h2_config,
+                    conns,
+                    reactor,
+                    wheel,
+                    timers,
+                    ws_hooks.copy(),
+                )
         if done3:
+            _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
+        return
+
+    if k == KIND_WS:
+        if _drive_ws(fd, _addr(packed), is_readable, reactor, wheel, timers):
             _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
         return
 
@@ -1034,8 +1156,10 @@ def _run_unified_loop_for_fd[
     the only listener-side difference is ``register`` vs
     ``register_exclusive``.
 
-    ``listener_fd`` registers under ``token = 0``, which keeps the
-    single-listener path a straight token compare. ``extra_fds`` (the
+    ``listener_fd`` registers under ``token = LISTENER_TOKEN`` (a value no
+    fd can take, so a client that ``accept`` hands fd 0 is not mistaken for
+    the listener), which keeps the single-listener path a straight token
+    compare. ``extra_fds`` (the
     N x M case: this worker's own listener on each *additional*
     address) register under ``token = fd`` and are routed through an
     fd set consulted before the ``conns`` lookup. When ``extra_fds`` is
@@ -1048,14 +1172,19 @@ def _run_unified_loop_for_fd[
     var timers = Dict[Int, UInt64]()
 
     comptime if is_shared:
-        reactor.register_exclusive(c_int(listener_fd), UInt64(0), INTEREST_READ)
+        reactor.register_exclusive(
+            c_int(listener_fd), LISTENER_TOKEN, INTEREST_READ
+        )
     else:
-        reactor.register(c_int(listener_fd), UInt64(0), INTEREST_READ)
+        reactor.register(c_int(listener_fd), LISTENER_TOKEN, INTEREST_READ)
 
+    var gate = ListenerGate(exclusive=is_shared)
+    gate.add(listener_fd, LISTENER_TOKEN)
     var listener_fds = Dict[Int, Bool]()
     for i in range(len(extra_fds)):
         var xf = c_int(extra_fds[i])
         listener_fds[Int(xf)] = True
+        gate.add(Int(xf), UInt64(Int(xf)))
         comptime if is_shared:
             reactor.register_exclusive(xf, UInt64(Int(xf)), INTEREST_READ)
         else:
@@ -1064,29 +1193,50 @@ def _run_unified_loop_for_fd[
     var events = List[Event]()
     var exit_status = WORKER_STATUS_CLEAN
     var stopping_addr = Int(Pointer[Bool, _](to=stopping))
+    # Joins the scheduler's accept-balancing group (disabled for a lone
+    # worker or when ``FLARE_BALANCE_ACCEPT=0``).
+    var bal = Balancer.open(stats_addr, reactor.wake_fd())
     while not load_stop_flag(stopping_addr):
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
+        bal.publish(len(conns))
         events.clear()
         try:
             _ = reactor.poll(_poll_timeout_ms(wheel), events)
         except:
             exit_status = WORKER_STATUS_CRASHED
             break
+        if bal.pending() > 0:
+            _adopt_handed_off(
+                bal,
+                reactor,
+                conns,
+                wheel,
+                timers,
+                config.idle_timeout_ms,
+                config.max_connections,
+                tls_ctx_addr,
+            )
 
         var now_ms = UInt64(_monotonic_ms())
-        _advance_timer_wheel_unified(now_ms, wheel, conns, timers, reactor)
+        var fired_fds = List[Int]()
+        var fired_ids = List[UInt64]()
+        _collect_fired_timers(now_ms, wheel, timers, fired_fds, fired_ids)
 
         for i in range(len(events)):
             var evt = events[i]
             if evt.is_wakeup():
                 continue
-            if evt.token == UInt64(0):
+            if evt.token == LISTENER_TOKEN:
                 _accept_loop_unified_fd(
                     listener_fd,
                     reactor,
                     conns,
+                    wheel,
+                    timers,
+                    config.idle_timeout_ms,
                     config.max_connections,
                     tls_ctx_addr,
+                    bal,
                 )
                 continue
             var fd = Int(evt.token)
@@ -1095,8 +1245,12 @@ def _run_unified_loop_for_fd[
                     fd,
                     reactor,
                     conns,
+                    wheel,
+                    timers,
+                    config.idle_timeout_ms,
                     config.max_connections,
                     tls_ctx_addr,
+                    bal,
                 )
                 continue
             if fd not in conns:
@@ -1115,13 +1269,32 @@ def _run_unified_loop_for_fd[
                 wheel,
                 timers,
                 ws_hooks.copy(),
+                peer_hup=evt.is_hup(),
             )
 
+        # Deadlines that passed while this poll's events were pending are
+        # enforced only now: a connection that had a request waiting was
+        # served above and re-armed its timer, so it is spared.
+        var expired = _expired_idle_conns(fired_fds, fired_ids, conns, timers)
+        for i in range(len(expired)):
+            _cleanup_conn_unified(expired[i], conns, timers, reactor, wheel)
+        gate.sync(reactor, len(conns), config.max_connections)
+
     store_worker_stat(stats_addr, WORKER_STAT_STATUS, exit_status)
+    # Stop taking hand-offs, then close what peers queued before that
+    # (a stream dropped here closes its fd).
+    bal.close()
+    while True:
+        var left = bal.pop()
+        if left == 0:
+            break
+        Pool[TcpStream].free(left)
     # Publish what was actually still in flight when the loop stopped,
     # so Scheduler.drain reports a measured number rather than the
     # count from whichever iteration happened to run last.
-    var still_live = _drain_remaining_conns_unified(conns, timers, reactor, wheel)
+    var still_live = _drain_remaining_conns_unified(
+        conns, timers, reactor, wheel
+    )
     store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, still_live)
 
 
@@ -1135,6 +1308,7 @@ def run_unified_reactor_loop[
     ref stopping: Bool,
     ws_hooks: Optional[WsH2Hooks] = None,
     tls_ctx_addr: Int = 0,
+    extra_fds: List[Int] = List[Int](),
 ) raises:
     """Single-threaded reactor loop that auto-dispatches HTTP/1.1 vs
     HTTP/2 per connection.
@@ -1152,65 +1326,18 @@ def run_unified_reactor_loop[
             via a fresh :class:`Pointer` so the optimiser
             cannot LICM-hoist the load (the multicore Scheduler
             mutates it from another thread).
+        ws_hooks: WebSocket-over-h2 sidecar, if one is attached.
+        tls_ctx_addr: ``SSL_CTX`` for TLS connections, 0 for cleartext.
+        extra_fds: Listeners on the additional addresses given to
+            :meth:`HttpServer.bind`; borrowed, closed by the server.
 
     Delegates to :func:`_run_unified_loop_for_fd[H, False]` after
     extracting the listener fd; identical to the shared variant
     except for ``register`` vs ``register_exclusive``.
     """
-    listener._socket.set_nonblocking(True)
-    _run_unified_loop_for_fd[H, False](
-        Int(listener._socket.fd),
-        config,
-        h2_config^,
-        handler,
-        stopping,
-        0,
-        ws_hooks,
-        tls_ctx_addr,
-    )
-
-
-# ── Unified reactor loop -- multi-listener (single-worker) ─────────────────
-
-
-def run_unified_reactor_loop_multi[
-    H: Handler
-](
-    mut primary: TcpListener,
-    extra_fds: List[Int],
-    config: ServerConfig,
-    var h2_config: Http2Config,
-    ref handler: H,
-    ref stopping: Bool,
-) raises:
-    """Single-worker reactor loop demuxing accepts across N listener fds.
-
-    Same shape and semantics as :func:`run_unified_reactor_loop`
-    (HTTP/1.1 + HTTP/2 auto-dispatch via the RFC 9113 §3.4
-    preface peek), with one structural difference: every listener
-    fd is registered with the reactor under ``token = fd`` so the
-    accept loop can route incoming events to the correct listener.
-    Connection events keep the existing ``token = client_fd``
-    convention; ``conns`` is the disambiguator (a token is a
-    listener fd iff it's not a key in ``conns``).
-
-    Args:
-        primary: First listener (the address returned by
-            :meth:`HttpServer.local_addr`). Closed by the
-            ``HttpServer`` owner; the loop only borrows.
-        extra_fds: Raw fds for the additional listeners attached
-            via :meth:`HttpServer.bind_many`. Owned by the caller
-            (typically ``HttpServer._extra_listener_fds``); closed
-            by ``HttpServer.__deinit__``. The loop only borrows them
-            for ``accept(2)``.
-        config: HTTP/1.1 server configuration.
-        h2_config: HTTP/2 SETTINGS for h2 peers.
-        handler: User's request handler.
-        stopping: External stop flag.
-    """
     from flare.net.socket import RawSocket, INVALID_FD, AF_INET, SOCK_STREAM
 
-    primary._socket.set_nonblocking(True)
+    listener._socket.set_nonblocking(True)
     for i in range(len(extra_fds)):
         # Wrap the fd in a temp RawSocket purely so we can call
         # set_nonblocking via the existing platform-aware path
@@ -1226,63 +1353,17 @@ def run_unified_reactor_loop_multi[
         except:
             pass
 
-    var reactor = Reactor()
-    var wheel = TimerWheel(now_ms=UInt64(_monotonic_ms()))
-    var conns = Dict[Int, Int]()
-    var timers = Dict[Int, UInt64]()
-
-    var primary_fd = primary._socket.fd
-    var listener_fds = Dict[Int, Bool]()
-    listener_fds[Int(primary_fd)] = True
-    reactor.register(primary_fd, UInt64(Int(primary_fd)), INTEREST_READ)
-    for i in range(len(extra_fds)):
-        var f = c_int(extra_fds[i])
-        listener_fds[Int(f)] = True
-        reactor.register(f, UInt64(Int(f)), INTEREST_READ)
-
-    var events = List[Event]()
-    var stopping_addr = Int(Pointer[Bool, _](to=stopping))
-    while not load_stop_flag(stopping_addr):
-        events.clear()
-        try:
-            _ = reactor.poll(_poll_timeout_ms(wheel), events)
-        except:
-            break
-
-        var now_ms = UInt64(_monotonic_ms())
-        _advance_timer_wheel_unified(now_ms, wheel, conns, timers, reactor)
-
-        for i in range(len(events)):
-            var evt = events[i]
-            if evt.is_wakeup():
-                continue
-            var fd = Int(evt.token)
-            if fd in listener_fds:
-                _accept_loop_unified_fd(
-                    fd, reactor, conns, config.max_connections
-                )
-                continue
-            if fd not in conns:
-                continue
-            var packed = conns[fd]
-            _unified_handle_conn_event(
-                fd,
-                packed,
-                evt.is_readable(),
-                evt.is_writable(),
-                handler,
-                config,
-                h2_config,
-                conns,
-                reactor,
-                wheel,
-                timers,
-            )
-
-    # Graceful shutdown: flip Cancel.SHUTDOWN, then close all live
-    # conns. Listener fds are closed by ``HttpServer.__deinit__`` -- the
-    # loop only borrows.
-    _ = _drain_remaining_conns_unified(conns, timers, reactor, wheel)
+    _run_unified_loop_for_fd[H, False](
+        Int(listener._socket.fd),
+        config,
+        h2_config^,
+        handler,
+        stopping,
+        0,
+        ws_hooks,
+        tls_ctx_addr,
+        extra_fds,
+    )
 
 
 # ── Unified reactor loop -- shared listener (multi-worker) ──────────────────
@@ -1299,6 +1380,7 @@ def run_unified_reactor_loop_shared[
     stats_addr: Int = 0,
     tls_ctx_addr: Int = 0,
     extra_fds: List[Int] = List[Int](),
+    ws_hooks: Optional[WsH2Hooks] = None,
 ) raises:
     """Multi-worker variant of :func:`run_unified_reactor_loop`.
 
@@ -1310,7 +1392,7 @@ def run_unified_reactor_loop_shared[
     because ``accept(2)`` on the losers returns ``EAGAIN``).
 
     ``extra_fds`` carries this worker's listeners on the *additional*
-    addresses of a :meth:`HttpServer.bind_many` server -- one fd per
+    addresses of a multi-address :meth:`HttpServer.bind` server -- one fd per
     extra address, per worker. That is the N x M shape: N addresses
     times M workers, each pairing owning its own ``SO_REUSEPORT``
     listener, rather than N addresses on one worker (multi-listener)
@@ -1325,7 +1407,7 @@ def run_unified_reactor_loop_shared[
         handler,
         stopping,
         stats_addr,
-        None,
+        ws_hooks,
         tls_ctx_addr,
         extra_fds,
     )

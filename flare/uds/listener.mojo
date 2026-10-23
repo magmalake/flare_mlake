@@ -28,12 +28,16 @@ from ..net.socket import RawSocket, SOCK_STREAM
 from ..net._libc import (
     _accept,
     _bind,
+    _connect,
     _getsockname,
     _listen,
     _strerror,
 )
 
 from ._libc import (
+    PATH_OTHER,
+    PATH_SOCKET,
+    lstat_kind,
     AF_UNIX,
     SOCKADDR_UN_SIZE,
     fill_sockaddr_un,
@@ -41,6 +45,32 @@ from ._libc import (
     unlink_path,
 )
 from .stream import UnixStream
+
+
+def _socket_path_is_stale(path: String) raises -> Bool:
+    """Probe the socket file at ``path`` with a throwaway ``connect(2)``.
+
+    Returns ``True`` only when the probe proves nobody is listening:
+    ``ECONNREFUSED`` (a leftover file) or ``ENOENT`` (already gone).
+    Every other outcome keeps the file: a successful connect means a live
+    server, and any other errno (``EACCES`` on a socket file the caller
+    may not write, ``EAGAIN`` on a full backlog, ``EPROTOTYPE`` for a
+    socket of another type, ...) says nothing about liveness, so the
+    socket must be treated as in use rather than taken over.
+    """
+    var sock = RawSocket(AF_UNIX, SOCK_STREAM)
+    var sa = stack_allocation[Int(SOCKADDR_UN_SIZE), UInt8]()
+    for i in range(Int(SOCKADDR_UN_SIZE)):
+        (sa.unsafe_offset(i)).unsafe_write(0)
+    var used = fill_sockaddr_un(sa, path)
+    var rc = _connect(sock.fd, sa, used)
+    var e = get_errno()
+    # Close explicitly: without a later use Mojo may destroy ``sock`` before
+    # the connect runs, and the probe would see EBADF.
+    sock.close()
+    if rc >= 0:
+        return False  # connected: a live server
+    return e == ErrNo.ECONNREFUSED or e == ErrNo.ENOENT
 
 
 struct UnixListener(Movable):
@@ -61,6 +91,10 @@ struct UnixListener(Movable):
     var _socket: RawSocket
     var _path: String
     var _cleanup_path: Bool
+    var _dev: UInt64
+    var _ino: UInt64
+    """Device and inode of the socket file this listener created, so
+    the destructor removes that file and not one that replaced it."""
 
     def __init__(
         out self,
@@ -76,6 +110,15 @@ struct UnixListener(Movable):
         self._socket = socket^
         self._path = path
         self._cleanup_path = cleanup_path
+        self._dev = 0
+        self._ino = 0
+        try:
+            var k = lstat_kind(path)
+            if k[0] == PATH_SOCKET:
+                self._dev = k[1]
+                self._ino = k[2]
+        except:
+            pass
 
     def __deinit__(deinit self):
         """Close the socket. If ``cleanup_path`` is ``True`` (the
@@ -85,7 +128,20 @@ struct UnixListener(Movable):
         have been moved / deleted by an admin)."""
         self._socket.close()
         if self._cleanup_path and self._path.byte_length() > 0:
-            _ = unlink_path(self._path)
+            # Only the file this listener made. It was unlinked by
+            # path, so a server that had since taken the path over lost
+            # its socket file when an old listener went away.
+            try:
+                var k = lstat_kind(self._path)
+                if (
+                    k[0] == PATH_SOCKET
+                    and k[1] == self._dev
+                    and k[2] == self._ino
+                    and self._ino != 0
+                ):
+                    _ = unlink_path(self._path)
+            except:
+                pass
 
     # ── Factory ───────────────────────────────────────────────────────────
 
@@ -114,8 +170,14 @@ struct UnixListener(Movable):
                 Linux, 104 on macOS, including NUL); paths longer
                 than that raise ``Error``.
             backlog: ``listen(2)`` backlog.
-            unlink_existing: ``unlink(path)`` before ``bind(2)``.
-                Defaults ``True`` so a crashed-then-restarted
+            unlink_existing: Remove a stale socket at ``path`` before
+                ``bind(2)``: one a probe ``connect(2)`` proves nobody
+                is listening on (``ECONNREFUSED``). A live socket, or
+                one the probe cannot judge (``EACCES`` on a socket
+                file the caller may not write, a socket of another
+                type, ...), raises ``AddressInUse`` and anything that
+                is not a socket raises ``NetworkError``; neither is
+                touched. Defaults ``True`` so a crashed-then-restarted
                 process recovers cleanly. Set ``False`` if you
                 want a hard ``EADDRINUSE`` when a previous
                 instance is still running.
@@ -130,8 +192,22 @@ struct UnixListener(Movable):
         """
         var sock = RawSocket(AF_UNIX, SOCK_STREAM)
         if unlink_existing:
-            # Best-effort: ignore failure (file might not exist).
-            _ = unlink_path(path)
+            # Remove only a stale socket. The path used to be unlinked
+            # whatever it was: a regular file was deleted, and a live
+            # server's socket vanished from under it, so the new bind
+            # "succeeded" and the old server stopped getting clients.
+            var k = lstat_kind(path)
+            if k[0] == PATH_OTHER:
+                raise NetworkError(
+                    "bind " + path + ": path exists and is not a socket"
+                )
+            if k[0] == PATH_SOCKET:
+                # Only a refused probe proves the socket stale: any other
+                # failure (EACCES, ...) says nothing about liveness and
+                # used to be swallowed, unlinking a live server's socket.
+                if not _socket_path_is_stale(path):
+                    raise AddressInUse(path, Int(ErrNo.EADDRINUSE.value))
+                _ = unlink_path(path)
 
         var sa = stack_allocation[Int(SOCKADDR_UN_SIZE), UInt8]()
         for i in range(Int(SOCKADDR_UN_SIZE)):

@@ -31,7 +31,13 @@ callback.
 
 from std.collections import Dict, Optional
 
-from flare.http.wire import HeaderMap, Method, Request, Response
+from flare.http.wire import (
+    HeaderMap,
+    Method,
+    Request,
+    Response,
+    trailer_field_allowed,
+)
 
 from .frame import (
     Frame,
@@ -40,6 +46,8 @@ from .frame import (
     H2_DEFAULT_FRAME_SIZE,
     H2_PREFACE,
     encode_frame,
+    encode_frame_header_into,
+    encode_frame_into,
     parse_frame,
 )
 from .hpack import HpackHeader
@@ -51,7 +59,13 @@ from flare.http.proto.h2_config import (
     _H2_DEFAULT_MAX_FRAME_SIZE,
     _H2_DEFAULT_MAX_HEADER_LIST_SIZE,
 )
-from .state import Connection, Http2ErrorCode, Stream, StreamState
+from .state import (
+    Connection,
+    Http2ErrorCode,
+    Stream,
+    StreamState,
+    h2_setting_error,
+)
 
 
 def _lower_ascii(k: String) -> String:
@@ -116,6 +130,12 @@ struct Http2Connection(Defaultable, Movable):
     var inbox: List[UInt8]
     var outbox: List[UInt8]
     var greeted: Bool
+    var peer_settings_seen: Bool
+    """True once the peer's first frame, a non-ACK SETTINGS, has arrived.
+
+    RFC 9113 sec 3.4: the client preface "MUST be followed by a SETTINGS
+    frame"; any other first frame is a connection error of type
+    PROTOCOL_ERROR."""
     var config: Http2Config
     """The :class:`Http2Config` the driver was constructed with.
     Kept on the driver so the reactor wiring can re-read
@@ -130,6 +150,10 @@ struct Http2Connection(Defaultable, Movable):
     is re-pumped when a WINDOW_UPDATE arrives."""
     var pending_pos: Dict[Int, Int]
     """Offset already flushed out of the matching ``pending_body``."""
+    var pending_trailers_k: Dict[Int, List[String]]
+    """Trailer names to send once the matching ``pending_body`` drains."""
+    var pending_trailers_v: Dict[Int, List[String]]
+    """Trailer values, parallel to ``pending_trailers_k``."""
 
     def __init__(out self):
         """Default-construct with :class:`Http2Config` defaults.
@@ -143,9 +167,12 @@ struct Http2Connection(Defaultable, Movable):
         self.inbox = List[UInt8]()
         self.outbox = List[UInt8]()
         self.greeted = False
+        self.peer_settings_seen = False
         self.config = Http2Config()
         self.pending_body = Dict[Int, List[UInt8]]()
         self.pending_pos = Dict[Int, Int]()
+        self.pending_trailers_k = Dict[Int, List[String]]()
+        self.pending_trailers_v = Dict[Int, List[String]]()
 
     @staticmethod
     def with_config(var config: Http2Config) raises -> Http2Connection:
@@ -173,17 +200,22 @@ struct Http2Connection(Defaultable, Movable):
         out.conn.max_concurrent_streams = out.config.max_concurrent_streams
         out.conn.max_request_body_size = out.config.max_body_size
         out.conn.initial_window_size = out.config.initial_window_size
-        out.conn.send_window = out.config.initial_window_size
-        out.conn.recv_window = out.config.initial_window_size
-        out.conn.max_frame_size = out.config.max_frame_size
-        # What we advertise is also the largest frame we accept; the
-        # peer's SETTINGS may later move max_frame_size but must not
-        # move this one.
+        # RFC 9113 sec 6.9.2: the connection-level windows start at
+        # 65535 whatever SETTINGS say; only WINDOW_UPDATE on stream 0
+        # moves them. Seeding the send window from *our* setting let us
+        # overrun a peer that advertised the default.
+        out.conn.send_window = 65535
+        out.conn.recv_window = 65535
+        # What we advertise is the largest frame we accept. The largest we
+        # send is the peer's to set (RFC 9113 sec 4.2): it stays at 16384
+        # until the peer's SETTINGS_MAX_FRAME_SIZE raises it.
         out.conn.local_max_frame_size = out.config.max_frame_size
         out.conn.max_header_list_size = out.config.max_header_list_size
-        out.conn.hpack_decoder.max_size = out.config.header_table_size
-        # The ceiling a peer size update may restore to is what we
-        # advertise, not the table's current size.
+        # What we advertise is the ceiling for a peer size update
+        # (RFC 7541 sec 6.3). The decoder's *current* size stays at the
+        # 4096 default: the peer's encoder keeps that table until it has
+        # received our SETTINGS and sent a size update (sec 4.2), so
+        # shrinking now would drop entries it still indexes (HPACK-03).
         out.conn.hpack_decoder.settings_max_size = out.config.header_table_size
         out.conn.hpack_decoder.allow_huffman = out.config.allow_huffman_decode
         out.conn.hpack_encoder.allow_huffman = out.config.allow_huffman_encode
@@ -202,9 +234,7 @@ struct Http2Connection(Defaultable, Movable):
         if self.greeted:
             return
         var f = self.conn.initial_settings()
-        var bytes = encode_frame(f)
-        for i in range(len(bytes)):
-            self.outbox.append(bytes[i])
+        encode_frame_into(f, self.outbox)
         self.greeted = True
 
     @staticmethod
@@ -267,10 +297,19 @@ struct Http2Connection(Defaultable, Movable):
                 | (Int(settings_payload[i + 4]) << 8)
                 | Int(settings_payload[i + 5])
             )
+            # Same bounds as a SETTINGS frame. This path applied the
+            # header's values unchecked, and MAX_FRAME_SIZE=0 then made
+            # every response body loop forever emitting empty DATA
+            # frames.
+            if h2_setting_error(id, v) != 0:
+                raise Error(
+                    "h2c upgrade: invalid HTTP2-Settings value for setting "
+                    + String(id)
+                )
             if id == 0x1:
-                out.conn.hpack_decoder.max_size = v
+                out.conn.peer_header_table_size = v
             elif id == 0x4:
-                out.conn.initial_window_size = v
+                out.conn.peer_initial_window_size = v
             elif id == 0x5:
                 out.conn.max_frame_size = v
             elif id == 0x8:
@@ -283,7 +322,7 @@ struct Http2Connection(Defaultable, Movable):
         var s = Stream()
         s.id = 1
         s.state = StreamState.HALF_CLOSED_REMOTE()
-        s.send_window = out.conn.initial_window_size
+        s.send_window = out.conn.peer_initial_window_size
         s.recv_window = out.conn.initial_window_size
         s.headers.append(HpackHeader(":method", req.method))
         s.headers.append(HpackHeader(":scheme", "http"))
@@ -316,8 +355,8 @@ struct Http2Connection(Defaultable, Movable):
             ):
                 continue
             s.headers.append(HpackHeader(lk, req.headers._values[j]))
-        for j in range(len(req.body)):
-            s.data.append(req.body[j])
+        s.data.extend(Span(req.body))
+        s.initial_header_count = len(s.headers)
         s.headers_complete = True
         s.data_complete = True
         out.conn.streams[1] = s^
@@ -332,8 +371,7 @@ struct Http2Connection(Defaultable, Movable):
 
     def feed(mut self, data: Span[UInt8, _]) raises:
         """Push ``data`` (bytes from the socket) into the driver."""
-        for i in range(len(data)):
-            self.inbox.append(data[i])
+        self.inbox.extend(data)
 
         # Strip the 24-byte preface once.
         if not self.conn.preface_seen:
@@ -352,39 +390,77 @@ struct Http2Connection(Defaultable, Movable):
                         var ga = self.conn._goaway_frame(
                             0, Http2ErrorCode.PROTOCOL_ERROR().value
                         )
-                        var gb = encode_frame(ga)
-                        for k in range(len(gb)):
-                            self.outbox.append(gb[k])
+                        encode_frame_into(ga, self.outbox)
                     self.inbox = List[UInt8]()
                     return
             # Drop the preface from the inbox.
             var rest = List[UInt8](capacity=len(self.inbox) - 24)
-            for i in range(24, len(self.inbox)):
-                rest.append(self.inbox[i])
+            rest.extend(Span(self.inbox)[24:])
             self.inbox = rest^
             self.conn.preface_seen = True
             self._emit_initial_settings()
 
-        # Drain frames until we run out of complete ones.
+        # Drain frames until we run out of complete ones. Frames are
+        # read from a cursor and the inbox is compacted once at the end:
+        # copying the rest of the inbox after every frame made a burst of
+        # small frames quadratic (1 MiB of 9-byte frames is ~60 GiB of
+        # copying).
+        var off = 0
         while True:
-            var span = Span[UInt8, _](self.inbox)
+            # A connection error ends the connection (RFC 9113 sec
+            # 5.4.1). Frames after the GOAWAY used to keep being applied,
+            # so streams above its last-stream-id were still dispatched
+            # -- work the peer will retry elsewhere -- and a flood the
+            # GOAWAY answered was still being processed.
+            if self.conn.goaway_sent:
+                self.inbox = List[UInt8]()
+                return
+            var avail = len(self.inbox) - off
+            # sec 4.2: refuse an oversized frame from its header, before
+            # buffering up to 16 MiB of payload we will reject anyway.
+            if avail >= 9:
+                var declared = (
+                    (Int(self.inbox[off]) << 16)
+                    | (Int(self.inbox[off + 1]) << 8)
+                    | Int(self.inbox[off + 2])
+                )
+                if declared > self.conn.local_max_frame_size:
+                    var gerr = self.conn._conn_error(
+                        Http2ErrorCode.FRAME_SIZE_ERROR().value
+                    )
+                    for gi in range(len(gerr)):
+                        encode_frame_into(gerr[gi], self.outbox)
+                    self.inbox = List[UInt8]()
+                    return
+            var span = Span[UInt8, _](self.inbox)[off:]
             var got = parse_frame(span)
             if not got:
-                return
-            var frame = got.value().copy()
-            var consumed = 9 + frame.header.length
-            var rest = List[UInt8](capacity=len(self.inbox) - consumed)
-            for i in range(consumed, len(self.inbox)):
-                rest.append(self.inbox[i])
-            self.inbox = rest^
-            var reply = self.conn.handle_frame(frame^)
+                break
+            var frame = got.take()
+            off += 9 + frame.header.length
+            var reply: List[Frame]
+            if not self.peer_settings_seen and not (
+                frame.header.type.value == FrameType.SETTINGS().value
+                and not frame.header.flags.has(FrameFlags.ACK())
+            ):
+                # sec 3.4: the preface must be followed by a SETTINGS
+                # frame (an ACK answers ours, which the peer cannot have
+                # seen yet); anything else first is an invalid preface.
+                reply = self.conn._conn_error(
+                    Http2ErrorCode.PROTOCOL_ERROR().value
+                )
+            else:
+                self.peer_settings_seen = True
+                reply = self.conn.handle_frame(frame^)
             for i in range(len(reply)):
-                var rb = encode_frame(reply[i])
-                for j in range(len(rb)):
-                    self.outbox.append(rb[j])
+                encode_frame_into(reply[i], self.outbox)
             # A WINDOW_UPDATE in that frame may have unparked response
             # bytes; nothing else re-drives them.
             self.pump_pending()
+        if off > 0:
+            var rest = List[UInt8](capacity=len(self.inbox) - off)
+            rest.extend(Span[UInt8, _](self.inbox)[off:])
+            self.inbox = rest^
 
     def drain(mut self) -> List[UInt8]:
         """Return all queued outbound bytes and clear the buffer.
@@ -410,41 +486,15 @@ struct Http2Connection(Defaultable, Movable):
         self.conn.streams[sid] = s^
 
     def take_completed_streams(self) -> List[Int]:
-        """Return stream ids whose request is fully buffered."""
-        var ids = List[Int]()
-        for entry in self.conn.streams.items():
-            # ``StreamSlab.items()`` returns ``List[Tuple[Int, Stream]]``;
-            # ``entry[1]`` is the per-stream record. Stream is copied
-            # eagerly inside ``items()`` so this loop never aliases the
-            # slab's owned storage.
-            var s = entry[1].copy()
-            # Skip streams already dispatched. Two things can mark a
-            # stream as served. ``emit_response`` moves a fully written
-            # one to ``CLOSED`` while ``headers_complete`` /
-            # ``data_complete`` stay set, so without the state check a
-            # second ``on_readable`` (an EAGAIN re-pump on macOS
-            # loopback, or any later readable event in the live reactor)
-            # re-returns the id and double-dispatches the handler.
-            #
-            # ``response_started`` covers the case the state check
-            # cannot: a response whose body is larger than the peer's
-            # send window is parked in ``pending_body`` and its stream
-            # stays open until the remainder drains. Every WINDOW_UPDATE
-            # from that peer arrives as a readable event, so a
-            # state-only guard re-ran the handler and re-sent the
-            # response head on each one -- which the peer is right to
-            # reject, a second HEADERS block without END_STREAM being a
-            # protocol error (RFC 9113 sec 8.1). Any client advertising
-            # the default 65535-byte window hit this on the first
-            # response larger than that.
-            if (
-                s.headers_complete
-                and s.data_complete
-                and not s.response_started
-                and s.state.value != StreamState.CLOSED().value
-            ):
-                ids.append(s.id)
-        return ids^
+        """Return stream ids whose request is fully buffered.
+
+        A stream already dispatched is excluded by ``Stream.slab_ready``:
+        ``emit_response`` moves a fully written one to ``CLOSED``, and
+        ``response_started`` covers a response parked in ``pending_body``
+        whose stream stays open until the window drains, so a
+        WINDOW_UPDATE never re-runs the handler (RFC 9113 sec 8.1).
+        """
+        return self.conn.streams.ready_ids()
 
     def take_reset_streams(mut self) -> List[Int]:
         """Pop the list of stream ids reset by the peer since the
@@ -473,12 +523,27 @@ struct Http2Connection(Defaultable, Movable):
         """Convert stream ``sid`` into a :class:`flare.http.Request`."""
         if sid not in self.conn.streams:
             raise Error("h2: take_request on unknown stream")
-        var s = self.conn.streams[sid].copy()
+        # The request takes the stream's header list and body, which the
+        # stream no longer needs once dispatched.
+        var s = self.conn.streams.pop(sid)
+        var fields = List[HpackHeader]()
+        swap(fields, s.headers)
         var req = Request(method="GET", url="/", version="HTTP/2")
-        # Pseudo headers come first per RFC 9113 §8.1.2.1.
-        for i in range(len(s.headers)):
-            var n = s.headers[i].name
-            var v = s.headers[i].value
+        swap(req.body, s.data)
+        var initial = s.initial_header_count
+        self.conn.streams[sid] = s^
+        req.headers.reserve(initial)
+        # Fields are appended, not set: a repeated field keeps every
+        # value, as on HTTP/1.1. ``set`` kept only the last, and browsers
+        # send cookies as one field per crumb (RFC 9113 sec 8.2.3), so a
+        # handler behind h2 saw only the last cookie.
+        var cookie = String("")
+        for i in range(initial, len(fields)):
+            if trailer_field_allowed(fields[i].name):
+                req.trailers.append(fields[i].name, fields[i].value)
+        for i in range(initial):
+            ref n = fields[i].name
+            ref v = fields[i].value
             if n == ":method":
                 req.method = v
             elif n == ":path":
@@ -487,10 +552,23 @@ struct Http2Connection(Defaultable, Movable):
                 req.headers.set("Host", v)
             elif n == ":scheme":
                 pass  # the reactor knows the scheme already
+            elif n == "cookie":
+                # sec 8.2.3: concatenate crumbs with "; " before handing
+                # them to an HTTP/1.1-shaped consumer.
+                if cookie.byte_length() > 0:
+                    cookie += "; "
+                cookie += v
+            elif n == "host" and req.headers.contains("Host"):
+                pass  # :authority wins (sec 8.3.1)
             else:
-                req.headers.set(n, v)
-        for i in range(len(s.data)):
-            req.body.append(s.data[i])
+                req.headers.append(n, v)
+        if cookie.byte_length() > 0:
+            req.headers.append("cookie", cookie)
+        # The body counted against the connection's buffered-request
+        # budget.
+        var credit = self.conn.release_request_credit(len(req.body))
+        for i in range(len(credit)):
+            self.outbox.extend(Span(encode_frame(credit[i])))
         return req^
 
     def emit_response(mut self, sid: Int, var resp: Response) raises:
@@ -518,7 +596,13 @@ struct Http2Connection(Defaultable, Movable):
         # Only taken when the body does not fit; the common case keeps
         # the one-shot framing below, END_STREAM riding the single DATA
         # frame, so the wire shape is unchanged for ordinary responses.
-        if len(resp.trailers._keys) == 0 and len(resp.body) > 0:
+        #
+        # Trailers ride the same path, sent once the body has drained.
+        # They used to force the one-shot framing whatever the body size,
+        # and every gRPC response has trailers, so a gRPC body over 16 KiB
+        # went out as one oversized DATA frame (FRAME_SIZE_ERROR) and
+        # ignored the peer's window (FLOW_CONTROL_ERROR).
+        if len(resp.body) > 0:
             var st = self.conn.streams[sid].copy()
             var budget = (
                 self.conn.send_window if self.conn.send_window
@@ -529,19 +613,25 @@ struct Http2Connection(Defaultable, Movable):
                 or len(resp.body) > self.conn.max_frame_size
             )
             if too_big:
-                var body = resp.body.copy()
+                var body = List[UInt8]()
+                swap(body, resp.body)
+                var tk = resp.trailers._keys.copy()
+                var tv = resp.trailers._values.copy()
                 self.begin_stream_response(sid, resp^)
                 var n = self.queue_stream_data(sid, Span[UInt8, _](body))
                 if n < len(body):
                     self.pending_body[sid] = body^
                     self.pending_pos[sid] = n
+                    if len(tk) > 0:
+                        self.pending_trailers_k[sid] = tk^
+                        self.pending_trailers_v[sid] = tv^
                     return  # open until the remainder drains
-                self.end_stream_response(sid, List[String](), List[String]())
+                self.end_stream_response(sid, tk, tv)
                 return
         # Build HpackHeader list from the response's HeaderMap.
         # HTTP/2 forbids ``Connection`` / ``Transfer-Encoding`` / ``Keep-Alive``
         # / ``Proxy-Connection`` / ``Upgrade`` per RFC 9113 §8.2.2.
-        var hdrs = List[HpackHeader]()
+        var hdrs = List[HpackHeader](capacity=len(resp.headers._keys))
         for i in range(len(resp.headers._keys)):
             var k = resp.headers._keys[i]
             var v = resp.headers._values[i]
@@ -587,12 +677,24 @@ struct Http2Connection(Defaultable, Movable):
             Span[HpackHeader, _](trailers),
         )
         for i in range(len(frames)):
-            var bytes = encode_frame(frames[i])
-            for j in range(len(bytes)):
-                self.outbox.append(bytes[j])
+            encode_frame_into(frames[i], self.outbox)
         var s = self.conn.streams[sid].copy()
         s.state = StreamState.CLOSED()
+        # The body fit the window, and it still spends it: without this
+        # the windows never shrank, so concurrent small responses each
+        # passed the check against the same stale budget, and after ~2
+        # GiB the peer's WINDOW_UPDATEs pushed the counter past 2^31-1
+        # and we sent GOAWAY to a healthy peer.
+        s.send_window -= len(resp.body)
+        self.conn.send_window -= len(resp.body)
         self.conn.streams[sid] = s^
+
+    def _stream_still_sendable(self, sid: Int) raises -> Bool:
+        """``sid`` exists and is not CLOSED, so response frames for it
+        can still go out."""
+        if sid not in self.conn.streams:
+            return False
+        return self.conn.streams[sid].state.value != StreamState.CLOSED().value
 
     def pump_pending(mut self) raises:
         """Flush response bytes parked by a closed send window.
@@ -606,6 +708,18 @@ struct Http2Connection(Defaultable, Movable):
             sids.append(entry.key)
         for i in range(len(sids)):
             var sid = sids[i]
+            if not self._stream_still_sendable(sid):
+                # The peer reset it (or it closed some other way): the
+                # parked bytes can never be sent. Holding them kept the
+                # whole body in memory for the life of the connection,
+                # and closed streams do not count against the
+                # concurrency limit, so a client could pile them up.
+                _ = self.pending_body.pop(sid)
+                _ = self.pending_pos.pop(sid)
+                if sid in self.pending_trailers_k:
+                    _ = self.pending_trailers_k.pop(sid)
+                    _ = self.pending_trailers_v.pop(sid)
+                continue
             var pos = self.pending_pos[sid]
             # Moved out and back rather than borrowed: the body lives in
             # `self` and the call below takes `self` mutably. A `List` move is
@@ -615,29 +729,34 @@ struct Http2Connection(Defaultable, Movable):
             var n = self.queue_parked_body(sid, Span(body), pos)
             if pos + n >= total:
                 _ = self.pending_pos.pop(sid)
-                self.end_stream_response(sid, List[String](), List[String]())
+                var tk = List[String]()
+                var tv = List[String]()
+                if sid in self.pending_trailers_k:
+                    tk = self.pending_trailers_k.pop(sid)
+                    tv = self.pending_trailers_v.pop(sid)
+                self.end_stream_response(sid, tk, tv)
             else:
                 self.pending_body[sid] = body^
                 self.pending_pos[sid] = pos + n
 
     # ── WebSocket-over-HTTP/2 bridge (RFC 8441) ────────────────────────────
 
-    def take_extended_connect_streams(self) -> List[Int]:
+    def take_extended_connect_streams(self) raises -> List[Int]:
         """Return stream ids of open Extended CONNECT tunnels awaiting
         acceptance: ``:method=CONNECT`` + ``:protocol=websocket``, headers
         complete, not yet END_STREAM'd, still OPEN (RFC 8441). The
         ``:protocol`` marker is cleared by :meth:`accept_ws_over_h2`, so an
         accepted tunnel is not re-returned."""
         var ids = List[Int]()
-        for entry in self.conn.streams.items():
-            var s = entry[1].copy()
+        for sid in self.conn.streams.ids():
+            ref s = self.conn.streams[sid]
             if (
                 s.headers_complete
                 and not s.data_complete
                 and s.extended_connect_protocol == "websocket"
                 and s.state.value == StreamState.OPEN().value
             ):
-                ids.append(s.id)
+                ids.append(sid)
         return ids^
 
     def accept_ws_over_h2(mut self, sid: Int) raises:
@@ -700,9 +819,7 @@ struct Http2Connection(Defaultable, Movable):
         var hf = self.conn.make_stream_headers(
             sid, resp.status, Span[HpackHeader, _](hdrs)
         )
-        var bytes = encode_frame(hf)
-        for j in range(len(bytes)):
-            self.outbox.append(bytes[j])
+        encode_frame_into(hf, self.outbox)
 
     def _send_budget(self, sid: Int) raises -> Int:
         """How many body bytes may go out on `sid` right now.
@@ -770,6 +887,10 @@ struct Http2Connection(Defaultable, Movable):
         if budget <= 0:
             return 0
         var mfs = self.conn.max_frame_size
+        if mfs < H2_DEFAULT_FRAME_SIZE:
+            # Settings are validated on the way in; this only keeps a
+            # bad value from turning the loop below into a spin.
+            mfs = H2_DEFAULT_FRAME_SIZE
         var total = len(data)
         var sent = 0
         while sent < total and budget > 0:
@@ -778,19 +899,11 @@ struct Http2Connection(Defaultable, Movable):
                 take = mfs
             if take > budget:
                 take = budget
-            var df = Frame()
-            df.header.type = FrameType.DATA()
-            df.header.stream_id = sid
-            df.header.flags = FrameFlags()
-            # Two copies of the payload, both in one go: `data` into the
-            # frame, and the encoded frame into the outbox. A byte at a time
-            # they are the whole cost of a large response — every byte of it
-            # appended twice, individually.
-            var pl = List[UInt8]()
-            pl.extend(data[sent : sent + take])
-            df.payload = pl^
-            var bytes = encode_frame(df)
-            self.outbox.extend(Span(bytes))
+            # The payload is copied once, straight into the outbox.
+            encode_frame_header_into(
+                FrameType.DATA(), FrameFlags(), sid, take, self.outbox
+            )
+            self.outbox.extend(data[sent : sent + take])
             sent += take
             budget -= take
         self.conn.send_window -= sent
@@ -821,18 +934,15 @@ struct Http2Connection(Defaultable, Movable):
             var tf = self.conn.make_stream_trailers(
                 sid, Span[HpackHeader, _](trailers)
             )
-            var bytes = encode_frame(tf)
-            for j in range(len(bytes)):
-                self.outbox.append(bytes[j])
+            encode_frame_into(tf, self.outbox)
         else:
-            var df = Frame()
-            df.header.type = FrameType.DATA()
-            df.header.stream_id = sid
-            df.header.flags = FrameFlags(FrameFlags.END_STREAM())
-            df.payload = List[UInt8]()
-            var bytes = encode_frame(df)
-            for j in range(len(bytes)):
-                self.outbox.append(bytes[j])
+            encode_frame_header_into(
+                FrameType.DATA(),
+                FrameFlags(FrameFlags.END_STREAM()),
+                sid,
+                0,
+                self.outbox,
+            )
         var s = self.conn.streams[sid].copy()
         s.state = StreamState.CLOSED()
         self.conn.streams[sid] = s^

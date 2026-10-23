@@ -23,6 +23,7 @@ from std.collections import List
 from std.memory import unsafe_memcpy, Pointer
 
 from flare.http.response import Response
+from flare.http._scan import parse_content_length
 from flare.http.server import (
     _status_reason,
     _append_str,
@@ -103,11 +104,29 @@ def _put_bytes(
     return off + n
 
 
+def _head_length(buf: List[UInt8]) -> Int:
+    """Length of ``buf`` up to and including the first CRLFCRLF; the whole
+    buffer when there is no header terminator."""
+    var n = len(buf)
+    var i = 0
+    while i + 3 < n:
+        if (
+            buf[i] == 13
+            and buf[i + 1] == 10
+            and buf[i + 2] == 13
+            and buf[i + 3] == 10
+        ):
+            return i + 4
+        i += 1
+    return n
+
+
 def serialize_static_into(
     mut write_buf: List[UInt8],
     mut write_pos: Int,
     resp: StaticResponse,
     keep_alive: Bool,
+    head_request: Bool = False,
 ) -> None:
     """Queue a pre-encoded static response into ``write_buf``.
 
@@ -115,6 +134,11 @@ def serialize_static_into(
     pattern as :func:`serialize_response_into`) and pulls either
     the keep-alive or close variant of the pre-encoded bytes
     depending on ``keep_alive``.
+
+    When ``head_request`` is ``True`` (the request was ``HEAD``) only
+    the bytes up to and including the first ``CRLFCRLF`` are queued:
+    a response to HEAD MUST NOT carry content (RFC 9110 §9.3.2) and
+    ends at the header terminator (RFC 9112 §6.3).
     """
     write_buf.clear()
     write_pos = 0
@@ -128,8 +152,12 @@ def serialize_static_into(
     var n: Int
     if keep_alive:
         n = len(resp.keepalive_bytes)
+        if head_request:
+            n = _head_length(resp.keepalive_bytes)
     else:
         n = len(resp.close_bytes)
+        if head_request:
+            n = _head_length(resp.close_bytes)
     if write_buf.capacity() < n:
         write_buf.reserve(n)
     write_buf.resize(n, UInt8(0))
@@ -147,11 +175,48 @@ def serialize_static_into(
         )
 
 
+def _wire_status(status: Int) -> Int:
+    """A status code fit for the status line: 100-599, else 500."""
+    if status < 100 or status > 599:
+        return 500
+    return status
+
+
+def _wire_reason(resp: Response, status: Int) -> String:
+    """The reason phrase to put on the wire.
+
+    RFC 9112 sec 4 allows only HTAB, SP, VCHAR and obs-text there. A
+    handler-set reason holding anything else -- above all CR or LF, which
+    end the status line -- is replaced by the standard phrase instead of
+    being written verbatim, where it split the response.
+    """
+    var reason = resp.reason
+    if reason.byte_length() == 0 or status != resp.status:
+        return _status_reason(status)
+    var p = reason.unsafe_ptr()
+    for i in range(reason.byte_length()):
+        var c = p[unsafe_offset=i]
+        if (c < 32 and c != 9) or c == 127:
+            return _status_reason(status)
+    return reason
+
+
+def _declared_length(resp: Response) -> Int:
+    """The handler's own ``Content-Length``, or -1 when it set none (or
+    set one that is not a plain decimal)."""
+    for i in range(resp.headers.len()):
+        if _is_content_length(resp.headers._keys[i]):
+            return parse_content_length(resp.headers._values[i])
+    return -1
+
+
 def serialize_response_into(
     mut write_buf: List[UInt8],
     mut date_cache: DateCache,
     resp: Response,
     keep_alive: Bool,
+    head_request: Bool = False,
+    length_known: Bool = True,
 ) -> None:
     """Serialise ``resp`` into ``write_buf`` ready to be sent.
 
@@ -161,11 +226,40 @@ def serialize_response_into(
     The ``Date`` header is emitted from the caller-supplied
     :class:`flare.runtime.DateCache` (RFC 9110 §6.6.1); any
     caller-supplied ``Date`` field on ``resp`` is dropped.
+
+    Responses to HEAD, and 1xx, 204 and 304 responses, never carry
+    content (RFC 9110 sec 6.4.1). Writing the body anyway put bytes on
+    the wire that a keep-alive client -- or a proxy multiplexing many
+    users onto this connection -- reads as the start of the *next*
+    response. For HEAD and 304, ``Content-Length`` describes the
+    representation a GET would have returned: the handler's own
+    ``Content-Length`` if it set one, otherwise the length of the body
+    it produced. 1xx and 204 carry no ``Content-Length`` at all.
+
+    Args:
+        write_buf: Output buffer, cleared first.
+        date_cache: Per-connection ``Date`` formatter.
+        resp: Response to serialise.
+        keep_alive: Emit ``keep-alive`` rather than ``close``.
+        head_request: The request was HEAD: send the head only.
+        length_known: False for a streamed response whose length is
+            unknown; ``Content-Length`` is then written only if the
+            handler set it.
     """
-    var reason = resp.reason
-    if reason.byte_length() == 0:
-        reason = _status_reason(resp.status)
+    var status = _wire_status(resp.status)
+    var reason = _wire_reason(resp, status)
     var body_len = len(resp.body)
+    var no_length_field = status < 200 or status == 204
+    var no_content = no_length_field or head_request or status == 304
+    var length_value = body_len
+    if no_content:
+        var declared = _declared_length(resp)
+        if declared >= 0:
+            length_value = declared
+        elif not length_known:
+            no_length_field = True
+    var emit_len = not no_length_field
+    var emit_body = not no_content and body_len > 0
 
     # Date: RFC 9110 §6.6.1, IMF-fixdate from the per-connection
     # DateCache. The cache calls clock_gettime + (re)formats only
@@ -189,7 +283,7 @@ def serialize_response_into(
     #   "Date: " = 6, date_bytes, "\r\n" = 2
     #   "Connection: keep-alive\r\n" = 24  /  "Connection: close\r\n" = 19
     #   "\r\n" = 2 (header terminator), then body
-    var total = 9 + _decimal_digits(resp.status) + 1 + reason.byte_length() + 2
+    var total = 9 + _decimal_digits(status) + 1 + reason.byte_length() + 2
     for i in range(resp.headers.len()):
         var k = resp.headers._keys[i]
         # Case-insensitive skip of Content-Length, Connection, and Date
@@ -199,18 +293,20 @@ def serialize_response_into(
         if _is_content_length(k) or _is_connection(k) or _is_date(k):
             continue
         total += k.byte_length() + 2 + resp.headers._values[i].byte_length() + 2
-    total += 16 + _decimal_digits(body_len) + 2
+    if emit_len:
+        total += 16 + _decimal_digits(length_value) + 2
     total += 6 + date_len + 2
     total += 24 if keep_alive else 19
     total += 2
-    total += body_len
+    if emit_body:
+        total += body_len
 
     write_buf.clear()
     write_buf.resize(unsafe_uninit_length=total)
     var off = 0
 
     off = _put_str(write_buf, off, "HTTP/1.1 ")
-    off = _put_int(write_buf, off, resp.status)
+    off = _put_int(write_buf, off, status)
     off = _put_str(write_buf, off, " ")
     off = _put_str(write_buf, off, reason)
     off = _put_str(write_buf, off, "\r\n")
@@ -224,9 +320,10 @@ def serialize_response_into(
         off = _put_str(write_buf, off, resp.headers._values[i])
         off = _put_str(write_buf, off, "\r\n")
 
-    off = _put_str(write_buf, off, "Content-Length: ")
-    off = _put_int(write_buf, off, body_len)
-    off = _put_str(write_buf, off, "\r\n")
+    if emit_len:
+        off = _put_str(write_buf, off, "Content-Length: ")
+        off = _put_int(write_buf, off, length_value)
+        off = _put_str(write_buf, off, "\r\n")
 
     off = _put_str(write_buf, off, "Date: ")
     off = _put_bytes(write_buf, off, date_bytes.unsafe_ptr(), date_len)
@@ -239,7 +336,7 @@ def serialize_response_into(
 
     off = _put_str(write_buf, off, "\r\n")
 
-    if body_len > 0:
+    if emit_body:
         _ = _put_bytes(write_buf, off, resp.body.unsafe_ptr(), body_len)
 
 
@@ -260,16 +357,15 @@ def serialize_response_headers_chunked_into(
     so it uses the append-based writer rather than the single-pass
     exact-size writer ``serialize_response_into`` uses.
     """
-    var reason = resp.reason
-    if reason.byte_length() == 0:
-        reason = _status_reason(resp.status)
+    var status = _wire_status(resp.status)
+    var reason = _wire_reason(resp, status)
     date_cache.refresh()
     var date_bytes = date_cache.current_bytes()
 
     write_buf.clear()
     var wire = write_buf^
     _append_str(wire, "HTTP/1.1 ")
-    _append_str(wire, String(resp.status))
+    _append_str(wire, String(status))
     _append_str(wire, " ")
     _append_str(wire, reason)
     _append_str(wire, "\r\n")
@@ -305,9 +401,13 @@ def build_error_response(status: Int, reason: String) -> Response:
     """Build a minimal text/plain error response. The caller threads
     the result through :func:`serialize_response_into` to queue it
     onto the wire.
+
+    ``reason`` may be handler-authored text (``HttpStatusError`` or, with
+    ``expose_error_messages``, any error string), so it goes in the body
+    only. The status line carries the standard phrase for ``status``.
     """
     var body_str = String(status) + " " + reason
-    var resp = Response(status=status, reason=reason)
+    var resp = Response(status=status)
     var body_bytes = body_str.as_bytes()
     for i in range(len(body_bytes)):
         resp.body.append(body_bytes[i])

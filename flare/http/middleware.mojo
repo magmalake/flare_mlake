@@ -22,7 +22,6 @@ stays monomorphised — no virtual dispatch, no allocation per
 request.
 """
 
-from std.ffi import OwnedDLHandle, c_int
 from std.os import getenv
 from std.time import perf_counter_ns
 
@@ -34,7 +33,7 @@ from .encoding import (
 from .handler import Handler
 from .request import Request
 from .response import Response
-from ..utils.dylib import find_flare_lib, dl_sym
+from ..utils.dylib import pinned_flare_lib
 
 
 # ── Logger ─────────────────────────────────────────────────────────────────
@@ -111,6 +110,33 @@ struct RequestId[Inner: Handler & Copyable](Copyable, Handler):
         return resp^
 
 
+struct AltSvc[Inner: Handler & Copyable](Copyable, Handler):
+    """Advertise an HTTP/3 endpoint with ``Alt-Svc`` (RFC 7838, RFC 9114
+    sec 3.1.1) on every response, so a browser that reached the server
+    over HTTP/1.1 or HTTP/2 moves to HTTP/3 for later requests. Wrap the
+    handler served on the TCP listener of a server bound with
+    ``bind_with_http3``. A handler's own ``Alt-Svc`` is kept.
+    """
+
+    var inner: Self.Inner
+    var value: String
+    """``h3=":<port>"; ma=<max_age>``, built once."""
+
+    def __init__(
+        out self, var inner: Self.Inner, h3_port: Int, max_age_s: Int = 86400
+    ):
+        self.inner = inner^
+        self.value = (
+            String('h3=":') + String(h3_port) + '"; ma=' + String(max_age_s)
+        )
+
+    def serve(self, req: Request) raises -> Response:
+        var resp = self.inner.serve(req).lower()
+        if not resp.headers.contains("alt-svc"):
+            resp.headers.set("Alt-Svc", self.value)
+        return resp^
+
+
 # ── Compress ───────────────────────────────────────────────────────────────
 
 
@@ -170,9 +196,16 @@ def negotiate_encoding(accept: String, brotli_ok: Bool) -> _AcceptEncodingPick:
     """Pick the best ``Content-Encoding`` for an ``Accept-Encoding``.
 
     Walks every comma-separated entry, parses ``;q=<weight>`` per
-    RFC 9110 paragraph 12.5.3, and returns the highest-q entry from
+    RFC 9110 paragraph 12.5.3, and returns the highest-q coding from
     {``br``, ``gzip``, ``identity``} that the client accepts. Ties
     break on brotli > gzip > identity (matches nginx default).
+
+    A coding's weight is the largest weight of an entry naming it; a
+    coding with no entry of its own takes the weight of ``*`` ("any
+    content coding not explicitly listed"), so the result does not
+    depend on entry order and ``identity;q=0, *`` never selects the
+    refused identity (APP-20). When every weight is 0 the pick is
+    ``identity`` with quality 0.
 
     Args:
         accept: Raw ``Accept-Encoding`` header value.
@@ -188,8 +221,11 @@ def negotiate_encoding(accept: String, brotli_ok: Bool) -> _AcceptEncodingPick:
     var n = accept.byte_length()
     var src = accept.unsafe_ptr()
     var pos = 0
-    var best_q = 0
-    var best_enc = "identity"
+    # Per-coding maxima over the explicit entries; -1 = no entry.
+    var br_q = -1
+    var gzip_q = -1
+    var id_q = -1
+    var star_q = -1
     while pos < n:
         var end = n
         for i in range(pos, n):
@@ -231,82 +267,50 @@ def negotiate_encoding(accept: String, brotli_ok: Bool) -> _AcceptEncodingPick:
                         break
             if pos_q >= 0:
                 q = _parse_q(String(unsafe_from_utf8=rest.as_bytes()[pos_q:]))
-        # Wildcard accepts anything; treat as "identity" if no specific match
-        # has been found yet (we still prefer concrete entries).
         if lower == "*":
-            if best_q == 0:
-                best_q = q
-                best_enc = "identity"
-            continue
-        if lower == "br" and brotli_ok:
-            if q > best_q or (q == best_q and best_enc != "br"):
-                best_q = q
-                best_enc = "br"
+            star_q = max(star_q, q)
+        elif lower == "br":
+            br_q = max(br_q, q)
         elif lower == "gzip":
-            if q > best_q or (q == best_q and best_enc == "identity"):
-                best_q = q
-                best_enc = "gzip"
+            gzip_q = max(gzip_q, q)
         elif lower == "identity":
-            if q > best_q:
-                best_q = q
-                best_enc = "identity"
+            id_q = max(id_q, q)
+    # A coding with no entry of its own takes the weight of ``*``
+    # (none = 0). Brotli counts only when it is linkable.
+    var star_w = max(star_q, 0)
+    var w_br = 0
+    if brotli_ok:
+        w_br = br_q if br_q >= 0 else star_w
+    var w_gzip = gzip_q if gzip_q >= 0 else star_w
+    var w_id = id_q if id_q >= 0 else star_w
+    var best_q = max(w_br, max(w_gzip, w_id))
     if best_q == 0:
         # No acceptable encoding found.
         pick.encoding = "identity"
         pick.quality = 0
         return pick^
-    pick.encoding = best_enc
+    if w_br == best_q:
+        pick.encoding = "br"
+    elif w_gzip == best_q:
+        pick.encoding = "gzip"
+    else:
+        pick.encoding = "identity"
     pick.quality = best_q
     return pick^
 
 
 def _brotli_available() -> Bool:
-    """Best-effort check that ``libflare_brotli.so`` is loadable.
+    """Whether ``libflare_brotli.so`` loads.
 
-    Probes the canonical path resolved by
-    :func:`flare.utils.dylib.find_flare_lib` (``CONDA_PREFIX``
-    ↦ ``build/`` fallback). Pure-syscall (``access(2)``) -- no
-    Mojo OwnedDLHandle hot path, so it's safe to call once per
-    request.
-    """
-    return _file_exists(find_flare_lib("brotli"))
-
-
-def _flare_fs_access(imm lib: OwnedDLHandle, addr: Int) raises -> c_int:
-    """Invoke ``flare_fs_access`` while ``lib`` is borrowed by the caller.
-
-    Taking ``lib`` as ``read`` ties the dylib's lifetime to the caller's
-    frame, so Mojo's ASAP destructor cannot drop the handle (and thus
-    ``dlclose`` it) before the resolved function pointer is invoked.
-    Without this, ``_file_exists`` segfaults inside the runtime call
-    helper on macOS arm64: the function-local ``OwnedDLHandle`` is
-    reclaimed after ``get_function`` and the cached pointer dangles
-    into unmapped memory by the time we call it.
-    """
-    var fn_access = dl_sym[def(Int) thin abi("C") -> c_int](
-        lib, "flare_fs_access"
-    )
-    return fn_access(addr)
-
-
-def _file_exists(path: String) -> Bool:
-    """Return whether ``path`` exists.
-
-    Routes through ``libflare_fs.so`` (``flare_fs_access``) so the
-    middleware does not register conflicting ``access(2)`` external_call
-    signatures with the stdlib.
+    The answer comes from the pinned process-wide handle, so after the
+    first call it costs a global-table lookup, not a syscall. It also
+    finds the library wherever the loader would, where the old
+    ``access(2)`` probe of the resolved path missed a library found on
+    the loader's search path.
     """
     try:
-        var lib = OwnedDLHandle(find_flare_lib("fs"))
-        var n = path.byte_length()
-        var c = List[UInt8](length=n + 1, fill=UInt8(0))
-        var src = path.unsafe_ptr()
-        for i in range(n):
-            c[i] = src[unsafe_offset=i]
-        var addr = Int(c.unsafe_ptr())
-        var rc = Int(_flare_fs_access(lib, addr))
-        _ = c^
-        return rc == 0
+        _ = pinned_flare_lib["brotli"]()
+        return True
     except:
         return False
 
@@ -317,12 +321,18 @@ struct Compress[Inner: Handler & Copyable](Copyable, Handler):
     Inspects the inbound ``Accept-Encoding`` header, picks the
     highest-q entry from {``br``, ``gzip``, ``identity``}, and
     encodes the inner response body accordingly. Sets
-    ``Content-Encoding`` and ``Vary: Accept-Encoding`` on the
-    response.
+    ``Content-Encoding`` on the response. ``Vary: Accept-Encoding``
+    is set on every response whose representation depends on the
+    request (body at least ``min_size_bytes``, not already encoded,
+    not partial), including those left as identity, so shared caches
+    never serve the identity variant to a client that accepts gzip.
 
     Bodies smaller than ``min_size_bytes`` (default 1024) are passed
     through untouched — the per-request encoder overhead beats the
-    transfer-time savings on small bodies.
+    transfer-time savings on small bodies. Partial-content responses
+    (status 206, or any response carrying ``Content-Range``, such as
+    ``FileServer`` answering a ``Range:`` request) are passed through
+    unencoded so ``Content-Range`` keeps matching the body.
     """
 
     var inner: Self.Inner
@@ -347,12 +357,23 @@ struct Compress[Inner: Handler & Copyable](Copyable, Handler):
         var brotli_ok = _brotli_available()
         var pick = negotiate_encoding(accept, brotli_ok)
         var resp = self.inner.serve(req).lower()
-        if pick.quality == 0:
-            return resp^
         if len(resp.body) < self.min_size_bytes:
             return resp^
         if resp.headers.contains("content-encoding"):
             # Already encoded upstream; don't double-compress.
+            return resp^
+        if resp.status == 206 or resp.headers.contains("content-range"):
+            # Partial content: the offsets in Content-Range refer to the
+            # selected representation (RFC 9110 §14.4, §8.4). Encoding the
+            # already-cut range would leave a Content-Range that no longer
+            # matches the body, so pass it through untouched.
+            return resp^
+        # From here the representation depends on Accept-Encoding, whether
+        # we encode it or send it as identity (no header, identity
+        # preferred, every coding refused): RFC 9110 §12.5.5 says to name
+        # the field so a shared cache keeps the variants apart.
+        resp.headers.append("Vary", "Accept-Encoding")
+        if pick.quality == 0:
             return resp^
         if pick.encoding == "br" and brotli_ok:
             var encoded = compress_brotli(
@@ -369,7 +390,6 @@ struct Compress[Inner: Handler & Copyable](Copyable, Handler):
         else:
             return resp^
         resp.headers.set("Content-Length", String(len(resp.body)))
-        resp.headers.append("Vary", "Accept-Encoding")
         return resp^
 
 

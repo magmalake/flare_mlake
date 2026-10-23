@@ -71,8 +71,14 @@ struct SharedHandler(Copyable, Handler):
     def serve(self, req: Request) raises -> Response:
         if req.url == "/hello":
             return ok("Hello from flare across every wire!")
+        if req.url == "/upload":
+            # On h3 with ``stream_request_bodies`` the body arrives after
+            # the handler runs; echo it back as it comes in.
+            var r = ok("")
+            r.body_stream = req.body_stream()
+            return r^
         var body = String("you reached ") + req.method + String(" ") + req.url
-        return ok(body^)
+        return ok(body)
 
 
 # ── Walkthrough ───────────────────────────────────────────────────────
@@ -90,6 +96,7 @@ def main() raises:
     var udp_cfg = QuicServerConfig()
     udp_cfg.host = String("127.0.0.1")
     udp_cfg.port = UInt16(0)
+    udp_cfg.http3.stream_request_bodies = True
     var srv = HttpServer.bind_with_http3(tcp_addr, udp_cfg^)
 
     print("[bind] TCP listener:", String(srv.local_addrs()[0]))
@@ -141,7 +148,7 @@ def main() raises:
     var req = Request(
         method=String("GET"), url=String("/hello"), body=List[UInt8]()
     )
-    var resp = handler.serve(req^)
+    var resp = handler.serve(req)
     print("    response status:", resp.status)
     print(
         "    response body:",
@@ -159,10 +166,11 @@ def main() raises:
     print("    streams dispatched this pass:", dispatched)
     print()
 
-    # Step 6: Http3Connection is what the QUIC reactor will hand
-    # each accepted QUIC connection to. Build one + verify it
-    # emits the server SETTINGS that the listener will write
-    # on the new control stream.
+    # Step 6: Http3Connection is what the QUIC reactor hands each
+    # accepted QUIC connection to. Build one and look at the server
+    # SETTINGS bytes; the listener sends exactly these (via
+    # take_control_stream_start) on stream 3, the server's control
+    # stream, with the first 1-RTT flight.
     var h3 = Http3Connection.with_config(Http3Config())
     var initial_settings = h3.emit_initial_settings()
     print("[h3] initial server SETTINGS emit length =", len(initial_settings))

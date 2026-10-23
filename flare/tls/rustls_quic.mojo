@@ -69,6 +69,9 @@ from ._rustls_quic_ffi import (
     _do_packet_decrypt,
     _do_header_encrypt,
     _do_header_decrypt,
+    _do_key_update,
+    _do_packet_decrypt_1rtt,
+    RustlsQuicPacketFns,
     _do_last_error,
     _find_rustls_quic_lib,
     _encode_alpn_wire,
@@ -284,6 +287,9 @@ struct RustlsQuicAcceptor(Movable):
     Same defensive pattern as :class:`flare.tls._server_ffi.ServerCtx`.
     """
 
+    var _fns: RustlsQuicPacketFns
+    """Per-packet entry points of :attr:`_lib`, resolved once."""
+
     def __init__(out self, var config: RustlsQuicConfig) raises:
         """Construct an acceptor from the supplied config.
 
@@ -315,6 +321,7 @@ struct RustlsQuicAcceptor(Movable):
             alpn_wire,
             config.max_early_data_size,
         )
+        self._fns = RustlsQuicPacketFns(lib)
         self._lib = lib^
         self._opaque_handle = handle
         self.config = config^
@@ -373,10 +380,9 @@ struct RustlsQuicAcceptor(Movable):
             var detail = _do_last_error(self._lib)
             raise Error(String("RustlsQuicAcceptor.accept failed: ") + detail)
         # Each session opens its own OwnedDLHandle. The .so
-        # itself stays mapped via LD_PRELOAD (set by the
-        # build_rustls.sh activation script on Linux) and via
-        # the acceptor's own handle, so opening multiple times
-        # is just a refcount bump.
+        # itself stays mapped via the acceptor's own handle (and,
+        # on Linux, its -z nodelete link flag), so opening
+        # multiple times is just a refcount bump.
         var session_lib = OwnedDLHandle(_find_rustls_quic_lib())
         return RustlsQuicSession._wrap(
             session_lib^, session_handle, dst_cid.copy()
@@ -575,6 +581,9 @@ struct RustlsQuicSession(Movable):
     """Pinned library handle so ``dlclose`` doesn't tear the
     .so out from under the in-flight FFI calls."""
 
+    var _fns: RustlsQuicPacketFns
+    """Per-packet entry points of :attr:`_lib`, resolved once."""
+
     var _level: Int
     """Current outbound encryption level. Starts at
     :data:`QuicEncryptionLevel.INITIAL`; advances as the
@@ -589,6 +598,7 @@ struct RustlsQuicSession(Movable):
         :meth:`RustlsQuicAcceptor.accept`.
         """
         self._lib = OwnedDLHandle(_find_rustls_quic_lib())
+        self._fns = RustlsQuicPacketFns(self._lib)
         self.dst_cid = dst_cid.copy()
         self._opaque_session_handle = 0
         self._level = QuicEncryptionLevel.INITIAL
@@ -604,9 +614,10 @@ struct RustlsQuicSession(Movable):
 
         Each session gets its own ``OwnedDLHandle`` so the .so
         refcount stays high until the session drops; on Linux the
-        ``LD_PRELOAD`` from ``build_rustls.sh`` is the additional
+        ``-z nodelete`` link flag is the additional
         belt-and-suspenders pin.
         """
+        self._fns = RustlsQuicPacketFns(lib)
         self._lib = lib^
         self._opaque_session_handle = handle
         self.dst_cid = dst_cid^
@@ -812,7 +823,7 @@ struct RustlsQuicSession(Movable):
         if self._opaque_session_handle == 0:
             raise Error("RustlsQuicSession.packet_encrypt: NULL session handle")
         return _do_packet_encrypt(
-            self._lib,
+            self._fns,
             self._opaque_session_handle,
             level,
             packet_number,
@@ -839,13 +850,41 @@ struct RustlsQuicSession(Movable):
         if self._opaque_session_handle == 0:
             raise Error("RustlsQuicSession.packet_decrypt: NULL session handle")
         return _do_packet_decrypt(
-            self._lib,
+            self._fns,
             self._opaque_session_handle,
             level,
             packet_number,
             header,
             payload,
         )
+
+    def packet_decrypt_1rtt(
+        self,
+        key_phase: Int,
+        packet_number: UInt64,
+        header: List[UInt8],
+        mut payload: List[UInt8],
+    ) raises -> Int:
+        """Open a 1-RTT ``payload`` in place under the header's key
+        phase bit (RFC 9001 sec 6.3). Returns 1 when the peer started a
+        key update and the keys rotated, else 0; raises on failure."""
+        if self._opaque_session_handle == 0:
+            raise Error("RustlsQuicSession.packet_decrypt_1rtt: NULL session")
+        return _do_packet_decrypt_1rtt(
+            self._fns,
+            self._opaque_session_handle,
+            key_phase,
+            packet_number,
+            header,
+            payload,
+        )
+
+    def key_update(self) raises -> Int:
+        """Start a 1-RTT key update (RFC 9001 sec 6.1); returns the new
+        key phase bit."""
+        if self._opaque_session_handle == 0:
+            raise Error("RustlsQuicSession.key_update: NULL session")
+        return _do_key_update(self._lib, self._opaque_session_handle)
 
     def header_encrypt(
         self,
@@ -868,10 +907,10 @@ struct RustlsQuicSession(Movable):
         if self._opaque_session_handle == 0:
             raise Error("RustlsQuicSession.header_encrypt: NULL session handle")
         _do_header_encrypt(
-            self._lib,
+            self._fns,
             self._opaque_session_handle,
             level,
-            sample,
+            Span(sample),
             first_byte_addr,
             pn_addr,
             pn_len,
@@ -893,10 +932,10 @@ struct RustlsQuicSession(Movable):
         if self._opaque_session_handle == 0:
             raise Error("RustlsQuicSession.header_decrypt: NULL session handle")
         _do_header_decrypt(
-            self._lib,
+            self._fns,
             self._opaque_session_handle,
             level,
-            sample,
+            Span(sample),
             first_byte_addr,
             pn_addr,
             pn_len,

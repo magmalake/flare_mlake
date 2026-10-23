@@ -40,6 +40,16 @@ comptime _BODY: Int = 100_000
 """Comfortably past the 65535-byte default window, so the send parks."""
 
 
+def _preface_bytes() -> List[UInt8]:
+    """The client magic followed by the empty SETTINGS frame RFC 9113 sec 3.4
+    requires as its first frame."""
+    var out = List[UInt8](String(H2_PREFACE).as_bytes())
+    var st = Frame()
+    st.header.type = FrameType.SETTINGS()
+    out.extend(Span[UInt8, _](encode_frame(st)))
+    return out^
+
+
 def _get_frame(sid: Int) raises -> List[UInt8]:
     var enc = HpackEncoder()
     var hdrs = List[HpackHeader]()
@@ -93,7 +103,12 @@ def _tally(bytes: List[UInt8]) raises -> _Tally:
             headers += 1
         elif f.header.type.value == FrameType.DATA().value:
             data_bytes += f.header.length
-        if f.header.flags.has(FrameFlags.END_STREAM()):
+        # Flag 0x1 is ACK on SETTINGS/PING: only HEADERS and DATA carry
+        # END_STREAM.
+        if (
+            f.header.type.value == FrameType.HEADERS().value
+            or f.header.type.value == FrameType.DATA().value
+        ) and f.header.flags.has(FrameFlags.END_STREAM()):
             end_stream = True
         var consumed = 9 + f.header.length
         var tail = List[UInt8](capacity=len(rest) - consumed)
@@ -106,7 +121,7 @@ def _tally(bytes: List[UInt8]) raises -> _Tally:
 def _served_connection() raises -> Http2Connection:
     """A connection whose stream 1 has a parked 100 KB response."""
     var c = Http2Connection()
-    c.feed(Span[UInt8, _](List[UInt8](String(H2_PREFACE).as_bytes())))
+    c.feed(Span[UInt8, _](_preface_bytes()))
     c.feed(Span[UInt8, _](_get_frame(1)))
     var ready = c.take_completed_streams()
     assert_equal(len(ready), 1)
@@ -166,6 +181,207 @@ def test_whole_body_survives_the_park() raises:
         if guard > 64:
             raise Error("pump made no progress")
     assert_equal(sent, _BODY)
+
+
+def _connection_with_stream(sid: Int) raises -> Http2Connection:
+    var c = Http2Connection()
+    var preface = List[UInt8](String(H2_PREFACE).as_bytes())
+    c.feed(Span[UInt8, _](preface))
+    var settings = Frame()
+    settings.header.type = FrameType.SETTINGS()
+    c.feed(Span[UInt8, _](encode_frame(settings)))
+    c.feed(Span[UInt8, _](_get_frame(sid)))
+    _ = c.take_completed_streams()
+    _ = c.drain()
+    return c^
+
+
+def _largest_data_frame(bytes: List[UInt8]) raises -> Int:
+    var rest = bytes.copy()
+    var biggest = 0
+    while True:
+        var got = parse_frame(Span[UInt8, _](rest))
+        if not got:
+            break
+        var f = got.value().copy()
+        if f.header.type.value == FrameType.DATA().value:
+            biggest = max(biggest, f.header.length)
+        var consumed = 9 + f.header.length
+        var tail = List[UInt8](capacity=len(rest) - consumed)
+        for k in range(consumed, len(rest)):
+            tail.append(rest[k])
+        rest = tail^
+    return biggest
+
+
+def test_response_with_trailers_is_flow_controlled() raises:
+    """Every gRPC response has trailers, and trailers used to force the
+    one-shot framing: one oversized DATA frame, window ignored."""
+    var c = _connection_with_stream(1)
+    var resp = Response(Status.OK)
+    resp.body = List[UInt8](length=_BODY, fill=UInt8(0x61))
+    resp.trailers.set("grpc-status", "0")
+    c.emit_response(1, resp^)
+    var first = c.drain()
+    var t1 = _tally(first)
+    assert_equal(t1.data_bytes, 65535, "sent more than the window allowed")
+    assert_true(_largest_data_frame(first) <= 16384, "oversized DATA frame")
+    assert_true(not t1.end_stream)
+    c.feed(Span[UInt8, _](_window_update(1, 65535)))
+    c.feed(Span[UInt8, _](_window_update(0, 65535)))
+    c.pump_pending()
+    var t2 = _tally(c.drain())
+    assert_equal(t2.data_bytes, _BODY - 65535)
+    assert_equal(t2.headers, 1, "the trailers go out after the body")
+    assert_true(t2.end_stream)
+
+
+def test_small_responses_spend_the_window() raises:
+    """A body that fits still consumes the window; otherwise concurrent
+    responses all passed against the same stale budget."""
+    var c = _connection_with_stream(1)
+    var before = c.conn.send_window
+    var resp = Response(Status.OK)
+    resp.body = List[UInt8](length=1000, fill=UInt8(0x61))
+    c.emit_response(1, resp^)
+    assert_equal(c.conn.send_window, before - 1000)
+
+
+def test_frames_after_a_connection_error_are_not_processed() raises:
+    """After GOAWAY the connection is over. A request that arrived in the
+    same read as the error used to be dispatched anyway."""
+    var c = Http2Connection()
+    var buf = List[UInt8](String(H2_PREFACE).as_bytes())
+    var settings = Frame()
+    settings.header.type = FrameType.SETTINGS()
+    buf.extend(Span[UInt8, _](encode_frame(settings)))
+    var ping = Frame()  # PING on a stream is a connection error
+    ping.header.type = FrameType.PING()
+    ping.header.stream_id = 1
+    ping.payload = List[UInt8](length=8, fill=UInt8(0))
+    ping.header.length = 8
+    buf.extend(Span[UInt8, _](encode_frame(ping)))
+    buf.extend(Span[UInt8, _](_get_frame(3)))
+    c.feed(Span[UInt8, _](buf))
+    assert_true(c.conn.goaway_sent)
+    assert_equal(len(c.take_completed_streams()), 0)
+
+
+def test_parked_body_is_released_when_the_peer_resets() raises:
+    var c = _served_connection()
+    _ = c.drain()
+    assert_equal(len(c.pending_body), 1)
+    var rst = Frame()
+    rst.header.type = FrameType.RST_STREAM()
+    rst.header.stream_id = 1
+    rst.payload = List[UInt8](length=4, fill=UInt8(0))
+    rst.payload[3] = UInt8(0x8)  # CANCEL
+    rst.header.length = 4
+    c.feed(Span[UInt8, _](encode_frame(rst)))
+    c.feed(Span[UInt8, _](_window_update(0, 65535)))
+    c.pump_pending()
+    assert_equal(len(c.pending_body), 0, "parked bytes outlived the stream")
+    assert_equal(_tally(c.drain()).data_bytes, 0)
+
+
+def test_closed_streams_do_not_accumulate() raises:
+    """Every stream a connection served used to stay in its table for the
+    connection's life; memory and per-HEADERS work grew with its age."""
+    var c = Http2Connection()
+    c.feed(Span[UInt8, _](_preface_bytes()))
+    for k in range(400):
+        var sid = 2 * k + 1
+        c.feed(Span[UInt8, _](_get_frame(sid)))
+        var ready = c.take_completed_streams()
+        assert_equal(len(ready), 1)
+        _ = c.take_request(sid)
+        c.emit_response(sid, Response(Status.OK))
+        _ = c.drain()
+    assert_true(
+        len(c.conn.streams) <= 257,
+        "stream table grew to " + String(len(c.conn.streams)),
+    )
+
+
+def test_many_small_frames_in_one_read() raises:
+    """feed copied the rest of the inbox after every frame; a burst of
+    small frames was quadratic. 3000 PINGs in one read must all be
+    answered."""
+    var c = Http2Connection()
+    var buf = _preface_bytes()
+    for _ in range(3000):
+        var p = Frame()
+        p.header.type = FrameType.PING()
+        p.payload = List[UInt8](length=8, fill=UInt8(1))
+        p.header.length = 8
+        buf.extend(Span[UInt8, _](encode_frame(p)))
+    c.feed(Span[UInt8, _](buf))
+    var out = c.drain()
+    var acks = 0
+    var rest = out^
+    var off = 0
+    while off + 9 <= len(rest):
+        var ln = (
+            (Int(rest[off]) << 16)
+            | (Int(rest[off + 1]) << 8)
+            | Int(rest[off + 2])
+        )
+        if Int(rest[off + 3]) == 0x6:
+            acks += 1
+        off += 9 + ln
+    assert_equal(acks, 3000)
+
+
+def test_oversized_frame_is_refused_from_its_header() raises:
+    """The size check ran after the whole declared payload had been
+    buffered, up to 16 MiB of it."""
+    var c = Http2Connection()
+    var buf = List[UInt8](String(H2_PREFACE).as_bytes())
+    # DATA header declaring 1 MiB, with no payload sent at all.
+    buf.append(UInt8(0x10))
+    buf.append(UInt8(0x00))
+    buf.append(UInt8(0x00))
+    buf.append(UInt8(0x0))
+    buf.append(UInt8(0x0))
+    for _ in range(4):
+        buf.append(UInt8(0))
+    c.feed(Span[UInt8, _](buf))
+    assert_true(c.conn.goaway_sent, "waited for 1 MiB before refusing it")
+
+
+def test_content_length_overrun_is_caught_on_the_frame() raises:
+    var c = Http2Connection()
+    c.feed(Span[UInt8, _](_preface_bytes()))
+    var enc = HpackEncoder()
+    var hdrs = List[HpackHeader]()
+    hdrs.append(HpackHeader(":method", "POST"))
+    hdrs.append(HpackHeader(":scheme", "https"))
+    hdrs.append(HpackHeader(":path", "/"))
+    hdrs.append(HpackHeader(":authority", "example.com"))
+    hdrs.append(HpackHeader("content-length", "5"))
+    var h = Frame()
+    h.header.type = FrameType.HEADERS()
+    h.header.stream_id = 1
+    h.header.flags = FrameFlags(FrameFlags.END_HEADERS())
+    h.payload = enc.encode(Span[HpackHeader, _](hdrs))
+    c.feed(Span[UInt8, _](encode_frame(h)))
+    var d = Frame()
+    d.header.type = FrameType.DATA()
+    d.header.stream_id = 1
+    d.payload = List[UInt8](length=50, fill=UInt8(0x61))
+    d.header.length = 50
+    c.feed(Span[UInt8, _](encode_frame(d)))
+    var out = c.drain()
+    var rst = False
+    var off = 0
+    while off + 9 <= len(out):
+        var ln = (
+            (Int(out[off]) << 16) | (Int(out[off + 1]) << 8) | Int(out[off + 2])
+        )
+        if Int(out[off + 3]) == 0x3:
+            rst = True
+        off += 9 + ln
+    assert_true(rst, "50 bytes against content-length 5 were accepted")
 
 
 def main() raises:

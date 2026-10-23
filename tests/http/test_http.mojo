@@ -189,6 +189,28 @@ def test_header_len() raises:
     assert_equal(h.len(), 3)
 
 
+def test_header_fields_in_order() raises:
+    """Every field is reachable in insertion order, repeats kept apart."""
+    var h = HeaderMap()
+    h.append("Accept", "a")
+    h.append("Cookie", "x=1")
+    h.append("accept", "b")
+    h.append("Cookie", "y=2")
+    var got = String()
+    for i in range(h.len()):
+        got += h.name_at(i) + "=" + h.value_at(i) + ";"
+    assert_equal(got, "Accept=a;Cookie=x=1;accept=b;Cookie=y=2;")
+
+
+def test_header_field_index_out_of_range() raises:
+    var h = HeaderMap()
+    h.append("A", "1")
+    with assert_raises():
+        _ = h.name_at(1)
+    with assert_raises():
+        _ = h.value_at(-1)
+
+
 def test_header_get_absent() raises:
     """HeaderMap.get() on an absent key must return empty string."""
     var h = HeaderMap()
@@ -254,6 +276,56 @@ def test_url_query_string() raises:
     assert_equal(u.path, "/search")
     assert_equal(u.query, "q=hello&lang=en")
     assert_equal(u.request_target(), "/search?q=hello&lang=en")
+
+
+def test_url_authority_ends_at_query() raises:
+    """APP-23: the authority ends at the first '?' (RFC 3986 §3.2), so a
+    '@' in the query is not userinfo and the host cannot be confused."""
+    var u = Url.parse("http://evil.com?@good.com/")
+    assert_equal(u.host, "evil.com")
+    assert_equal(u.path, "/")
+    assert_equal(u.query, "@good.com/")
+    assert_equal(u.request_target(), "/?@good.com/")
+    var v = Url.parse("http://good.com?x=/y")
+    assert_equal(v.host, "good.com")
+    assert_equal(v.path, "/")
+    assert_equal(v.query, "x=/y")
+    var w = Url.parse("http://good.com:8080?x=1#frag")
+    assert_equal(w.host, "good.com")
+    assert_equal(Int(w.port), 8080)
+    assert_equal(w.query, "x=1")
+    assert_equal(w.fragment, "frag")
+
+
+def test_url_fragment_starts_at_first_hash() raises:
+    """APP-23: the fragment starts at the first '#', so a later '#'
+    cannot smuggle an '@' into the authority."""
+    var u = Url.parse("http://evil.com#@good.com#x")
+    assert_equal(u.host, "evil.com")
+    assert_equal(u.fragment, "@good.com#x")
+    var v = Url.parse("http://h.example/p?q=1#a#b")
+    assert_equal(v.path, "/p")
+    assert_equal(v.query, "q=1")
+    assert_equal(v.fragment, "a#b")
+
+
+def test_url_userinfo_split_at_last_at() raises:
+    """APP-25: userinfo ends at the LAST '@' of the authority, so a second
+    '@' cannot leave an '@' in the host (WHATWG / curl pick ``good.com``)."""
+    var u = Url.parse("http://a@evil.com@good.com/")
+    assert_equal(u.host, "good.com")
+    assert_equal(Int(u.port), 80)
+    assert_equal(u.path, "/")
+    var v = Url.parse("https://user:p@ss@good.com:8443/x?y=1")
+    assert_equal(v.host, "good.com")
+    assert_equal(Int(v.port), 8443)
+    assert_equal(v.path, "/x")
+    assert_equal(v.query, "y=1")
+    # A single '@' and no '@' behave as before.
+    assert_equal(Url.parse("http://user:pw@example.com/").host, "example.com")
+    assert_equal(Url.parse("http://example.com/").host, "example.com")
+    # An '@' in the path or query is never userinfo.
+    assert_equal(Url.parse("http://example.com/a@b").host, "example.com")
 
 
 def test_url_empty_path() raises:
@@ -393,7 +465,7 @@ def test_http_server_get_loopback() raises:
     assert_equal(req.method, "GET")
     assert_equal(req.url, "/")
 
-    var resp = handler(req^)
+    var resp = handler(req)
     _write_response(server_stream, resp)
     server_stream.close()
 

@@ -10,6 +10,7 @@ fallback when raw is shorter.
 from std.testing import assert_equal, assert_true, assert_false
 from std.collections.span import Span
 
+from flare.http.hpack_huffman import huffman_encode
 from flare.qpack import (
     QPACK_STATIC_TABLE_SIZE,
     QpackHeader,
@@ -54,6 +55,24 @@ def test_static_table_find_full_match() raises:
     assert_equal(static_table_find(":method", "GET"), 17)
     assert_equal(static_table_find(":scheme", "https"), 23)
     assert_equal(static_table_find("missing", "value"), -1)
+
+
+def test_static_table_every_entry_round_trips() raises:
+    """Each index finds itself (or an earlier duplicate pair) and
+    survives an encode/decode round trip as a single indexed line."""
+    for i in range(QPACK_STATIC_TABLE_SIZE):
+        var h = static_table_lookup(i)
+        var idx = static_table_find(h.name, h.value)
+        assert_true(idx >= 0 and idx <= i)
+        assert_equal(static_table_lookup(idx).value, h.value)
+        assert_true(static_table_find_name(h.name) <= idx)
+        var hs = List[QpackHeader]()
+        hs.append(h.copy())
+        var wire = List[UInt8]()
+        encode_field_section(hs, wire)
+        var back = decode_field_section(Span[UInt8, _](wire))
+        assert_equal(back[0].name, h.name)
+        assert_equal(back[0].value, h.value)
 
 
 def test_static_table_find_name_only() raises:
@@ -168,11 +187,127 @@ def test_round_trip_long_value_uses_huffman_when_shorter() raises:
     assert_equal(decoded[0].value, headers[0].value)
 
 
+def _decode_raises(buf: List[UInt8]) -> Bool:
+    try:
+        var _ = decode_field_section(Span[UInt8, _](buf))
+    except:
+        return True
+    return False
+
+
+def test_raw_literal_value_that_is_not_utf8_is_refused() raises:
+    """QPACK-03: a literal value was handed to ``ascii_unchecked_string``
+    unvalidated, so byte 0xFF became a ``String`` holding invalid UTF-8."""
+    # RIC=0, Base=0, literal with static name ref :authority, raw value
+    # of length 1: 0xFF.
+    assert_true(_decode_raises(_bytes(0x00, 0x00, 0x50, 0x01, 0xFF)))
+    # A lone continuation byte and a truncated 2-byte sequence.
+    assert_true(_decode_raises(_bytes(0x00, 0x00, 0x50, 0x01, 0x80)))
+    assert_true(_decode_raises(_bytes(0x00, 0x00, 0x50, 0x01, 0xC3)))
+
+
+def test_huffman_literal_value_that_is_not_utf8_is_refused() raises:
+    var raw = List[UInt8]()
+    raw.append(UInt8(0xFF))
+    var huff = List[UInt8]()
+    huffman_encode(raw, huff)
+    var buf = _bytes(0x00, 0x00, 0x50)
+    buf.append(UInt8(0x80) | UInt8(len(huff)))
+    for i in range(len(huff)):
+        buf.append(huff[i])
+    assert_true(_decode_raises(buf))
+
+
+def test_literal_name_that_is_not_utf8_is_refused() raises:
+    # 001N Hxxx literal name, length 1 (raw): 0xFF, then value "a".
+    assert_true(_decode_raises(_bytes(0x00, 0x00, 0x21, 0xFF, 0x01, 0x61)))
+
+
+def test_valid_utf8_literal_value_is_still_accepted() raises:
+    # "caf\xC3\xA9" is valid UTF-8; ASCII values are unaffected.
+    var buf = _bytes(0x00, 0x00, 0x50, 0x05, 0x63, 0x61, 0x66, 0xC3, 0xA9)
+    var out = decode_field_section(Span[UInt8, _](buf))
+    assert_equal(len(out), 1)
+    assert_equal(out[0].value, String("caf\u00e9"))
+    var ascii = _bytes(0x00, 0x00, 0x50, 0x03, 0x61, 0x62, 0x63)
+    var out2 = decode_field_section(Span[UInt8, _](ascii))
+    assert_equal(out2[0].value, String("abc"))
+
+
+def _indexed_lines(count: Int) -> List[UInt8]:
+    """A static-only section of ``count`` one-byte lines, each ``:method
+    GET`` (index 17, 42 bytes decoded: 7 + 3 + 32)."""
+    var buf = _bytes(0x00, 0x00)
+    for _ in range(count):
+        buf.append(UInt8(0xC0 | 17))
+    return buf^
+
+
+def test_decoded_size_is_capped_not_just_the_wire_size() raises:
+    """One wire byte per 42 decoded bytes: a section well under any wire
+    limit expands past the decoded one (the FoxIO QPACK class, Oct
+    2026). The cap is exact: the cap itself decodes, one byte under is
+    refused."""
+    var buf = _indexed_lines(100)
+    var ok = decode_field_section(Span[UInt8, _](buf), UInt64(4200))
+    assert_equal(len(ok), 100)
+    var raised = False
+    try:
+        var _ = decode_field_section(Span[UInt8, _](buf), UInt64(4199))
+    except e:
+        raised = True
+        assert_true("field section above limit" in String(e))
+    assert_true(raised)
+
+
+def test_default_cap_stops_a_small_section_that_expands_hugely() raises:
+    """About 64 KiB of decoded headers is the default ceiling: 1560 lines
+    pass, 1561 do not, and a 100 KB-on-the-wire flood is refused rather
+    than expanded to megabytes."""
+    var at = _indexed_lines(1560)
+    assert_equal(len(decode_field_section(Span[UInt8, _](at))), 1560)
+    var over = _indexed_lines(1561)
+    var raised = False
+    try:
+        var _ = decode_field_section(Span[UInt8, _](over))
+    except e:
+        raised = True
+        assert_true("field section above limit" in String(e))
+    assert_true(raised)
+    var flood = _indexed_lines(100000)
+    raised = False
+    try:
+        var _ = decode_field_section(Span[UInt8, _](flood))
+    except:
+        raised = True
+    assert_true(raised)
+
+
+def test_literal_lines_count_toward_the_cap() raises:
+    """An empty literal name and value is still 32 bytes of table entry
+    in RFC 9114 section 4.2.2's accounting: 001N0000 then a zero-length
+    value, three-byte lines costing 32 each."""
+    var buf = _bytes(0x00, 0x00)
+    for _ in range(10):
+        buf.append(UInt8(0x20))
+        buf.append(UInt8(0x00))
+    assert_equal(
+        len(decode_field_section(Span[UInt8, _](buf), UInt64(320))), 10
+    )
+    var raised = False
+    try:
+        var _ = decode_field_section(Span[UInt8, _](buf), UInt64(319))
+    except:
+        raised = True
+    assert_true(raised)
+
+
 def main() raises:
     test_static_table_size()
     test_static_table_lookup_known_indices()
     test_static_table_lookup_out_of_range()
     test_static_table_find_full_match()
+    test_static_table_every_entry_round_trips()
     test_static_table_find_name_only()
     test_round_trip_full_static_match()
     test_round_trip_literal_with_name_reference()
@@ -182,4 +317,11 @@ def main() raises:
     test_decode_rejects_literal_with_dynamic_name_ref()
     test_decode_rejects_required_insert_count_above_zero()
     test_round_trip_long_value_uses_huffman_when_shorter()
-    print("test_qpack: 13 passed")
+    test_raw_literal_value_that_is_not_utf8_is_refused()
+    test_huffman_literal_value_that_is_not_utf8_is_refused()
+    test_literal_name_that_is_not_utf8_is_refused()
+    test_valid_utf8_literal_value_is_still_accepted()
+    test_decoded_size_is_capped_not_just_the_wire_size()
+    test_default_cap_stops_a_small_section_that_expands_hugely()
+    test_literal_lines_count_toward_the_cap()
+    print("test_qpack: 21 passed")

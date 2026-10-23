@@ -15,7 +15,10 @@ directory carry the detail.
 | [`threat-model.md`](threat-model.md) | Adversary classes (anonymous attacker, authenticated abuser, malicious peer), per-attack mitigations, non-goals, disclosure process, verification cadence. |
 | [`operations.md`](operations.md) | Production runbook -- topology choices, TLS posture, health endpoints, graceful shutdown, observability, resource limits, common failure modes, container deployment, soak harness. |
 | [`concurrency.md`](concurrency.md) | The Mojo closure-binding rules flare relies on, the cross-thread primitive surface (`Cancel`, `HandoffQueue`, `block_in_pool`), and the owned-by-one-thread invariant. |
+| [`threading.md`](threading.md) | The AsyncRT thread engine: where each thread runs, serving leases, join semantics, forked children, known limits, and how to measure it. |
+| [`development.md`](development.md) | Pixi environments, the task list (tests, lints, conformance, fuzz, bench, formal), and the common commands for contributors. |
 | [`cookbook.md`](cookbook.md) | Index of files under `examples/{basic,intermediate,advanced}/` mapped to use cases. |
+| [`../formal/README.md`](../formal/README.md) | Lean 4 models of flare and the proofs about them: the design (anchors, spec lock, differential tests, verified kernels) with diagrams, and the 0.12 audit report in [`../formal/REPORT.md`](../formal/REPORT.md). |
 
 The public Mojo API is stable within a minor: patch releases never
 break source for the same minor. Breaking changes only land at minor

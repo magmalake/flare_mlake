@@ -90,6 +90,7 @@ from std.format import Writable, Writer
 
 from .extract import Extractor
 from .request import Request
+from .proto.utf8 import utf8_lossy_string
 
 
 # ── AuthError ─────────────────────────────────────────────────────────────
@@ -399,12 +400,10 @@ def parse_basic_credentials(authz: String) raises AuthError -> BasicCredentials:
             break
     if split < 0:
         raise AuthError(_variant=10, detail=String(""))
-    var user = String(capacity_bytes=split)
-    for k in range(split):
-        user += chr(Int(raw[k]))
-    var pw = String(capacity_bytes=raw_n - split - 1)
-    for k in range(split + 1, raw_n):
-        pw += chr(Int(raw[k]))
+    # RFC 7617 sec 2.1: credentials are UTF-8. chr() per byte
+    # double-encoded them, so a non-ASCII password never matched.
+    var user = utf8_lossy_string(Span[UInt8, _](raw)[:split])
+    var pw = utf8_lossy_string(Span[UInt8, _](raw)[split + 1 : raw_n])
     return BasicCredentials(user^, pw^)
 
 
@@ -524,6 +523,18 @@ def csrf_token_b64url(token_bytes: List[UInt8]) -> String:
     return out^
 
 
+comptime CSRF_TOKEN_MIN_CHARS: Int = 16
+"""Shortest token :func:`csrf_token_compare` will accept on either side
+(16 base64url characters is 96 bits)."""
+
+
+def new_csrf_token() raises -> String:
+    """A fresh CSRF token: 32 CSPRNG bytes, base64url-encoded."""
+    from flare.crypto.random import random_bytes
+
+    return csrf_token_b64url(random_bytes(32))
+
+
 def csrf_token_compare(a: String, b: String) -> Bool:
     """Constant-time string comparison for CSRF token check.
 
@@ -533,7 +544,16 @@ def csrf_token_compare(a: String, b: String) -> Bool:
     independent of the position of the first differing byte —
     blocking BREACH-style timing oracles against the token
     cookie.
+
+    Either token shorter than ``CSRF_TOKEN_MIN_CHARS`` fails. Two
+    empty strings used to compare equal, so a victim with no CSRF
+    cookie yet, targeted by a form that omitted the field, passed.
     """
+    if (
+        a.byte_length() < CSRF_TOKEN_MIN_CHARS
+        or b.byte_length() < CSRF_TOKEN_MIN_CHARS
+    ):
+        return False
     if a.byte_length() != b.byte_length():
         return False
     var n = a.byte_length()
@@ -557,9 +577,10 @@ struct CsrfToken(Copyable):
     folds them through :func:`csrf_token_compare` for the final
     check.
 
-    Token generation is intentionally outside this surface — the
-    caller picks the entropy source (``urandom`` / ``rdrand`` /
-    HSM-backed) and feeds the bytes to :func:`csrf_token_b64url`.
+    :func:`new_csrf_token` makes a token from the OS CSPRNG; a caller
+    with its own entropy source can feed bytes to
+    :func:`csrf_token_b64url` instead. Tokens shorter than
+    ``CSRF_TOKEN_MIN_CHARS`` never verify.
     """
 
     var cookie: String

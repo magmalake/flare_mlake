@@ -1,0 +1,349 @@
+import Flare.Core
+
+/-!
+# QUIC timers: idle timeout and the closing / draining period
+
+Two labelled transition systems over a `Nat` clock in milliseconds.
+
+**Idle timeout (RFC 9000 §10.1).** Events are a datagram received for the
+connection at `t` (`auth`: some packet in it decrypted and was processed), an
+ack-eliciting packet sent at `t`, and the timers advanced to `t`.
+`ispecStep` is the RFC: the effective timeout is the minimum of the two
+advertised `max_idle_timeout` values (the sole non-zero one if only one is
+non-zero, none if both are 0), raised to at least three times the PTO; the
+timer restarts on every successfully processed packet and on the first
+ack-eliciting send after one. `fixedStep` is flare's timer (server and client,
+QUIC-20 and QUIC-21), which `fixed_run` relates to the spec on every run.
+
+**Closing and draining (RFC 9000 §10.2, §10.2.1, §10.2.2, §11.1).** Events are
+a local close, a CONNECTION_CLOSE from the peer, any other packet attributed
+to the connection, the driver having something to send (an ACK, stream data,
+a probe), and a timer firing. The output is the list of packets sent.
+`cspecStep` is one RFC-conforming behaviour: a local close sends
+CONNECTION_CLOSE and enters closing for 3×PTO; in closing only
+CONNECTION_CLOSE is sent, once per incoming packet; a peer's
+CONNECTION_CLOSE enters draining, where nothing is sent; both end after
+3×PTO. `spec_*` prove those properties for every state. `srvStepNow` and
+`cliStepNow` mirror flare's server and client (QUIC-22..24; both send nothing
+in draining).
+-/
+namespace Flare.L3.Quic.Timers
+
+/-- Generic run of a step function over an event list. -/
+def run {σ ε : Type} (step : σ → ε → σ) (s : σ) (es : List ε) : σ := es.foldl step s
+
+/-! ## Idle timeout -/
+
+structure IdleParams where
+  /-- our max_idle_timeout (ms); 0 = absent -/
+  localIdle : Nat
+  /-- the peer's max_idle_timeout (ms); 0 = absent -/
+  peerIdle : Nat
+  /-- current PTO (ms) -/
+  pto : Nat
+
+/-- RFC 9000 §10.1: the effective idle timeout, if any. -/
+def effective (p : IdleParams) : Option Nat :=
+  let m : Option Nat :=
+    if p.localIdle = 0 then (if p.peerIdle = 0 then none else some p.peerIdle)
+    else if p.peerIdle = 0 then some p.localIdle else some (min p.localIdle p.peerIdle)
+  m.map fun v => max v (3 * p.pto)
+
+/-- mirrors flare/quic/_server_support.mojo#_effective_idle_ms sha=125091334ee3 at=4b4e9f4c (fixed,
+QUIC-20): 0 stands for "no timeout". -/
+def effectiveMs (localIdle peerIdle pto : Nat) : Nat :=
+  let m := if localIdle = 0 then peerIdle else if peerIdle = 0 then localIdle else min localIdle peerIdle
+  if m = 0 then 0 else max m (3 * pto)
+
+/-- The shipped helper computes exactly the spec's effective timeout. -/
+theorem effectiveMs_spec (l p pto : Nat) :
+    effective ⟨l, p, pto⟩ = if effectiveMs l p pto = 0 then none else some (effectiveMs l p pto) := by
+  unfold effective effectiveMs
+  by_cases hl : l = 0 <;> by_cases hp : p = 0 <;> simp [hl, hp] <;> split <;> omega
+
+inductive IEv
+  | recv (t : Nat) (auth : Bool)
+  | sendAE (t : Nat)
+  | tick (t : Nat)
+
+/-- Spec state: when the current idle period started, whether an ack-eliciting
+packet was sent since the last processed receipt, and whether the
+connection has been closed by the idle timer. -/
+structure ISpec where
+  start : Nat
+  sentSince : Bool
+  closed : Bool
+
+def ispecStep (p : IdleParams) (s : ISpec) : IEv → ISpec
+  | .recv t auth => if s.closed ∨ auth = false then s else { s with start := t, sentSince := false }
+  | .sendAE t => if s.closed ∨ s.sentSince then s else { s with start := t, sentSince := true }
+  | .tick t =>
+    if s.closed then s else
+    match effective p with
+    | none => s
+    | some d => if s.start + d ≤ t then { s with closed := true } else s
+
+/-- The timer the server runs (fixed, QUIC-20): armed from the effective
+timeout, re-armed only by an authenticated receipt or the first ack-eliciting
+send after one, not armed when there is no effective timeout.
+mirrors flare/quic/server.mojo#QuicListener._handle_inbound+QuicListener._process_one_packet sha=5dce8b038aa3 at=12630564 (only packets for which
+`_process_one_packet` succeeded), `_build_1rtt_response` (first ack-eliciting
+send, `idle_sent_since_rx`), `schedule_idle_timeout`, `_client_params_ok` (the
+peer's value) and flare/quic/_server_support.mojo#_effective_idle_ms sha=125091334ee3 at=12630564. The
+client runs the same timer (fixed, QUIC-21): flare/quic/client.mojo#QuicClientConnection._dispatch_frames sha=96f9aaa8a2be at=12630564 (processed packets, with the monotonic clock),
+`_note_ack_eliciting_send`, `_apply_peer_transport_params` (the server's value)
+and `_check_idle` (called from `poll`) -/
+structure IFix where
+  deadline : Option Nat
+  sentSince : Bool
+  closed : Bool
+
+def fixedStep (p : IdleParams) (s : IFix) : IEv → IFix
+  | .recv t auth =>
+    if s.closed ∨ auth = false then s
+    else { s with deadline := (effective p).map (t + ·), sentSince := false }
+  | .sendAE t =>
+    if s.closed ∨ s.sentSince then s
+    else { s with deadline := (effective p).map (t + ·), sentSince := true }
+  | .tick t =>
+    if s.closed then s else
+    match s.deadline with
+    | none => s
+    | some d => if d ≤ t then { s with closed := true } else s
+
+/-- The timer tracks the spec state. -/
+def R (p : IdleParams) (s : ISpec) (f : IFix) : Prop :=
+  f.closed = s.closed ∧ f.sentSince = s.sentSince ∧ f.deadline = (effective p).map (s.start + ·)
+
+theorem fixed_sim (p : IdleParams) (s : ISpec) (f : IFix) (e : IEv) (h : R p s f) :
+    R p (ispecStep p s e) (fixedStep p f e) := by
+  obtain ⟨h1, h2, h3⟩ := h
+  cases e with
+  | recv t auth =>
+    simp only [ispecStep, fixedStep, h1]
+    split <;> simp_all [R]
+  | sendAE t =>
+    simp only [ispecStep, fixedStep, h1, h2]
+    split <;> simp_all [R]
+  | tick t =>
+    simp only [ispecStep, fixedStep, h1, h3]
+    split
+    · exact ⟨h1, h2, h3⟩
+    · cases hd : effective p with
+      | none => simp [R, h1, h2, h3, hd]
+      | some d =>
+        simp only [Option.map_some]
+        split <;> simp_all [R]
+
+theorem fixed_run (p : IdleParams) (es : List IEv) :
+    ∀ (s : ISpec) (f : IFix), R p s f → R p (run (ispecStep p) s es) (run (fixedStep p) f es) := by
+  induction es with
+  | nil => intro s f h; exact h
+  | cons e es ih => intro s f h; exact ih _ _ (fixed_sim p s f e h)
+
+/-- Initial states at connection start `t0`. -/
+def ispecInit (t0 : Nat) : ISpec := ⟨t0, false, false⟩
+def fixedInit (p : IdleParams) (t0 : Nat) : IFix := ⟨(effective p).map (t0 + ·), false, false⟩
+theorem init_R (p : IdleParams) (t0 : Nat) : R p (ispecInit t0) (fixedInit p t0) :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- On every run the timer closes exactly when the spec does. -/
+theorem fixed_closed_eq_spec (p : IdleParams) (t0 : Nat) (es : List IEv) :
+    (run (fixedStep p) (fixedInit p t0) es).closed = (run (ispecStep p) (ispecInit t0) es).closed :=
+  (fixed_run p es _ _ (init_R p t0)).1
+
+theorem spec_none_step (p : IdleParams) (hp : effective p = none) (s : ISpec) (e : IEv) :
+    (ispecStep p s e).closed = s.closed := by
+  cases e with
+  | recv t a => simp only [ispecStep]; split <;> rfl
+  | sendAE t => simp only [ispecStep]; split <;> rfl
+  | tick t => simp only [ispecStep, hp]; split <;> rfl
+
+/-- Without an effective timeout the spec never closes on idleness. -/
+theorem spec_none_never (p : IdleParams) (hp : effective p = none) (es : List IEv) :
+    ∀ s : ISpec, (run (ispecStep p) s es).closed = s.closed := by
+  induction es with
+  | nil => intro s; rfl
+  | cons e es ih => intro s; simp only [run, List.foldl_cons] at ih ⊢; rw [ih, spec_none_step p hp]
+
+/-! ## Closing and draining -/
+
+inductive Pkt | cc | other
+  deriving DecidableEq, Repr
+
+inductive CEv
+  | localClose (t : Nat)
+  | peerClose (t : Nat)
+  | recvPkt (t : Nat)
+  | want (t : Nat)
+  | tick (t : Nat)
+
+inductive Phase
+  | opened
+  | closing (untilT : Nat)
+  | draining (untilT : Nat)
+  | gone
+  deriving DecidableEq, Repr
+
+structure CSt where
+  phase : Phase
+  /-- packets sent, newest first -/
+  out : List Pkt
+  deriving DecidableEq, Repr
+
+/-- One RFC 9000 §10.2-conforming behaviour (the MAY single CONNECTION_CLOSE
+on receipt of the peer's is not taken; rate limiting is not modelled). -/
+def cspecStep (pto : Nat) (s : CSt) : CEv → CSt
+  | .localClose t => match s.phase with
+    | .opened => ⟨.closing (t + 3 * pto), .cc :: s.out⟩
+    | _ => s
+  | .peerClose t => match s.phase with
+    | .opened => ⟨.draining (t + 3 * pto), s.out⟩
+    | .closing u => ⟨.draining u, s.out⟩
+    | _ => s
+  | .recvPkt t => match s.phase with
+    | .closing u => if t < u then ⟨.closing u, .cc :: s.out⟩ else s
+    | _ => s
+  | .want _ => match s.phase with
+    | .opened => ⟨.opened, .other :: s.out⟩
+    | _ => s
+  | .tick t => match s.phase with
+    | .closing u => if u ≤ t then ⟨.gone, s.out⟩ else s
+    | .draining u => if u ≤ t then ⟨.gone, s.out⟩ else s
+    | _ => s
+
+/-- §11.1 / §10.2: closing a connection sends CONNECTION_CLOSE. -/
+theorem spec_cc_on_close (pto t : Nat) (out : List Pkt) :
+    (cspecStep pto ⟨.opened, out⟩ (.localClose t)).out = .cc :: out := rfl
+
+/-- §10.2.2: in draining, nothing is sent. -/
+theorem spec_draining_silent (pto u : Nat) (out : List Pkt) (e : CEv) :
+    (cspecStep pto ⟨.draining u, out⟩ e).out = out := by
+  cases e <;> simp only [cspecStep] <;> (try split) <;> rfl
+
+/-- §10.2.1: in closing, only CONNECTION_CLOSE is sent. -/
+theorem spec_closing_only_cc (pto u : Nat) (out : List Pkt) (e : CEv) :
+    (cspecStep pto ⟨.closing u, out⟩ e).out = out ∨
+      (cspecStep pto ⟨.closing u, out⟩ e).out = .cc :: out := by
+  cases e <;> simp only [cspecStep] <;> (try split) <;> simp
+
+/-- §10.2: closing and draining persist until their end time, which a local
+close or the peer's CONNECTION_CLOSE sets 3×PTO after entry. -/
+theorem spec_tick_before (pto u t : Nat) (out : List Pkt) (ht : t < u) :
+    (cspecStep pto ⟨.closing u, out⟩ (.tick t)).phase = .closing u ∧
+    (cspecStep pto ⟨.draining u, out⟩ (.tick t)).phase = .draining u := by
+  simp [cspecStep, Nat.not_le.mpr ht]
+
+/-- Server state: the connection phase, the slot's `alive` flag, packets sent. -/
+structure SSt where
+  phase : Phase
+  alive : Bool
+  out : List Pkt
+  deriving DecidableEq, Repr
+
+/-- The server (QUIC-22 and QUIC-23). A local close sends CONNECTION_CLOSE,
+sets `alive := False` and enters the closing phase for 3×PTO
+(`_enter_closing`); a packet received in the closing phase is answered with
+CONNECTION_CLOSE (`_answer_closing`; the code answers only the 1st, 2nd, 4th,
+... packet, a rate limit the model does not take, so the model answers every
+one, which is the stronger obligation); only the closing timer, not any other
+timer of the slot, ends the phase. A dead slot that never sent a
+CONNECTION_CLOSE (no 1-RTT keys) is reclaimed by its next timer. Nothing is
+sent while draining: `_build_1rtt_response`, `_build_initial_response` and
+`_build_handshake_response` return no datagram and `_drain_and_send` returns
+at once when the connection state is DRAINING, so no ACK, response, PTO probe,
+long-header retransmit or delayed-ACK flush leaves the server at any level.
+A peer CONNECTION_CLOSE enters draining from the open state
+(`apply_connection_close`); the slot then ends with its idle timer. While
+closing, `_handle_inbound` processes nothing, so the peer's CONNECTION_CLOSE
+is answered like any other packet and the closing timer ends the slot.
+mirrors flare/quic/server.mojo#QuicListener._build_1rtt_response+QuicListener._build_initial_response+QuicListener._build_handshake_response+QuicListener._drain_and_send sha=04e6ba9f9fd5 at=4c1f34bc,
+flare/quic/state.mojo#apply_connection_close sha=59dee456aa9d at=4c1f34bc,
+flare/quic/server.mojo#QuicListener._close_for+QuicListener._enter_closing+QuicListener._answer_closing+QuicListener._handle_inbound+QuicListener.advance_timers sha=be199d49b02d at=4c1f34bc -/
+def srvStepNow (pto : Nat) (s : SSt) : CEv → SSt
+  | .localClose t => match s.phase with
+    | .opened => ⟨.closing (t + 3 * pto), false, .cc :: s.out⟩
+    | _ => s
+  | .peerClose t => match s.phase with
+    | .opened => ⟨.draining t, s.alive, s.out⟩
+    | .closing u => if t < u then { s with out := .cc :: s.out } else s
+    | _ => s
+  | .recvPkt t => match s.phase with
+    | .closing u => if t < u then { s with out := .cc :: s.out } else s
+    | _ => s
+  | .want _ =>
+    match s.phase with
+    | .draining _ => s
+    | .gone => s
+    | _ => if s.alive then { s with out := .other :: s.out } else s
+  | .tick t => match s.phase with
+    | .closing u => if u ≤ t then { s with phase := .gone } else s
+    | _ => if s.alive = false ∧ s.phase ≠ .gone then { s with phase := .gone } else s
+
+/-- **QUIC-23**: the server sends nothing in draining, whatever the
+event. -/
+theorem srvNow_draining_silent (pto u : Nat) (al : Bool) (out : List Pkt) (e : CEv) :
+    (srvStepNow pto ⟨.draining u, al, out⟩ e).out = out := by
+  cases e <;> simp only [srvStepNow] <;> (try split) <;> rfl
+
+/-- The states the QUIC-22 fix covers: an open connection is alive, a
+closing one is not (draining is QUIC-23). -/
+def SOk (s : SSt) : Prop :=
+  (s.phase = .opened ∧ s.alive = true) ∨ (∃ u, s.phase = .closing u ∧ s.alive = false)
+
+/-- **QUIC-22**: on local close, packets and timer events the server behaves
+as the RFC 9000 §10.2 specification `cspecStep`. -/
+theorem srvFix_refines (pto : Nat) (s : SSt) (h : SOk s) (e : CEv)
+    (he : ∀ t, e ≠ .peerClose t) :
+    (srvStepNow pto s e).phase = (cspecStep pto ⟨s.phase, s.out⟩ e).phase ∧
+    (srvStepNow pto s e).out = (cspecStep pto ⟨s.phase, s.out⟩ e).out := by
+  obtain ⟨ph, al, out⟩ := s
+  rcases h with ⟨h1, h2⟩ | ⟨u, h1, h2⟩
+  · simp only at h1 h2
+    subst h1; subst h2
+    cases e with
+    | peerClose t => exact absurd rfl (he t)
+    | localClose t => simp [srvStepNow, cspecStep]
+    | recvPkt t => simp [srvStepNow, cspecStep]
+    | want t => simp [srvStepNow, cspecStep]
+    | tick t => simp [srvStepNow, cspecStep]
+  · simp only at h1 h2
+    subst h1; subst h2
+    cases e with
+    | peerClose t => exact absurd rfl (he t)
+    | localClose t => simp [srvStepNow, cspecStep]
+    | recvPkt t => by_cases ht : t < u <;> simp [srvStepNow, cspecStep, ht]
+    | want t => simp [srvStepNow, cspecStep]
+    | tick t => by_cases ht : u ≤ t <;> simp [srvStepNow, cspecStep, ht]
+
+/-- The client as shipped (QUIC-24): nothing is sent in draining. `_build_1rtt`
+(and the Initial, Handshake and 0-RTT builders) return no datagram when the
+connection state is DRAINING, which covers `_drain_egress`, `_check_pto`,
+`keepalive` and `shutdown`; `send_stream` raises instead of sending.
+mirrors flare/quic/client.mojo#QuicClientConnection._build_1rtt+QuicClientConnection.send_stream sha=6139df454e5d at=12630564 -/
+def cliStepNow (s : CSt) : CEv → CSt
+  | .localClose _ => match s.phase with
+    | .opened => ⟨.gone, .cc :: s.out⟩
+    | _ => s
+  | .peerClose t => match s.phase with
+    | .opened => ⟨.draining t, s.out⟩
+    | _ => s
+  | .recvPkt _ => s
+  | .want _ => match s.phase with
+    | .gone => s
+    | .draining _ => s
+    | _ => { s with out := .other :: s.out }
+  | .tick _ => s
+
+/-- **QUIC-24**: the client sends nothing in draining. -/
+theorem cliNow_draining_silent (u : Nat) (out : List Pkt) (e : CEv) :
+    (cliStepNow ⟨.draining u, out⟩ e).out = out := by
+  cases e <;> simp only [cliStepNow] <;> (try split) <;> rfl
+
+/-- The client's own close conforms: it sends CONNECTION_CLOSE and, having
+closed its socket, may end the closing state at once (RFC 9000 §10.2:
+endpoints "able to close the UDP socket, MAY end these states earlier"). -/
+theorem cli_close_ok (t : Nat) (out : List Pkt) :
+    cliStepNow ⟨.opened, out⟩ (.localClose t) = ⟨.gone, .cc :: out⟩ := rfl
+
+end Flare.L3.Quic.Timers

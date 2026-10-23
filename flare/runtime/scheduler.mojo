@@ -1,6 +1,6 @@
-"""Multicore scheduler: 1 shared listener, N reactors, N pthread workers.
+"""Multicore scheduler: 1 shared listener, N reactors, N workers.
 
-Runs N single-threaded reactor loops in parallel, one per pthread,
+Runs N single-threaded reactor loops in parallel, one per worker thread,
 all sharing a *single* listener fd. Each worker registers the
 listener fd in its own reactor with ``EPOLLEXCLUSIVE`` (on Linux
 >= 4.5) so the kernel wakes exactly one worker per accept event.
@@ -25,16 +25,16 @@ Shutdown path: ``shutdown()`` flips a heap-allocated ``Bool`` that
 every worker polls on each reactor iteration. A stable heap address
 is used (instead of a field on the ``Scheduler`` struct) so the flag
 survives the NRVO-or-not move from ``Scheduler.start`` back to the
-caller. The main thread then closes the shared listener fd once
-and joins all workers before ``shutdown()`` returns.
+caller. The main thread joins all workers, and only then closes the
+shared listener fd (once), before ``shutdown()`` returns.
 
-Relying on ``close(listener_fd)`` alone to wake the workers is not
-enough on Linux: when the fd is also registered in the worker's
-``epoll`` instance, the kernel holds an extra reference to the
-underlying ``struct file``, so ``close()`` from another thread does
-not trigger an ``EPOLLHUP`` and the workers stay blocked in
-``epoll_wait`` until the 100 ms poll timeout fires. The heap flag is
-what actually breaks the loop.
+The listener is never closed to wake the workers. On Linux an fd that
+is also registered in a worker's ``epoll`` instance is kept alive by
+the kernel, so ``close()`` from another thread triggers no ``EPOLLHUP``
+and the workers stay blocked in ``epoll_wait`` until the 100 ms poll
+timeout fires; and closing it early let a worker that polled a batch
+before it saw the flag ``accept`` on a reused number (CONC-05). The
+heap flag is what breaks the loop.
 
 This module is :trait:`Frontend`-generic: every worker calls
 :meth:`Frontend.run_worker` once with its assigned listener fd
@@ -85,6 +85,7 @@ from ..tcp import TcpListener
 
 from ._thread import ThreadHandle, num_cpus, _OpaquePtr
 from .frontend import Frontend
+from ._balance import balance_group_alloc, balance_group_free
 from .reuseport import bind_reuseport, bind_shared
 
 # Re-exported so the reactor loops' existing
@@ -97,12 +98,16 @@ from .scheduler_stats import (
     load_worker_stat,
     WORKER_STAT_INFLIGHT,
     WORKER_STAT_STATUS,
+    WORKER_STAT_DONE,
     WORKER_STAT_SLOTS,
+    WORKER_STAT_GROUP,
+    WORKER_STAT_INDEX,
     WORKER_STATUS_RUNNING,
     WORKER_STATUS_CLEAN,
     WORKER_STATUS_CRASHED,
 )
 from ._worker import _WorkerCtx, _worker_entry
+from ._libc_time import monotonic_now_ms
 
 
 # ── ShutdownReport (per-worker drain accounting) ─────────────────────────────
@@ -176,7 +181,7 @@ def _scheduler_free_ctxs[F: Frontend](addrs: List[Int]):
 
 
 struct Scheduler[F: Frontend](Movable):
-    """Owns ``num_workers`` pthread workers, each running a frontend's
+    """Owns ``num_workers`` workers, each running a frontend's
     serving loop sharing a single listener fd (or its own
     SO_REUSEPORT listener when the strategy demands).
 
@@ -241,10 +246,10 @@ struct Scheduler[F: Frontend](Movable):
     # listener yet" (freshly constructed) or "already destroyed"
     # (post-shutdown).
     var _shared_listener_addr: Int
-    # Cached fd for the shared listener. Convenient for the shutdown
-    # path which closes the fd before destroying the heap struct;
-    # closing first ensures any in-flight ``accept(2)`` returns -1
-    # and the worker observes the stop flag promptly.
+    # Cached fd for the shared listener, for the workers' bare-number
+    # handles. It is closed once, by the listener's destructor in
+    # ``_free_resources``, after every worker has joined; never earlier,
+    # since a worker may still ``accept`` on it.
     var _shared_listener_fd: Int
     var _per_worker_listener_addrs: List[Int]
     """When the io_uring buffer-ring path is active, the
@@ -263,6 +268,10 @@ struct Scheduler[F: Frontend](Movable):
     # (in-flight snapshot + exit status). Read by ``drain`` after the
     # workers join; freed on teardown. Empty until ``start``.
     var _stats_addrs: List[Int]
+    # Accept-balancing group block shared by every worker
+    # (``flare.runtime._balance``); 0 when balancing is off or there is a
+    # single worker. Freed with the stats cells.
+    var _balance_addr: Int
     # Number of workers whose last run exited with WORKER_STATUS_CRASHED,
     # captured from the stats cells during ``shutdown`` / ``drain`` before
     # they are freed. Lets callers tell a crash from a clean shutdown
@@ -283,6 +292,7 @@ struct Scheduler[F: Frontend](Movable):
         self._ctx_addrs = List[Int]()
         self._stopping_addr = 0
         self._stats_addrs = List[Int]()
+        self._balance_addr = 0
         self._last_crash_count = 0
 
     @staticmethod
@@ -328,9 +338,9 @@ struct Scheduler[F: Frontend](Movable):
 
         Raises:
             Error: If ``num_workers`` is outside ``1..=256``, if the
-                listener fails to bind, or if ``pthread_create``
-                fails; partially-started workers are best-effort
-                joined before re-raising.
+                listener fails to bind, or if spawning a worker fails;
+                partially-started workers are best-effort joined before
+                re-raising.
         """
         if num_workers < 1 or num_workers > 256:
             raise Error(
@@ -490,10 +500,17 @@ struct Scheduler[F: Frontend](Movable):
         # Allocated on this thread before any pthread spawns; the worker
         # writes them, ``drain`` reads them after join, teardown frees
         # them. Native Mojo allocator (see _scheduler_free_raw).
-        for _ in range(num_workers):
+        # Several workers share one block that balances accepted
+        # connections between them; ``FLARE_BALANCE_ACCEPT=0`` opts out.
+        if num_workers >= 2 and getenv("FLARE_BALANCE_ACCEPT") != "0":
+            s._balance_addr = balance_group_alloc(num_workers)
+        for w in range(num_workers):
             var sp = alloc(Layout[Int64](count=WORKER_STAT_SLOTS)).unsafe_leak()
             sp[unsafe_offset=WORKER_STAT_INFLIGHT] = Int64(0)
             sp[unsafe_offset=WORKER_STAT_STATUS] = Int64(WORKER_STATUS_RUNNING)
+            sp[unsafe_offset=WORKER_STAT_DONE] = Int64(0)
+            sp[unsafe_offset=WORKER_STAT_GROUP] = Int64(s._balance_addr)
+            sp[unsafe_offset=WORKER_STAT_INDEX] = Int64(w)
             s._stats_addrs.append(Int(sp))
 
         # If we need per-worker listeners (io_uring buffer-ring
@@ -508,6 +525,11 @@ struct Scheduler[F: Frontend](Movable):
         # so their destructors don't fire here; the same shutdown
         # path that frees s._shared_listener_addr will iterate +
         # free them.
+        # A failed bind raises. It used to be skipped: the listener list
+        # came up short, a worker past its end ran on fd -1, and with
+        # extra addresses a worker was handed another address's
+        # listener as its primary, since the extras sit right after the
+        # primaries in the same list.
         if prebind_per_worker:
             for _ in range(num_workers):
                 try:
@@ -516,8 +538,9 @@ struct Scheduler[F: Frontend](Movable):
                     var ptr = alloc(Layout[TcpListener](count=1)).unsafe_leak()
                     ptr.unsafe_write(pwl^)
                     s._per_worker_listener_addrs.append(Int(ptr))
-                except:
-                    pass
+                except e:
+                    s._abandon_start()
+                    raise e^
 
         # Extra addresses, same serial-bind discipline. Appended to
         # _per_worker_listener_addrs AFTER the primaries so indices
@@ -536,8 +559,9 @@ struct Scheduler[F: Frontend](Movable):
                     xptr.unsafe_write(xl^)
                     s._per_worker_listener_addrs.append(Int(xptr))
                     per_worker.append(xfd)
-                except:
-                    pass
+                except e:
+                    s._abandon_start()
+                    raise e^
             extra_worker_fds.append(per_worker^)
 
         for i in range(num_workers):
@@ -577,7 +601,7 @@ struct Scheduler[F: Frontend](Movable):
 
             var spawned = False
             try:
-                var th = ThreadHandle.spawn[_worker_entry[Self.F]](arg)
+                var th = ThreadHandle.spawn_serving[_worker_entry[Self.F]](arg)
                 # Move the (non-Copyable) handle into the next slot
                 # of the worker array; bump the live-slot counter.
                 s._workers_ptr.unsafe_offset(s._workers_len).unsafe_write(th^)
@@ -615,6 +639,12 @@ struct Scheduler[F: Frontend](Movable):
                         _OpaquePtr(unsafe_from_address=s._stats_addrs[k])
                     )
                 s._stats_addrs.clear()
+                balance_group_free(s._balance_addr)
+                s._balance_addr = 0
+                # The pre-bound per-worker listeners (default mode) were
+                # never freed here, so a failed start left every one of
+                # them open and bound (CONC-06). All workers joined.
+                s._free_per_worker_listeners()
                 # All workers joined, so no one is reading the
                 # shared listener anymore -- destroy + free it
                 # if we owned one (paths that prebind per-worker
@@ -630,22 +660,42 @@ struct Scheduler[F: Frontend](Movable):
                 s._stopping_addr = 0
                 raise Error("pthread_create failed in Scheduler.start")
 
+        # Workers holding a lease are pool tasks. Don't hand back the
+        # scheduler while one is still queued: a donating join elsewhere
+        # could run it inline and never return. No-op for OS threads.
+        for i in range(s._workers_len):
+            s._workers_ptr.unsafe_offset(i)[].wait_started()
         return s^
 
-    def _signal_and_close_listener(mut self):
-        """Flip the stop flag and close the shared listener fd.
+    def _abandon_start(mut self):
+        """Undo a ``start`` that failed before any worker was spawned:
+        free the listeners, stats cells, stop flag and worker array."""
+        self._free_resources()
+        if Int(self._workers_ptr) != 0:
+            _scheduler_free_raw(self._workers_ptr.unsafe_bitcast[UInt8]())
+            var null_addr = 0
+            self._workers_ptr = Pointer[ThreadHandle, MutUntrackedOrigin](
+                unsafe_from_address=null_addr
+            )
+        self._workers_len = 0
+
+    def _signal_stop(mut self):
+        """Flip the stop flag.
 
         Idempotent. ``_stopping_addr == 0`` (never started / already
-        torn down) short-circuits the flip; the fd close is skipped
-        once the fd is -1.
+        torn down) makes it a no-op.
+
+        The shared listener is deliberately *not* closed here. Every
+        worker holds its bare fd number, and one that polled a batch
+        before it saw the flag still accepts on it, so closing it now
+        would let that ``accept`` land on whatever the number names next
+        (or let a worker still starting up register a reused number).
+        ``_free_resources`` closes it once, after every worker joined;
+        the stop flag, polled at least every 100 ms, is what ends the
+        loops (CONC-05).
         """
         if self._stopping_addr != 0:
             store_stop_flag(self._stopping_addr, True)
-        if self._shared_listener_fd >= 0:
-            _ = external_call["close", c_int, c_int](
-                c_int(self._shared_listener_fd)
-            )
-            self._shared_listener_fd = -1
 
     def _join_workers(mut self):
         """Join every worker thread and release the handle array.
@@ -680,6 +730,18 @@ struct Scheduler[F: Frontend](Movable):
                 crashed += 1
         self._last_crash_count = crashed
 
+    def _free_per_worker_listeners(mut self):
+        """Close and free every pre-bound per-worker listener (primaries
+        and extras). Only call once no worker can still use them."""
+        for i in range(len(self._per_worker_listener_addrs)):
+            var pwl_raw = _OpaquePtr(
+                unsafe_from_address=self._per_worker_listener_addrs[i]
+            )
+            var pwl_typed = pwl_raw.unsafe_bitcast[TcpListener]()
+            pwl_typed.unsafe_deinit_pointee()
+            _scheduler_free_raw(pwl_raw)
+        self._per_worker_listener_addrs.clear()
+
     def _free_resources(mut self):
         """Free ctxs, listeners, stats cells, and the stop flag.
 
@@ -696,21 +758,17 @@ struct Scheduler[F: Frontend](Movable):
             typed.unsafe_deinit_pointee()
             _scheduler_free_raw(raw)
             self._shared_listener_addr = 0
+            self._shared_listener_fd = -1
 
-        for i in range(len(self._per_worker_listener_addrs)):
-            var pwl_raw = _OpaquePtr(
-                unsafe_from_address=self._per_worker_listener_addrs[i]
-            )
-            var pwl_typed = pwl_raw.unsafe_bitcast[TcpListener]()
-            pwl_typed.unsafe_deinit_pointee()
-            _scheduler_free_raw(pwl_raw)
-        self._per_worker_listener_addrs.clear()
+        self._free_per_worker_listeners()
 
         for i in range(len(self._stats_addrs)):
             _scheduler_free_raw(
                 _OpaquePtr(unsafe_from_address=self._stats_addrs[i])
             )
         self._stats_addrs.clear()
+        balance_group_free(self._balance_addr)
+        self._balance_addr = 0
 
         if self._stopping_addr != 0:
             var stop_raw = _OpaquePtr(unsafe_from_address=self._stopping_addr)
@@ -720,15 +778,14 @@ struct Scheduler[F: Frontend](Movable):
     def shutdown(mut self) raises:
         """Signal every worker to stop and wait for them to join.
 
-        Flips the heap-allocated stopping flag, closes the shared
-        listener socket (useful on macOS kqueue; on Linux the
-        stopping flag is what actually breaks the loop), then joins
-        all worker threads, records the crash count, and frees every
-        worker context, listener, stats cell, and the stopping-flag
-        heap cell. Idempotent — a second call finds the state empty
+        Flips the heap-allocated stopping flag (what breaks the
+        workers' loops), joins all worker threads, records the crash
+        count, and frees every worker context, listener (the shared
+        one is closed here, after the join), stats cell, and the
+        stopping-flag heap cell. Idempotent — a second call finds the state empty
         and is a no-op.
         """
-        self._signal_and_close_listener()
+        self._signal_stop()
         self._join_workers()
         self._record_crash_count()
         self._free_resources()
@@ -770,9 +827,13 @@ struct Scheduler[F: Frontend](Movable):
         an exact "finished vs cut" split is not available in this
         force-close model.
 
-        ``timeout_ms <= 0`` is a hard stop (equivalent to
-        ``shutdown()`` with the documented hard-cut semantics).
-        Negative values are clamped to 0.
+        ``timeout_ms`` bounds the wait. A worker whose thread has not
+        returned by then (a handler that will not finish) is detached
+        and reported with ``drained == 0``; its context, stats cell and
+        listeners (its own, not the joined workers'), the shared listener
+        (opt-out shape), and the shared stop flag, are left allocated, since the
+        thread may still be using them. ``timeout_ms <= 0`` is a hard stop: no drain window,
+        and every worker is joined, as ``shutdown()`` does.
 
         Args:
             timeout_ms: Max ms to wait for the workers to drain.
@@ -786,19 +847,56 @@ struct Scheduler[F: Frontend](Movable):
         var deadline_ms = timeout_ms if timeout_ms > 0 else 0
         var n_workers = len(self._stats_addrs)
 
-        # Step 1: signal stop + close the shared listener so a pending
-        # accept returns and the worker observes the flag promptly.
-        self._signal_and_close_listener()
+        # Step 1: signal stop. The shared listener stays open until
+        # every worker has joined (see _signal_stop).
+        self._signal_stop()
 
-        # Step 2: join. ``pthread_join`` is a bounded blocking call --
-        # workers cooperatively exit within one reactor poll cycle.
-        # (No explicit sleep: calling ``libc_nanosleep_ms`` inside this
-        # post-pthread_create context regresses the usleep-multiplier
-        # anomaly; the join already bounds the wait.)
-        self._join_workers()
+        # Step 2: wait, up to the deadline, for each worker's thread to
+        # return (WORKER_STAT_DONE), then join the ones that did and
+        # detach the rest. This used to go straight to pthread_join, so
+        # a worker stuck in a handler held drain(timeout_ms) for as long
+        # as the handler took, forever included. A yield loop, not a
+        # sleep: libc_nanosleep_ms after pthread_create trips the
+        # usleep-multiplier anomaly noted in shutdown().
+        var n = self._workers_len
+        var done = List[Bool](length=n, fill=True)
+        if deadline_ms > 0:
+            var until = monotonic_now_ms() + deadline_ms
+            while True:
+                var all_done = True
+                for i in range(n):
+                    done[i] = (
+                        load_worker_stat(self._stats_addrs[i], WORKER_STAT_DONE)
+                        != 0
+                    )
+                    if not done[i]:
+                        all_done = False
+                if all_done or monotonic_now_ms() >= until:
+                    break
+                _ = external_call["sched_yield", c_int]()
+        var stuck = List[Int]()
+        for i in range(n):
+            try:
+                if done[i]:
+                    self._workers_ptr.unsafe_offset(i)[].join()
+                else:
+                    self._workers_ptr.unsafe_offset(i)[].detach()
+                    stuck.append(i)
+            except:
+                pass
+            self._workers_ptr.unsafe_offset(i).unsafe_deinit_pointee()
+        if n > 0:
+            _scheduler_free_raw(self._workers_ptr.unsafe_bitcast[UInt8]())
+            var null_addr = 0
+            self._workers_ptr = Pointer[ThreadHandle, MutUntrackedOrigin](
+                unsafe_from_address=null_addr
+            )
+            self._workers_len = 0
 
-        # Step 3: read the real per-worker in-flight snapshots + exit
-        # status now that the joins established the happens-before edge.
+        # Step 3: read the per-worker in-flight snapshots + exit status.
+        # For a joined worker the join is the happens-before edge; for a
+        # detached one it is the acquire load, and the count is as of
+        # the deadline.
         var reports = List[ShutdownReport]()
         for i in range(n_workers):
             var inflight = load_worker_stat(
@@ -807,15 +905,59 @@ struct Scheduler[F: Frontend](Movable):
             var status = load_worker_stat(
                 self._stats_addrs[i], WORKER_STAT_STATUS
             )
+            var on_time = i >= n or done[i]
             reports.append(
                 ShutdownReport(
-                    drained=1 if deadline_ms > 0 else 0,
-                    timed_out=inflight,
+                    drained=1 if deadline_ms > 0 and on_time else 0,
+                    timed_out=inflight if on_time else max(inflight, 1),
                     in_flight_at_deadline=inflight,
                     crashed=1 if status == WORKER_STATUS_CRASHED else 0,
                 )
             )
         self._record_crash_count()
+
+        # A detached worker may still be running, reading its context,
+        # stats cell and listeners. Those stay allocated for the life of
+        # the process rather than be freed under a live thread.
+        if len(stuck) > 0:
+            for k in range(len(stuck) - 1, -1, -1):
+                var idx = stuck[k]
+                if idx < len(self._ctx_addrs):
+                    _ = self._ctx_addrs.pop(idx)
+                if idx < len(self._stats_addrs):
+                    _ = self._stats_addrs.pop(idx)
+            # Drop only the stuck workers' listeners from the list that
+            # gets freed. Primary i is entry i; worker i's extras follow
+            # all the primaries, at n + i * n_extra + j. Clearing the
+            # whole list leaked every joined worker's SO_REUSEPORT
+            # listener (CONC-04).
+            var n_lis = len(self._per_worker_listener_addrs)
+            var n_extra = 0
+            if n > 0 and n_lis > n:
+                n_extra = (n_lis - n) // n
+            var is_stuck = List[Bool](length=n, fill=False)
+            for k in range(len(stuck)):
+                is_stuck[stuck[k]] = True
+            var kept = List[Int]()
+            for p in range(n_lis):
+                var owner = p if p < n else (p - n) // n_extra
+                if not (owner < n and is_stuck[owner]):
+                    kept.append(self._per_worker_listener_addrs[p])
+            self._per_worker_listener_addrs = kept^
+            # The shared listener (opt-out shape) is held by every worker
+            # by its bare fd number, so it is leaked with the detached
+            # worker too rather than closed under it (CONC-05).
+            self._shared_listener_addr = 0
+            self._shared_listener_fd = -1
+            # The detached worker re-reads the shared stop flag on every
+            # serve-loop iteration, so the flag stays allocated too: it
+            # is leaked like the stuck worker's context and stats cell.
+            # Freeing it handed the cell to the next allocation, which
+            # could store False and keep the worker serving forever.
+            self._stopping_addr = 0
+            # The accept-balancing group too: the worker publishes into it
+            # every iteration and locks it on the way out.
+            self._balance_addr = 0
 
         # Step 4: free everything (stats cells are read above first).
         self._free_resources()

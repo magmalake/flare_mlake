@@ -28,7 +28,7 @@ from .frame import AckFrame, AckRange, EcnCounts
 comptime _CLOCK_MONOTONIC: c_int = c_int(
     6
 ) if CompilationTarget.is_macos() else c_int(1)
-from .varint import encode_varint
+from .varint import encode_varint, encode_varint_into
 from ..tls.rustls_quic import QuicEncryptionLevel
 
 
@@ -53,8 +53,38 @@ def _bufsize_from_env(name: String, default: Int) -> Int:
 
 # Cap on the number of disjoint ACK ranges tracked per connection.
 # Bounds the per-slot memory; the oldest (lowest) ranges are dropped
-# once the cap is hit (RFC 9000 sec 13.2.4 allows acking a subset).
+# once the cap is hit (RFC 9000 sec 13.2.4 allows acking a subset), and
+# a floor remembers them for duplicate detection (_ack_floor).
 comptime _ACK_MAX_RANGES: Int = 32
+
+
+def _ack_floor(flat: List[UInt64]) -> UInt64:
+    """The floor stored in ``flat``: one above the highest packet number
+    whose range :func:`_ack_record` ever dropped at the cap, or 0.
+
+    ``flat`` is a list of ``[low, high]`` pairs, so a trailing slot at an
+    odd index is free; the floor lives there (every pair reader loops on
+    ``i + 1 < len(flat)`` and never sees it)."""
+    if len(flat) % 2 == 1:
+        return flat[len(flat) - 1]
+    return UInt64(0)
+
+
+def _ack_contains(flat: List[UInt64], pn: UInt64) -> Bool:
+    """Whether ``pn`` was already received, per the ranges
+    :func:`_ack_record` keeps. A number below the floor lies in a range
+    that was dropped at the cap: it was either received or too old to
+    tell, so it counts as seen and a replay of an old packet is dropped
+    rather than run again (RFC 9000 sec 13.2.3: a receiver may forget a
+    range only if it will not accept packets in it). The floor never
+    moves down, so a later merge of two ranges cannot make a dropped
+    number read as new."""
+    var i = 0
+    while i + 1 < len(flat):
+        if flat[i] <= pn and pn <= flat[i + 1]:
+            return True
+        i += 2
+    return pn < _ack_floor(flat)
 
 
 def _ack_record(mut flat: List[UInt64], pn: UInt64):
@@ -66,7 +96,20 @@ def _ack_record(mut flat: List[UInt64], pn: UInt64):
     to :data:`_ACK_MAX_RANGES` (keeping the highest), then storing
     back descending. The range count stays tiny so the cost is
     negligible per packet.
+
+    When the cap drops ranges, the floor (see :func:`_ack_floor`) rises
+    to one above the highest dropped number and is stored in the trailing
+    slot, so :func:`_ack_contains` keeps treating them as received.
     """
+    # In-order arrival, the common case: extend the newest range in
+    # place instead of rebuilding and re-sorting every range.
+    if len(flat) >= 2 and pn >= flat[0]:
+        if pn <= flat[1]:
+            return
+        if pn == flat[1] + UInt64(1):
+            flat[1] = pn
+            return
+    var floor = _ack_floor(flat)
     var lows = List[UInt64]()
     var highs = List[UInt64]()
     var i = 0
@@ -100,12 +143,17 @@ def _ack_record(mut flat: List[UInt64], pn: UInt64):
     var start = 0
     if len(ml) > _ACK_MAX_RANGES:
         start = len(ml) - _ACK_MAX_RANGES
+        # ml is ascending: the highest dropped range is ml[start - 1].
+        if mh[start - 1] + UInt64(1) > floor:
+            floor = mh[start - 1] + UInt64(1)
     flat.clear()
     var c = len(ml) - 1
     while c >= start:
         flat.append(ml[c])
         flat.append(mh[c])
         c -= 1
+    if floor > UInt64(0):
+        flat.append(floor)
 
 
 def _ack_from_ranges(flat: List[UInt64], ack_delay: UInt64) raises -> AckFrame:
@@ -163,41 +211,10 @@ def _encode_h3_stream_frame(
     if fin:
         frame_type |= 0x01
     out.append(UInt8(frame_type))
-    var sid_var = encode_varint(stream_id)
-    for i in range(len(sid_var)):
-        out.append(sid_var[i])
-    var off_var = encode_varint(offset)
-    for i in range(len(off_var)):
-        out.append(off_var[i])
-    var len_var = encode_varint(UInt64(len(stream_bytes)))
-    for i in range(len(len_var)):
-        out.append(len_var[i])
+    encode_varint_into(stream_id, out)
+    encode_varint_into(offset, out)
+    encode_varint_into(UInt64(len(stream_bytes)), out)
     out.extend(stream_bytes)
-
-
-def _stream_id_from_key(k: String) -> Int:
-    """Parse the QUIC stream id out of an ``http3_response_egress``
-    key of the form ``"<slot>:<stream_id>"`` (ASCII only, so
-    byte-level iteration is safe). Returns -1 if the key has no
-    colon or no digits after it.
-    """
-    var key_bytes = k.as_bytes()
-    var sid = 0
-    var found_colon = False
-    var any_digit = False
-    for j in range(len(key_bytes)):
-        var b = Int(key_bytes[j])
-        if not found_colon:
-            if b == 0x3A:  # ':'
-                found_colon = True
-            continue
-        if b < 0x30 or b > 0x39:
-            continue
-        sid = sid * 10 + (b - 0x30)
-        any_digit = True
-    if not found_colon or not any_digit:
-        return -1
-    return sid
 
 
 def _inbound_level_for_datagram(datagram: Span[UInt8, _]) -> Int:
@@ -250,6 +267,26 @@ def _ready_sentinel() -> List[UInt8]:
     return out^
 
 
+def _effective_idle_ms(
+    local_ms: UInt64, peer_ms: UInt64, pto_ms: UInt64
+) -> UInt64:
+    """The effective idle timeout in ms, or 0 for none (RFC 9000 sec 10.1,
+    18.2): the minimum of the two advertised values, the sole non-zero one
+    when only one side advertises, none when both are 0 (or absent). A
+    timeout is never shorter than three PTOs, so an endpoint is not closed
+    while a probe it sent is still waiting for its answer."""
+    var m: UInt64
+    if local_ms == UInt64(0):
+        m = peer_ms
+    elif peer_ms == UInt64(0):
+        m = local_ms
+    else:
+        m = min(local_ms, peer_ms)
+    if m == UInt64(0):
+        return UInt64(0)
+    return max(m, UInt64(3) * pto_ms)
+
+
 def _monotonic_ms() -> UInt64:
     """Return the monotonic clock in milliseconds.
 
@@ -276,30 +313,19 @@ def _monotonic_ms() -> UInt64:
     return UInt64(Int(sec) * 1000 + Int(nsec) // 1_000_000)
 
 
-def _random_bytes(n: Int) -> List[UInt8]:
-    """Return ``n`` unpredictable bytes from ``/dev/urandom``.
+def _random_bytes(n: Int) raises -> List[UInt8]:
+    """Return ``n`` bytes from the OS CSPRNG.
 
-    Used for server-issued Connection IDs + stateless-reset tokens
-    (RFC 9000 sec 5.1.1 / 10.3: both must be unguessable). Falls
-    back to a clock-mixed deterministic fill only if urandom is
-    unavailable (should not happen on Linux / macOS).
+    Used for server-issued Connection IDs, stateless-reset tokens and
+    the reset / Retry keys (RFC 9000 sec 5.1.1 / 10.3: all must be
+    unguessable). It read ``/dev/urandom`` and, if that failed, fell
+    back to a fill derived from the millisecond clock, which an
+    attacker can guess to within a few values; a short read also left
+    it indexing past the bytes it got. It raises instead now.
     """
-    var out = List[UInt8](capacity=n)
-    try:
-        with open("/dev/urandom", "r") as f:
-            var raw = f.read_bytes(n)
-            for i in range(n):
-                out.append(raw[i])
-    except:
-        var seed = _monotonic_ms()
-        for i in range(n):
-            out.append(
-                UInt8(
-                    Int((seed >> UInt64(i * 8)) & UInt64(0xFF))
-                    ^ (i * 31 + 0x5A)
-                )
-            )
-    return out^
+    from flare.crypto.random import random_bytes
+
+    return random_bytes(n)
 
 
 # -- Per-slot rustls QUIC session carrier ------------------------------
@@ -331,6 +357,15 @@ struct _SessionSlot(Copyable):
     treats 0 as the silent-drop path per RFC 9001 §5.2."""
 
 
+comptime CRYPTO_REASM_WINDOW: Int = 65536
+"""Most CRYPTO bytes buffered ahead of the contiguous prefix, per level.
+A TLS 1.3 flight with a long certificate chain fits comfortably."""
+comptime CRYPTO_REASM_MAX_FRAGMENTS: Int = 256
+"""Most out-of-order CRYPTO fragments held at once, per level."""
+comptime QUIC_CRYPTO_BUFFER_EXCEEDED: UInt64 = 0x0D
+comptime QUIC_TRANSPORT_PARAMETER_ERROR: UInt64 = 0x08
+
+
 struct _CryptoStream(Copyable, Defaultable):
     """Per-level inbound CRYPTO reassembly buffer.
 
@@ -346,16 +381,39 @@ struct _CryptoStream(Copyable, Defaultable):
     var expected: UInt64
     var frag_offsets: List[UInt64]
     var frag_data: List[List[UInt8]]
+    var buffered: Int
+    """Bytes held in out-of-order fragments."""
 
     def __init__(out self):
         self.expected = UInt64(0)
         self.frag_offsets = List[UInt64]()
         self.frag_data = List[List[UInt8]]()
+        self.buffered = 0
 
-    def insert(mut self, offset: UInt64, data: List[UInt8]):
-        """Buffer one CRYPTO fragment for later contiguous drain."""
+    def insert(mut self, offset: UInt64, data: List[UInt8]) raises:
+        """Buffer one CRYPTO fragment for later contiguous drain.
+
+        Raises ``CRYPTO_BUFFER_EXCEEDED`` (RFC 9000 sec 20.1) for a
+        fragment that ends more than :data:`CRYPTO_REASM_WINDOW` bytes
+        past the contiguous prefix, or once that many bytes or
+        :data:`CRYPTO_REASM_MAX_FRAGMENTS` fragments are held. Any offset
+        used to be buffered, and the drain rescans every fragment per
+        step, so an unauthenticated peer could grow both memory and CPU
+        without limit before any handshake. A fragment wholly below the
+        prefix (a retransmit) is dropped without being stored.
+        """
+        var end = offset + UInt64(len(data))
+        if end <= self.expected:
+            return
+        if (
+            end > self.expected + UInt64(CRYPTO_REASM_WINDOW)
+            or self.buffered + len(data) > CRYPTO_REASM_WINDOW
+            or len(self.frag_offsets) >= CRYPTO_REASM_MAX_FRAGMENTS
+        ):
+            raise Error("QUIC CRYPTO_BUFFER_EXCEEDED")
         self.frag_offsets.append(offset)
         self.frag_data.append(data.copy())
+        self.buffered += len(data)
 
     def drain_contiguous(mut self) -> List[UInt8]:
         """Pop and concatenate every buffered fragment that
@@ -384,6 +442,7 @@ struct _CryptoStream(Copyable, Defaultable):
         return out^
 
     def _swap_remove(mut self, idx: Int):
+        self.buffered -= len(self.frag_data[idx])
         var last = len(self.frag_offsets) - 1
         if idx != last:
             self.frag_offsets[idx] = self.frag_offsets[last]

@@ -1,16 +1,21 @@
-"""Off-reactor DNS resolution + happy-eyeballs ordering.
+"""DNS resolution on a separate thread + happy-eyeballs ordering.
 
 ``getaddrinfo(3)`` is a blocking syscall with no async variant on the
-platforms flare targets. :func:`resolve_async` offloads it to a fresh
-pool thread (via the same pthread mechanism :func:`block_in_pool` uses)
-so the call runs off the reactor's stack and is bounded by a
-:class:`Cancel` token at the call boundary, rather than running inline.
-The synchronous :func:`flare.dns.resolve` is untouched; callers that do
-not need the off-thread variant pay nothing.
+platforms flare targets. :func:`resolve_async` runs it on a fresh pool
+thread (the pthread mechanism :func:`block_in_pool` uses) **and waits
+for that thread**: the caller is blocked for the whole lookup, exactly
+as with :func:`flare.dns.resolve`. What it adds is a separate stack and
+a :class:`Cancel` check before the lookup starts and after it returns.
+It does not free a reactor thread to serve other connections while the
+lookup runs, and a cancel that arrives mid-lookup takes effect only
+when ``getaddrinfo`` returns. Errors come back with the resolver's
+message (``DnsError(host): reason``) as a plain ``Error``, which is
+what a raised ``DnsError`` is by the time any caller sees it.
 
 :func:`order_happy_eyeballs` reorders a resolved address list into the
-RFC 8305 connection-attempt order (interleave IPv6 / IPv4) so a dialer
-can race families without one stalling the other.
+RFC 8305 connection-attempt order (interleave IPv6 / IPv4, starting with
+the family of the first address) so a dialer can race families without one
+stalling the other.
 
 The worker thread is joined (the public API is synchronous --
 the submitter waits for the result anyway), so a flipped ``cancel`` is
@@ -73,11 +78,12 @@ def _resolve_start(arg: _OpaquePtr) -> _OpaquePtr:
 
 
 def resolve_async(host: String, cancel: Cancel) raises -> List[IpAddr]:
-    """Resolve ``host`` on a pool thread, off the reactor stack.
+    """Resolve ``host`` on a pool thread and wait for it.
 
-    Same result as :func:`flare.dns.resolve` but the ``getaddrinfo``
-    call runs on a fresh kernel thread; a flipped ``cancel`` aborts the
-    call at the pre-flight / post-flight boundary.
+    Same result as :func:`flare.dns.resolve`, and it blocks the caller
+    just as long: the ``getaddrinfo`` call runs on a fresh kernel thread
+    that this function joins. A flipped ``cancel`` is honoured before
+    the thread starts and after it finishes, not during the lookup.
 
     Args:
         host: Hostname or numeric IP string.
@@ -149,10 +155,15 @@ def resolve_async(host: String, cancel: Cancel) raises -> List[IpAddr]:
 def order_happy_eyeballs(addrs: List[IpAddr]) -> List[IpAddr]:
     """Reorder ``addrs`` into RFC 8305 connection-attempt order.
 
-    Interleaves the IPv6 and IPv4 results (``v6[0], v4[0], v6[1],
-    v4[1], ...``) preserving each family's relative order, so a dialer
-    can race the two families without one family's slow first address
-    starving the other. Returns a new list; the input is unchanged.
+    Interleaves the two address families, **starting with the family of
+    ``addrs[0]``** (the resolver's most-preferred address, RFC 8305 §4:
+    "whichever address family is first in the list should be followed by an
+    address of the other address family"), preserving each family's relative
+    order: ``[v6, v4, v6, v4, ...]`` for an IPv6-first input and
+    ``[v4, v6, v4, v6, ...]`` for an IPv4-first one. A dialer can then race
+    the two families without one family's slow first address starving the
+    other, and the first attempt still goes to the address the OS ranked
+    highest. Returns a new list; the input is unchanged.
     """
     var v6 = List[IpAddr]()
     var v4 = List[IpAddr]()
@@ -161,12 +172,15 @@ def order_happy_eyeballs(addrs: List[IpAddr]) -> List[IpAddr]:
             v6.append(addrs[i].copy())
         else:
             v4.append(addrs[i].copy())
+    var first_v6 = len(addrs) == 0 or addrs[0].is_v6()
+    ref first = v6 if first_v6 else v4
+    ref second = v4 if first_v6 else v6
     var out = List[IpAddr](capacity=len(addrs))
     var i = 0
-    while i < len(v6) or i < len(v4):
-        if i < len(v6):
-            out.append(v6[i].copy())
-        if i < len(v4):
-            out.append(v4[i].copy())
+    while i < len(first) or i < len(second):
+        if i < len(first):
+            out.append(first[i].copy())
+        if i < len(second):
+            out.append(second[i].copy())
         i += 1
     return out^

@@ -55,6 +55,7 @@ from std.time import perf_counter_ns
 
 from flare.crypto.base64 import base64_decode, base64_encode
 from flare.http.encoding import (
+    DEFAULT_MAX_DECOMPRESSED_BYTES,
     compress_gzip,
     decompress_deflate,
     decompress_gzip,
@@ -78,6 +79,7 @@ from .status import (
     GRPC_STATUS_INTERNAL,
     GRPC_STATUS_INVALID_ARGUMENT,
     GrpcStatus,
+    grpc_message_encode,
 )
 
 
@@ -388,17 +390,29 @@ def _negotiate_response_encoding(accept_encoding: String) -> String:
     return String("")
 
 
+comptime _HANDLER_RAISED: String = "handler raised"
+"""``grpc-message`` for a handler that raised. The raise text used to go
+to the client verbatim: file paths, SQL, whatever the exception held.
+A handler that wants the client to see a reason returns it in a
+``GrpcStatus`` instead."""
+
+
 def _decompress_payload(
-    payload: Span[UInt8, _], encoding: String
+    payload: Span[UInt8, _],
+    encoding: String,
+    max_out: Int = DEFAULT_MAX_DECOMPRESSED_BYTES,
 ) raises -> List[UInt8]:
     """Decompress a compressed LPM payload per the request's
     ``grpc-encoding``. Supports ``gzip`` and ``deflate``; any other
-    (or empty) encoding on a compressed frame is a protocol error."""
+    (or empty) encoding on a compressed frame is a protocol error.
+    Raises before the output passes ``max_out`` bytes."""
+    if max_out <= 0:
+        raise Error("grpc adapter: decompressed request exceeds the limit")
     var enc = ascii_lower(encoding)
     if enc == "gzip":
-        return decompress_gzip(payload)
+        return decompress_gzip(payload, max_out)
     if enc == "deflate":
-        return decompress_deflate(payload)
+        return decompress_deflate(payload, max_out)
     raise Error(
         "grpc adapter: compressed LPM frame with unsupported / missing "
         "grpc-encoding '"
@@ -410,6 +424,7 @@ def _decompress_payload(
 def stitch_request_data(
     request_data: Span[UInt8, _],
     encoding: String = String(""),
+    max_decompressed_bytes: Int = DEFAULT_MAX_DECOMPRESSED_BYTES,
 ) raises -> List[UInt8]:
     """Stitch one or more LPM frames out of the accumulated
     request DATA bytes into a single contiguous payload.
@@ -424,10 +439,16 @@ def stitch_request_data(
     call's ``grpc-encoding`` (``gzip`` / ``deflate``). A compressed
     frame with no / unsupported ``grpc-encoding`` raises.
 
+    ``max_decompressed_bytes`` bounds the whole call, not each frame:
+    it was a per-frame cap, so a body of many small compressed frames,
+    each inflating to just under 16 MiB, stitched into one payload of
+    any size.
+
     Raises on:
     * truncated LPM frame (need-more-data at the end of the
       request body),
-    * compressed flag set with no negotiated / supported encoding.
+    * compressed flag set with no negotiated / supported encoding,
+    * decompressed output past ``max_decompressed_bytes``.
     """
     var out = List[UInt8]()
     var pos = 0
@@ -441,7 +462,9 @@ def stitch_request_data(
             )
         if dec.message.flag.is_compressed():
             var plain = _decompress_payload(
-                Span[UInt8, _](dec.message.payload), encoding
+                Span[UInt8, _](dec.message.payload),
+                encoding,
+                max_decompressed_bytes - len(out),
             )
             for i in range(len(plain)):
                 out.append(plain[i])
@@ -524,7 +547,9 @@ def emit_trailing_headers_status(
     )
     if status.message.byte_length() > 0:
         trailers.append(
-            Tuple[String, String](String("grpc-message"), status.message.copy())
+            Tuple[String, String](
+                String("grpc-message"), grpc_message_encode(status.message)
+            )
         )
     if Bool(status.details):
         var details_bytes = status.details.value().copy()
@@ -604,10 +629,10 @@ def run_unary_call[
       malformed input to this code).
     * LPM stitch failure (truncated frame, compressed without a
       negotiated encoding) -> ``GRPC_STATUS_INVALID_ARGUMENT``.
-    * Handler ``raises`` -> ``GRPC_STATUS_INTERNAL`` with the
-      raise message (clients see ``grpc-message`` for diagnostics
-      only; the failure mode is "server side bug, not client
-      input").
+    * Handler ``raises`` -> ``GRPC_STATUS_INTERNAL`` with the fixed
+      message ``"handler raised"``. The raise text stays on the
+      server: the failure is a server-side bug, not client input,
+      and the text can carry anything the exception held.
     """
     var accept = String("")
     if Bool(headers.accept_encoding):
@@ -640,7 +665,9 @@ def run_unary_call[
         reply = handler.serve_unary(ctx, Span[UInt8, _](request_bytes))
     except e:
         return _outcome_from_reply(
-            GrpcUnaryReply.err(GrpcStatus.err(GRPC_STATUS_INTERNAL, String(e))),
+            GrpcUnaryReply.err(
+                GrpcStatus.err(GRPC_STATUS_INTERNAL, _HANDLER_RAISED)
+            ),
             accept,
         )
     return _outcome_from_reply(reply^, accept)

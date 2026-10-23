@@ -25,6 +25,9 @@ from test_frame_mux import (
     test_demux_oversize_length_raises as test_frame_mux__test_demux_oversize_length_raises,
 )
 from test_frame_mux import (
+    test_demux_error_does_not_redeliver_routed_frames as test_frame_mux__test_demux_error_does_not_redeliver_routed_frames,
+)
+from test_frame_mux import (
     test_demux_thousand_streams_isolated as test_frame_mux__test_demux_thousand_streams_isolated,
 )
 from test_uds_listener import (
@@ -35,6 +38,12 @@ from test_uds_listener import (
 )
 from test_uds_listener import (
     test_bind_then_query_local_path as test_uds_listener__test_bind_then_query_local_path,
+)
+from test_uds_listener import (
+    test_queried_local_path_round_trips_non_ascii as test_uds_listener__test_queried_local_path_round_trips_non_ascii,
+)
+from test_uds_listener import (
+    test_sockaddr_un_round_trips_utf8 as test_uds_listener__test_sockaddr_un_round_trips_utf8,
 )
 from test_uds_listener import (
     test_bind_unlinks_stale_socket_by_default as test_uds_listener__test_bind_unlinks_stale_socket_by_default,
@@ -57,6 +66,18 @@ from test_uds_listener import (
 from test_uds_listener import (
     test_connect_to_nonexistent_path_raises_refused as test_uds_listener__test_connect_to_nonexistent_path_raises_refused,
 )
+from test_uds_listener import (
+    test_bind_leaves_a_live_socket_and_a_plain_file_alone as test_uds_listener__test_bind_leaves_a_live_socket_and_a_plain_file_alone,
+)
+from test_uds_listener import (
+    test_bind_refuses_when_liveness_probe_is_inconclusive as test_uds_listener__test_bind_refuses_when_liveness_probe_is_inconclusive,
+)
+from test_uds_listener import (
+    test_bind_refuses_unwritable_live_listener as test_uds_listener__test_bind_refuses_unwritable_live_listener,
+)
+from test_uds_listener import (
+    test_destructor_removes_only_its_own_socket as test_uds_listener__test_destructor_removes_only_its_own_socket,
+)
 
 
 def main() raises:
@@ -67,11 +88,18 @@ def main() raises:
     suite.test[test_frame_mux__test_demux_multiple_frames_one_feed]()
     suite.test[test_frame_mux__test_demux_split_across_feeds]()
     suite.test[test_frame_mux__test_demux_oversize_length_raises]()
+    suite.test[
+        test_frame_mux__test_demux_error_does_not_redeliver_routed_frames
+    ]()
     suite.test[test_frame_mux__test_demux_thousand_streams_isolated]()
     # tests/uds/test_uds_listener.mojo
     suite.test[test_uds_listener__test_af_unix_constant]()
     suite.test[test_uds_listener__test_sun_path_max_is_platform_correct]()
     suite.test[test_uds_listener__test_bind_then_query_local_path]()
+    suite.test[
+        test_uds_listener__test_queried_local_path_round_trips_non_ascii
+    ]()
+    suite.test[test_uds_listener__test_sockaddr_un_round_trips_utf8]()
     suite.test[test_uds_listener__test_bind_unlinks_stale_socket_by_default]()
     suite.test[test_uds_listener__test_round_trip_bytes]()
     suite.test[test_uds_listener__test_eof_on_peer_close]()
@@ -81,4 +109,12 @@ def main() raises:
     suite.test[
         test_uds_listener__test_connect_to_nonexistent_path_raises_refused
     ]()
+    suite.test[
+        test_uds_listener__test_bind_leaves_a_live_socket_and_a_plain_file_alone
+    ]()
+    suite.test[
+        test_uds_listener__test_bind_refuses_when_liveness_probe_is_inconclusive
+    ]()
+    suite.test[test_uds_listener__test_bind_refuses_unwritable_live_listener]()
+    suite.test[test_uds_listener__test_destructor_removes_only_its_own_socket]()
     suite^.run()

@@ -31,7 +31,7 @@ lifecycle invariants.
 |---|---|---|
 | Process / kernel | Anyone with `ptrace` rights, root, or the same uid. | flare cannot defend against root; depend on Linux user isolation + seccomp at the orchestrator layer. |
 | Process / OpenSSL | The host's libssl + libcrypto. | flare pins major versions via pixi; CVE response is a pixi bump. |
-| Process / zlib + brotli + FFI shims | The host's libz + libbrotli + the flare-built `libflare_*.so`. | The flare shims are built from `flare/{http,tls}/ffi/*.c` at activation time; they're trivially auditable. |
+| Process / zlib + libdeflate + brotli + FFI shims | The host's libz + libdeflate + libbrotli + the flare-built `libflare_*.so`. | The flare shims are built from `flare/{http,tls}/ffi/*.c` at activation time; they're trivially auditable. |
 | flare / network | Anyone on the public internet (worst case). | Everything below. |
 
 ## Adversaries
@@ -56,9 +56,17 @@ existing credentials.
 | HPACK Huffman DoS (compression oracle). | The decoder is constant-time relative to input length; the table-driven kernel does not branch on payload content. |
 | permessage-deflate zip-bomb. | Per-message decompressed-size cap (default 16 MiB) is enforced before allocation. Exceeding the cap raises and the WS connection is closed with 1009 (`MESSAGE_TOO_BIG`). Both the no-context-takeover and context-takeover code paths honour the cap. |
 | TLS downgrade. | TLS 1.2+ only, weak ciphers disabled (`flare.tls.config` whitelist). No TLS 1.0 / 1.1 fallback path exists. |
-| TLS session-ticket replay. | flare emits new tickets on every handshake; the OpenSSL rotation key is part of the TlsAcceptor and rotates with `reload`. |
-| WS unmasked client frame. | `WsConnection.recv` enforces the RFC 6455 §5.1 client-side mask requirement; unmasked frames are rejected with 1002. |
-| WS UTF-8 violation in TEXT frame. | Frame-level UTF-8 validator runs on every TEXT payload; invalid sequences trigger 1007 (`INVALID_FRAME_PAYLOAD_DATA`). |
+| TLS session-ticket replay. | Tickets are opt-in: with `TlsServerConfig.enable_session_tickets` left at its default (`False`) a `TlsAcceptor` issues no tickets, keeps no server session cache and resumes nothing. When opted in, flare emits new tickets on every handshake; the ticket key belongs to the `TlsAcceptor`'s `SSL_CTX` and `TlsAcceptor.reload()` replaces that context, so it rotates the key and empties the session cache: a ticket or cached session issued before a reload does not resume after it (the peer does a full handshake). Without a reload the key lives as long as the process. |
+| WS unmasked client frame. | `WsConnection.recv` enforces the RFC 6455 §5.1 client-side mask requirement; an unmasked frame is answered with CLOSE 1002 and `recv` raises `WsProtocolError`. |
+| WS UTF-8 violation in TEXT frame. | `WsConnection.recv` runs the UTF-8 validator on every final (unfragmented) TEXT frame; invalid sequences write CLOSE 1007 (`INVALID_FRAME_PAYLOAD_DATA`) and fail the connection. `WsConnection.recv_message` reassembles a fragmented message and validates it as a whole, with the same 1007 close. |
+| QUIC amplification: a spoofed Initial aimed at a victim address. | Until the peer's address is validated the server sends at most 3x the bytes it received from it (RFC 9000 sec 8.1), retransmissions and the padded 1200-byte Initial included. An Initial in a datagram under 1200 bytes is dropped (sec 14.1). `QuicServerConfig.require_address_validation` makes every new connection prove its address with an HMAC Retry token first. A Version Negotiation reply is sent only to datagrams of at least 1200 bytes, never to a Version Negotiation packet. |
+| QUIC handshake-state exhaustion (Initial flood). | `QuicServerConfig.max_connections` caps live slots; under a flood, enable Retry so no handshake state is committed for an unvalidated address. A draining server refuses new connections. |
+| QUIC 0-RTT replay. | 0-RTT is off by default. When enabled it is accepted only on a resumed ClientHello rustls approves, under a per-connection packet-number and byte budget (`EarlyDataReplayGuard`), and a listener-wide strike set refuses a first flight replayed as a fresh connection (RFC 9001 sec 9.2). The h3 client sends only idempotent methods in 0-RTT. |
+| QUIC connection-ID exhaustion / linkability. | The server issues at most 4 CIDs per connection whatever larger `active_connection_id_limit` the peer allows, unroutes every issued CID when the connection ends, and treats retiring a CID never issued as PROTOCOL_VIOLATION. A peer that issues more CIDs than flare's limit of 2 is closed with CONNECTION_ID_LIMIT_ERROR. |
+| QUIC stateless-reset spoofing. | Reset tokens are `HMAC-SHA256(listener key, CID)[:16]`; the key is 32 random bytes per listener, so a token cannot be predicted from the CID. Stateless resets are sized below the triggering packet so two endpoints cannot loop. |
+| QUIC flow-control memory pinning. | A stream's receive limit is granted a window (auto-tuned, at most 16 MiB) ahead of what has arrived, but connection-level MAX_DATA is granted only as requests are answered, so unanswered request bodies are bounded by 64 MiB per connection; a request body over `Http3RequestReader.max_body_bytes` (10 MiB) is an error. Data past a limit closes the connection with FLOW_CONTROL_ERROR. |
+| QUIC forged key update. | A packet in the other key phase rotates the keys only if it authenticates under the next key generation; a forged phase bit fails AEAD and changes nothing (RFC 9001 sec 6.3). |
+| QUIC optimistic ACK / ACK of unsent packets. | An ACK naming a packet number never sent in its space closes the connection with PROTOCOL_VIOLATION (RFC 9000 sec 13.1), so a peer cannot inflate the congestion window or force retransmission storms. |
 | URL-injected control characters (`\0`, CR, LF, `@` in IP literals). | `flare.net` + `flare.dns` reject these *before* the bytes reach libc. |
 
 ### A2. Authenticated abuser
@@ -70,9 +78,9 @@ cookie, API key, etc).
 |---|---|
 | Path traversal via static files. | `FileServer` rejects `..`, NUL, absolute paths at the request layer; only resolves relative paths under the declared root. |
 | Cookie tampering on signed sessions. | `signed_cookie_*` and `Session[T]` use HMAC-SHA256; invalid HMACs are rejected at the extractor layer, so the handler never sees a forged session. Key rotation is supported via `signed_cookie_decode_keys` (multiple keys, oldest-last). |
-| Replay of stolen session cookie. | Session contents include a server-side expiry; out-of-band rotation requires app-level support. flare does not bind sessions to TLS exporter or client IP; that decision is application policy. |
+| Replay of stolen session cookie. | Every session store expires sessions server-side: `CookieSessionStore` signs an absolute expiry into the cookie, `InMemorySessionStore` and `BackedSessionStore` stamp the server-side entry, all with `ttl_s` defaulting to one day (`DEFAULT_SESSION_TTL_S`; `ttl_s=0` opts out). Expiry bounds a replay window, it does not revoke: revoking one session earlier needs `BackedSessionStore.destroy` or a key rotation, which is app-level support. flare does not bind sessions to TLS exporter or client IP; that decision is application policy. |
 | CSRF. | flare does not ship CSRF middleware. SameSite cookie attributes are honoured (`Cookie.same_site`), but the framework cannot defend against application-level CSRF on its own. **You must** require a CSRF token on state-changing requests. |
-| XSS via reflected error message. | Sanitised-error policy: 4xx responses use a fixed status reason; the raised message is logged but not echoed. The Compress middleware and StaticResponse path do not auto-link or interpret content. |
+| XSS via reflected error message. | Sanitised-error policy: 4xx responses use a fixed status reason; the raised message is logged with the request id but not echoed. The Compress middleware and StaticResponse path do not auto-link or interpret content. |
 | Open redirect via Location header. | `Redirect` honours absolute URLs verbatim. **Validate the redirect target** if you build it from user input. |
 
 ### A3. Malicious peer in a proxy/server chain

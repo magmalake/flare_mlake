@@ -13,8 +13,14 @@
 #include <openssl/err.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
+#include <openssl/x509v3.h>
+#include <openssl/pem.h>
+#include <pthread.h>
 #include <string.h>
 #include <string>
+#include <map>
+#include <memory>
+#include <mutex>
 
 /* POSIX for test server and socket utilities */
 #include <sys/socket.h>
@@ -24,14 +30,36 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <errno.h>
+#include <pthread.h>
+#include <signal.h>
 
 /* Compile-time version gate */
 #if OPENSSL_VERSION_NUMBER < 0x30000000L
 #error "flare requires OpenSSL 3.x or later (OPENSSL_VERSION_NUMBER < 0x30000000L)"
 #endif
 
-/* Thread-local error buffer — no global mutable state */
-static thread_local std::string last_error_msg;
+/* Per-thread error buffer — no global mutable state. A pthread key rather
+ * than thread_local: a TLS segment in a library loaded with dlopen bumps
+ * glibc's TLS generation, and that leaves every other library's dynamic
+ * TLS access (the allocator's included) on __tls_get_addr's slow path. */
+static pthread_key_t last_error_key;
+static pthread_once_t last_error_once = PTHREAD_ONCE_INIT;
+
+static void last_error_key_init() {
+    pthread_key_create(&last_error_key, [](void* p) {
+        delete static_cast<std::string*>(p);
+    });
+}
+
+static std::string& last_error() {
+    pthread_once(&last_error_once, last_error_key_init);
+    auto* s = static_cast<std::string*>(pthread_getspecific(last_error_key));
+    if (!s) {
+        s = new std::string();
+        pthread_setspecific(last_error_key, s);
+    }
+    return *s;
+}
 
 static void capture_openssl_errors() {
     char buf[512] = {0};
@@ -42,11 +70,11 @@ static void capture_openssl_errors() {
         if (!msg.empty()) msg += "; ";
         msg += buf;
     }
-    last_error_msg = msg;
+    last_error() = msg;
 }
 
 static void set_error(const char* msg) {
-    last_error_msg = msg;
+    last_error() = msg;
 }
 
 /* Cipher list providing forward secrecy + AEAD authentication for TLS 1.2 */
@@ -58,9 +86,41 @@ static const char* FORWARD_SECRET_CIPHERS =
     "ECDHE-ECDSA-CHACHA20-POLY1305:"
     "ECDHE-RSA-CHACHA20-POLY1305";
 
+// ── SIGPIPE ──────────────────────────────────────────────────────────────────
+//
+// SSL_set_fd gives OpenSSL a socket BIO, and the socket BIO writes with
+// plain write(2): no MSG_NOSIGNAL. A write after the peer has gone raises
+// SIGPIPE, and its default action ends the process, so one client that
+// disconnected mid-response killed the whole server. The cleartext paths
+// already pass MSG_NOSIGNAL; this closes the TLS one.
+//
+// The disposition is changed only if it is still SIG_DFL, so a handler
+// or an explicit SIG_IGN the application installed is left alone. With
+// SIGPIPE ignored the write fails with EPIPE, which the caller already
+// reports as an error.
+
+static pthread_once_t flare_sigpipe_once = PTHREAD_ONCE_INIT;
+
+static void flare_ignore_default_sigpipe(void) {
+    struct sigaction cur;
+    if (sigaction(SIGPIPE, nullptr, &cur) != 0) return;
+    if ((cur.sa_flags & SA_SIGINFO) == 0 && cur.sa_handler == SIG_DFL) {
+        struct sigaction ign;
+        memset(&ign, 0, sizeof(ign));
+        ign.sa_handler = SIG_IGN;
+        sigemptyset(&ign.sa_mask);
+        sigaction(SIGPIPE, &ign, nullptr);
+    }
+}
+
+static void flare_sigpipe_guard(void) {
+    pthread_once(&flare_sigpipe_once, flare_ignore_default_sigpipe);
+}
+
 // ── Context lifecycle ────────────────────────────────────────────────────────
 
 flare_ssl_ctx_t flare_ssl_ctx_new(void) {
+    flare_sigpipe_guard();
     ERR_clear_error();
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) {
@@ -135,6 +195,7 @@ int flare_ssl_ctx_load_cert_key(flare_ssl_ctx_t ctx,
 // ── Session lifecycle ────────────────────────────────────────────────────────
 
 flare_ssl_t flare_ssl_new(flare_ssl_ctx_t ctx, int fd) {
+    flare_sigpipe_guard();
     ERR_clear_error();
     SSL* ssl = SSL_new(static_cast<SSL_CTX*>(ctx));
     if (!ssl) { capture_openssl_errors(); return nullptr; }
@@ -148,20 +209,48 @@ void flare_ssl_free(flare_ssl_t ssl) {
     if (ssl) SSL_free(static_cast<SSL*>(ssl));
 }
 
-/* Set SNI + the verification hostname and drive the handshake. Returns
- * SSL_connect's raw return so callers can classify it themselves. */
-static int flare_ssl_connect_raw(SSL* s, const char* server_name) {
-    ERR_clear_error();
-    /* Always send SNI when a hostname (not IP) is given */
-    if (server_name && server_name[0] != '\0') {
-        SSL_set_tlsext_host_name(s, server_name);
-        /* Also set hostname for certificate verification */
-        SSL_set1_host(s, server_name);
+/* Set SNI and the name the certificate is checked against. Returns 0,
+ * or -1 with last_error() set.
+ *
+ * Both return values used to be ignored. A failed SSL_set1_host left the
+ * handshake verifying the chain but no name, so any trusted certificate
+ * for any host was accepted: fail-open. An IP literal was sent as SNI,
+ * which RFC 6066 sec 3 forbids, and matched against DNS names instead of
+ * the certificate's IP addresses. */
+static int flare_ssl_set_peer_name(SSL* s, const char* server_name) {
+    if (!server_name || server_name[0] == '\0') return 0;
+    ASN1_OCTET_STRING* ip = a2i_IPADDRESS(server_name);
+    if (ip) {
+        ASN1_OCTET_STRING_free(ip);
+        if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(s), server_name)
+            != 1) {
+            capture_openssl_errors();
+            set_error("cannot set the IP address to verify");
+            return -1;
+        }
+        return 0;
     }
+    if (SSL_set_tlsext_host_name(s, server_name) != 1) {
+        capture_openssl_errors();
+        set_error("cannot set SNI");
+        return -1;
+    }
+    if (SSL_set1_host(s, server_name) != 1) {
+        capture_openssl_errors();
+        set_error("cannot set the hostname to verify");
+        return -1;
+    }
+    return 0;
+}
+
+/* Drive the handshake. Returns SSL_connect's raw return so callers can
+ * classify it themselves. */
+static int flare_ssl_connect_raw(SSL* s) {
+    ERR_clear_error();
     return SSL_connect(s);
 }
 
-/* Stash why a handshake failed into last_error_msg. This drains the
+/* Stash why a handshake failed into last_error(). This drains the
  * error queue, so SSL_get_error must run before it, never after. */
 static void flare_ssl_connect_capture(SSL* s) {
     capture_openssl_errors();
@@ -169,13 +258,14 @@ static void flare_ssl_connect_capture(SSL* s) {
     long verify_err = SSL_get_verify_result(s);
     if (verify_err != X509_V_OK) {
         const char* v = X509_verify_cert_error_string(verify_err);
-        last_error_msg = std::string("verify:") + v;
+        last_error() = std::string("verify:") + v;
     }
 }
 
 int flare_ssl_connect(flare_ssl_t ssl, const char* server_name) {
     SSL* s = static_cast<SSL*>(ssl);
-    if (flare_ssl_connect_raw(s, server_name) != 1) {
+    if (flare_ssl_set_peer_name(s, server_name) != 0) return -1;
+    if (flare_ssl_connect_raw(s) != 1) {
         flare_ssl_connect_capture(s);
         return -1;
     }
@@ -184,13 +274,18 @@ int flare_ssl_connect(flare_ssl_t ssl, const char* server_name) {
 
 int flare_ssl_connect_ex(flare_ssl_t ssl, const char* server_name) {
     SSL* s = static_cast<SSL*>(ssl);
-    int ret = flare_ssl_connect_raw(s, server_name);
+    /* Idempotent (set1 replaces), so a retry after WANT_READ /
+     * WANT_WRITE may run it again. */
+    if (flare_ssl_set_peer_name(s, server_name) != 0) {
+        return FLARE_SSL_IO_FATAL;
+    }
+    int ret = flare_ssl_connect_raw(s);
     if (ret == 1) return 0;
     /* Classify first: capture_openssl_errors() empties the queue that
      * SSL_get_error reads. A blocking fd with SO_RCVTIMEO armed reports
      * the expiry as WANT_READ (recv returned EAGAIN), which
      * flare_ssl_connect cannot separate from a protocol failure --
-     * both leave the error queue empty and last_error_msg blank. */
+     * both leave the error queue empty and last_error() blank. */
     int err = SSL_get_error(s, ret);
     if (err == SSL_ERROR_WANT_READ)  return FLARE_SSL_IO_WANT_READ;
     if (err == SSL_ERROR_WANT_WRITE) return FLARE_SSL_IO_WANT_WRITE;
@@ -254,14 +349,17 @@ int flare_ssl_read_blocking(flare_ssl_t ssl, uint8_t* buf, int len) {
      * SO_SNDTIMEO expired -- recv/send returned EAGAIN mid-record. */
     if (err == SSL_ERROR_WANT_READ)  return FLARE_SSL_IO_WANT_READ;
     if (err == SSL_ERROR_WANT_WRITE) return FLARE_SSL_IO_WANT_WRITE;
-    /* Every other zero return is end of stream. Deliberately wider than
-     * flare_ssl_read_ex's CLOSED, which only covers close_notify and
-     * SSL_ERROR_SYSCALL: OpenSSL 3.x reports a peer that vanished
-     * without close_notify as SSL_ERROR_SSL / "unexpected eof while
-     * reading", and a blocking reader has always seen that as a plain
-     * 0 from flare_ssl_read. Turning it into an error here would break
-     * every caller that reads a body until EOF. */
-    if (n == 0) return 0;
+    /* close_notify is a clean end of stream. Any other zero return is
+     * the peer going away without one: OpenSSL 3.x reports that as
+     * SSL_ERROR_SSL / "unexpected eof while reading", older releases as
+     * SSL_ERROR_SYSCALL. It is reported separately, so a reader whose
+     * framing is the end of the stream can tell a finished body from a
+     * truncated one. Readers that do not care treat both as EOF. */
+    if (n == 0) {
+        if (err == SSL_ERROR_ZERO_RETURN) return 0;
+        ERR_clear_error();
+        return FLARE_SSL_IO_EOF_UNCLEAN;
+    }
     capture_openssl_errors();
     return FLARE_SSL_IO_FATAL;
 }
@@ -441,10 +539,42 @@ int flare_ssl_ctx_enable_session_tickets(flare_ssl_ctx_t ctx, int lifetime_s) {
     return 0;
 }
 
+int flare_ssl_ctx_disable_session_tickets(flare_ssl_ctx_t ctx) {
+    SSL_CTX* c = static_cast<SSL_CTX*>(ctx);
+    if (!c) { set_error("ctx is null"); return -1; }
+    /* TLS 1.2: no stateless (RFC 5077) tickets. TLS 1.3: with
+     * SSL_OP_NO_TICKET OpenSSL would fall back to stateful tickets that
+     * point into the server cache, so also send zero NewSessionTicket
+     * messages. SSL_SESS_CACHE_OFF stops the server caching sessions, so
+     * a session-id resumption (TLS 1.2) has nothing to find either. */
+    SSL_CTX_set_options(c, SSL_OP_NO_TICKET);
+    if (SSL_CTX_set_num_tickets(c, 0) != 1) {
+        capture_openssl_errors();
+        return -1;
+    }
+    SSL_CTX_set_session_cache_mode(c, SSL_SESS_CACHE_OFF);
+    return 0;
+}
+
+int flare_ssl_ctx_set_min_proto(flare_ssl_ctx_t ctx, int version) {
+    SSL_CTX* c = static_cast<SSL_CTX*>(ctx);
+    if (!c) { set_error("ctx is null"); return -1; }
+    /* Fail closed: TLS 1.0 / 1.1 are never re-enabled. */
+    if (version < TLS1_2_VERSION || version > TLS1_3_VERSION) {
+        set_error("flare_ssl_ctx_set_min_proto: version must be TLS 1.2 or 1.3");
+        return -1;
+    }
+    if (SSL_CTX_set_min_proto_version(c, version) != 1) {
+        capture_openssl_errors();
+        return -1;
+    }
+    return 0;
+}
+
 // ── Error ────────────────────────────────────────────────────────────────────
 
 const char* flare_ssl_last_error(void) {
-    return last_error_msg.c_str();
+    return last_error().c_str();
 }
 
 // ── Server-side context lifecycle ─────────────────────────────────────────
@@ -452,6 +582,7 @@ const char* flare_ssl_last_error(void) {
 flare_ssl_ctx_t flare_ssl_ctx_new_server(
     const char* cert_path, const char* key_path
 ) {
+    flare_sigpipe_guard();
     ERR_clear_error();
     if (!cert_path || !key_path) {
         set_error("flare_ssl_ctx_new_server: cert_path / key_path required");
@@ -481,25 +612,136 @@ flare_ssl_ctx_t flare_ssl_ctx_new_server(
     return static_cast<void*>(ctx);
 }
 
-int flare_ssl_ctx_reload(
-    flare_ssl_ctx_t ctx, const char* cert_path, const char* key_path
+/* Certificates a server context serves, by SNI host ("" is the default).
+ * The map is immutable and replaced whole under the mutex, and the cert
+ * callback installs the chosen entry on each connection, so a reload
+ * never touches state another thread's handshake is reading. */
+namespace {
+struct FlareCert {
+    X509* leaf = nullptr;
+    EVP_PKEY* key = nullptr;
+    STACK_OF(X509)* chain = nullptr;
+    ~FlareCert() {
+        if (leaf) X509_free(leaf);
+        if (key) EVP_PKEY_free(key);
+        if (chain) sk_X509_pop_free(chain, X509_free);
+    }
+};
+using CertMap = std::map<std::string, std::shared_ptr<FlareCert>>;
+struct CertStore {
+    std::mutex mu;
+    std::shared_ptr<const CertMap> certs;
+};
+
+int store_index() {
+    static int idx = -1;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        idx = SSL_CTX_get_ex_new_index(
+            0, nullptr, nullptr, nullptr,
+            [](void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*) {
+                delete static_cast<CertStore*>(ptr);
+            });
+    });
+    return idx;
+}
+
+std::string lower(const char* s) {
+    std::string out(s);
+    for (auto& c : out) c = (char)tolower((unsigned char)c);
+    return out;
+}
+
+int pick_cert(SSL* s, void* arg) {
+    auto* st = static_cast<CertStore*>(arg);
+    std::shared_ptr<const CertMap> m;
+    {
+        std::lock_guard<std::mutex> g(st->mu);
+        m = st->certs;
+    }
+    if (!m) return 1;
+    const char* sn = SSL_get_servername(s, TLSEXT_NAMETYPE_host_name);
+    auto it = m->end();
+    if (sn) {
+        std::string host = lower(sn);
+        it = m->find(host);
+        auto dot = host.find('.');
+        if (it == m->end() && dot != std::string::npos)
+            it = m->find("*" + host.substr(dot));
+    }
+    if (it == m->end()) it = m->find("");
+    if (it == m->end()) return 1;
+    const FlareCert& c = *it->second;
+    return SSL_use_cert_and_key(s, c.leaf, c.key, c.chain, 1) == 1 ? 1 : 0;
+}
+
+std::shared_ptr<FlareCert> load_cert(const char* cert_path, const char* key_path) {
+    auto c = std::make_shared<FlareCert>();
+    c->chain = sk_X509_new_null();
+    BIO* cb = BIO_new_file(cert_path, "r");
+    BIO* kb = BIO_new_file(key_path, "r");
+    bool ok = c->chain && cb && kb;
+    if (ok) ok = (c->leaf = PEM_read_bio_X509_AUX(cb, nullptr, nullptr, nullptr));
+    while (ok) {
+        X509* extra = PEM_read_bio_X509(cb, nullptr, nullptr, nullptr);
+        if (!extra) break;
+        if (!sk_X509_push(c->chain, extra)) { X509_free(extra); ok = false; }
+    }
+    if (ok) {
+        ERR_clear_error();  /* the loop ends on a benign "no start line" */
+        ok = (c->key = PEM_read_bio_PrivateKey(kb, nullptr, nullptr, nullptr));
+    }
+    if (ok) ok = X509_check_private_key(c->leaf, c->key) == 1;
+    if (cb) BIO_free(cb);
+    if (kb) BIO_free(kb);
+    if (!ok) { capture_openssl_errors(); return nullptr; }
+    return c;
+}
+}  // namespace
+
+int flare_ssl_ctx_set_cert(
+    flare_ssl_ctx_t ctx, const char* host, const char* cert_path,
+    const char* key_path
 ) {
     ERR_clear_error();
     SSL_CTX* c = static_cast<SSL_CTX*>(ctx);
-    if (!c || !cert_path || !key_path) {
-        set_error("flare_ssl_ctx_reload: ctx / cert / key required");
+    if (!c || !host || !cert_path || !key_path) {
+        set_error("flare_ssl_ctx_set_cert: ctx / host / cert / key required");
         return -1;
     }
-    if (SSL_CTX_use_certificate_chain_file(c, cert_path) != 1) {
-        capture_openssl_errors(); return -1;
+    /* Loaded and checked before anything is installed: a bad pair leaves
+     * the context serving what it served. */
+    auto cert = load_cert(cert_path, key_path);
+    if (!cert) return -1;
+    int idx = store_index();
+    auto* st = static_cast<CertStore*>(SSL_CTX_get_ex_data(c, idx));
+    if (!st) {
+        st = new CertStore();
+        if (SSL_CTX_set_ex_data(c, idx, st) != 1) {
+            delete st;
+            capture_openssl_errors();
+            return -1;
+        }
+        SSL_CTX_set_cert_cb(c, pick_cert, st);
     }
-    if (SSL_CTX_use_PrivateKey_file(c, key_path, SSL_FILETYPE_PEM) != 1) {
-        capture_openssl_errors(); return -1;
-    }
-    if (SSL_CTX_check_private_key(c) != 1) {
-        capture_openssl_errors(); return -1;
-    }
+    std::lock_guard<std::mutex> g(st->mu);
+    auto next = std::make_shared<CertMap>(st->certs ? *st->certs : CertMap());
+    (*next)[lower(host)] = cert;
+    st->certs = next;
     return 0;
+}
+
+int flare_ssl_ctx_reload(
+    flare_ssl_ctx_t ctx, const char* cert_path, const char* key_path
+) {
+    return flare_ssl_ctx_set_cert(ctx, "", cert_path, key_path);
+}
+
+int flare_ssl_ctx_check_private_key(flare_ssl_ctx_t ctx) {
+    ERR_clear_error();
+    SSL_CTX* c = static_cast<SSL_CTX*>(ctx);
+    if (!c) return 0;
+    return SSL_CTX_check_private_key(c) == 1 ? 1 : 0;
 }
 
 /* ALPN selection callback. ``arg`` carries our wire-format
@@ -618,6 +860,7 @@ int flare_ssl_ctx_set_verify_client_cert(
 // ── Server-side session lifecycle ─────────────────────────────────────────
 
 flare_ssl_t flare_ssl_new_accept(flare_ssl_ctx_t ctx, int fd) {
+    flare_sigpipe_guard();
     ERR_clear_error();
     SSL* ssl = SSL_new(static_cast<SSL_CTX*>(ctx));
     if (!ssl) { capture_openssl_errors(); return nullptr; }

@@ -13,6 +13,7 @@ Platform notes:
 
 from std.ffi import c_int, c_uint, c_size_t, c_ssize_t, get_errno, ErrNo
 from std.memory import stack_allocation
+from std.sys.info import CompilationTarget
 
 from std.format import Writable, Writer
 from ..net import (
@@ -24,6 +25,7 @@ from ..net import (
 from ..net.socket import (
     RawSocket,
     AF_INET,
+    AF_INET6,
     SOCK_DGRAM,
     _build_sockaddr_in,
     _sockaddr_to_socket_addr,
@@ -36,7 +38,7 @@ from ..net._libc import (
     _strerror,
     SOL_SOCKET,
     SO_BROADCAST,
-    SOCKADDR_IN_SIZE,
+    SOCKADDR_IN6_SIZE,
     MSG_DONTWAIT,
 )
 
@@ -140,7 +142,7 @@ struct UdpSocket(Movable):
     # ── Factory ───────────────────────────────────────────────────────────────
 
     @staticmethod
-    def bind(addr: SocketAddr) raises -> UdpSocket:
+    def bind(addr: SocketAddr, reuse_port: Bool = False) raises -> UdpSocket:
         """Create a UDP socket bound to ``addr``.
 
         After this call, ``recv_from()`` will receive datagrams sent to
@@ -149,6 +151,9 @@ struct UdpSocket(Movable):
         Args:
             addr: The local address to bind. Use port ``0`` for an
                   OS-assigned ephemeral port.
+            reuse_port: Set ``SO_REUSEPORT`` first, so several sockets
+                  of this user can bind the port and the kernel spreads
+                  flows across them by 4-tuple (a multi-worker server).
 
         Returns:
             A bound ``UdpSocket``.
@@ -162,8 +167,14 @@ struct UdpSocket(Movable):
             var s = UdpSocket.bind(SocketAddr.localhost(5000))
             ```
         """
-        var sock = RawSocket(AF_INET, SOCK_DGRAM)
-        sock.set_reuse_addr(True)
+        # The family follows the address: it was always AF_INET, so
+        # binding an IPv6 address failed. And no SO_REUSEADDR: for UDP it
+        # lets a second socket bind the same port and take a share of
+        # its datagrams (all of them, for unicast, on some kernels).
+        var family = AF_INET6 if addr.ip.is_v6() else AF_INET
+        var sock = RawSocket(family, SOCK_DGRAM)
+        if reuse_port:
+            sock.set_reuse_port(True)
 
         var sa = _build_sockaddr_in(addr)
         var rc = _bind(sock.fd, sa[0], sa[1])
@@ -182,10 +193,12 @@ struct UdpSocket(Movable):
         return UdpSocket(sock^, local)
 
     @staticmethod
-    def unbound() raises -> UdpSocket:
+    def unbound(ipv6: Bool = False) raises -> UdpSocket:
         """Create a send-only UDP socket without binding to a specific port.
 
         The OS assigns an ephemeral source port on the first ``send_to()``.
+        ``ipv6`` picks an AF_INET6 socket, needed to send to IPv6
+        destinations.
 
         Returns:
             An unbound ``UdpSocket``.
@@ -201,7 +214,7 @@ struct UdpSocket(Movable):
         """
         from ..net.address import IpAddr, SocketAddr as SA
 
-        var sock = RawSocket(AF_INET, SOCK_DGRAM)
+        var sock = RawSocket(AF_INET6 if ipv6 else AF_INET, SOCK_DGRAM)
         var unspec = SA(IpAddr.unspecified(), 0)
         return UdpSocket(sock^, unspec)
 
@@ -269,11 +282,13 @@ struct UdpSocket(Movable):
         queued datagrams in one reactor tick without touching
         ``SO_RCVTIMEO`` per call.
         """
-        var peer_buf = stack_allocation[Int(SOCKADDR_IN_SIZE), UInt8]()
-        for i in range(Int(SOCKADDR_IN_SIZE)):
+        # Sized for sockaddr_in6: a 16-byte buffer truncates an IPv6
+        # sender and the decoder then reads sin6_addr past its end.
+        var peer_buf = stack_allocation[Int(SOCKADDR_IN6_SIZE), UInt8]()
+        for i in range(Int(SOCKADDR_IN6_SIZE)):
             peer_buf.unsafe_offset(i).unsafe_write(0)
         var peer_len = stack_allocation[1, c_uint]()
-        peer_len.unsafe_write(SOCKADDR_IN_SIZE)
+        peer_len.unsafe_write(SOCKADDR_IN6_SIZE)
 
         var got = _recvfrom(
             self._socket.fd,
@@ -320,11 +335,13 @@ struct UdpSocket(Movable):
             print("got", n, "bytes from", String(sender))
             ```
         """
-        var peer_buf = stack_allocation[Int(SOCKADDR_IN_SIZE), UInt8]()
-        for i in range(Int(SOCKADDR_IN_SIZE)):
+        # Sized for sockaddr_in6: a 16-byte buffer truncates an IPv6
+        # sender and the decoder then reads sin6_addr past its end.
+        var peer_buf = stack_allocation[Int(SOCKADDR_IN6_SIZE), UInt8]()
+        for i in range(Int(SOCKADDR_IN6_SIZE)):
             peer_buf.unsafe_offset(i).unsafe_write(0)
         var peer_len = stack_allocation[1, c_uint]()
-        peer_len.unsafe_write(SOCKADDR_IN_SIZE)
+        peer_len.unsafe_write(SOCKADDR_IN6_SIZE)
 
         var got = _recvfrom(
             self._socket.fd,
@@ -385,6 +402,24 @@ struct UdpSocket(Movable):
             NetworkError: If ``setsockopt(2)`` fails.
         """
         self._socket.set_send_buffer(bytes)
+
+    def set_ecn(self, codepoint: Int) raises:
+        """Mark outgoing datagrams with the ECN ``codepoint`` (0 none,
+        2 ECT(0), 1 ECT(1), 3 CE; RFC 3168) and deliver received
+        datagrams' codepoints to :meth:`flare.udp.BatchReceiver.ecn`.
+        Linux only; a no-op elsewhere.
+
+        Raises:
+            NetworkError: If ``setsockopt(2)`` fails.
+        """
+        if not CompilationTarget.is_linux():
+            return
+        if self._local.ip.is_v6():
+            self._socket._set_int_opt(41, 66, 1)  # IPV6_RECVTCLASS
+            self._socket._set_int_opt(41, 67, codepoint)  # IPV6_TCLASS
+        else:
+            self._socket._set_int_opt(0, 13, 1)  # IP_RECVTOS
+            self._socket._set_int_opt(0, 1, codepoint)  # IP_TOS
 
     def set_broadcast(self, enabled: Bool) raises:
         """Enable or disable sending to broadcast addresses.

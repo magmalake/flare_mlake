@@ -132,6 +132,16 @@ struct TlsServerNotImplemented(Copyable, Writable):
 # ── TlsServerConfig ────────────────────────────────────────────────────────
 
 
+@fieldwise_init
+struct TlsSniCert(Copyable):
+    """A certificate served to clients whose SNI matches ``host`` (an
+    exact name, or ``*.example.com`` for one label)."""
+
+    var host: String
+    var cert_file: String
+    var key_file: String
+
+
 struct TlsServerConfig(Copyable):
     """Server-side TLS policy.
 
@@ -172,20 +182,25 @@ struct TlsServerConfig(Copyable):
     var client_ca_bundle: String
     var min_protocol: Int
     var enable_session_tickets: Bool
-    """When True (default), the acceptor's ``SSL_CTX`` is
-    configured to issue RFC 5077 session tickets (TLS 1.2) /
+    """Opt-in; default ``False``. When True the acceptor's
+    ``SSL_CTX`` issues RFC 5077 session tickets (TLS 1.2) /
     RFC 8446 §4.6.1 NewSessionTicket frames (TLS 1.3) so peers
-    can resume on subsequent connects. Cheap to keep on; turn
-    off only for environments where ticket-key rotation is not
-    handled out-of-band (the acceptor does not auto-rotate
-    -- the ``flare_ssl_ctx_enable_session_tickets`` FFI permits
-    rotation but the acceptor doesn't expose the hook yet)."""
+    can resume on subsequent connects. When False the context
+    sends no tickets and keeps no server session cache, so no
+    session is issued and none can be resumed (every connection
+    is a full handshake). The ticket key lives as long as the
+    ``SSL_CTX``; :meth:`TlsAcceptor.reload` builds a new context,
+    so it rotates the key and invalidates every ticket and cached
+    session issued before it."""
     var ticket_lifetime_s: Int
     """Session ticket lifetime in seconds. Default 7200 (two
     hours). Maps to ``SSL_CTX_set_timeout`` and the embedded TLS
     1.3 ``ticket_lifetime`` field. Production deployments should
     keep this short and rotate ticket keys via an out-of-band
     secret-management path."""
+    var sni_certs: List[TlsSniCert]
+    """Certificates chosen by SNI; a client whose SNI matches none, or
+    that sends none, gets ``cert_file``."""
     var handshake_timeout_ms: Int
     """Wall-clock cap (milliseconds) on a single blocking
     ``SSL_accept`` drive in ``TlsAcceptor.handshake_fd``. Default
@@ -203,9 +218,10 @@ struct TlsServerConfig(Copyable):
         require_client_cert: Bool = False,
         client_ca_bundle: String = "",
         min_protocol: Int = TLS_PROTOCOL_TLS12,
-        enable_session_tickets: Bool = True,
+        enable_session_tickets: Bool = False,
         ticket_lifetime_s: Int = 7200,
         handshake_timeout_ms: Int = 10_000,
+        var sni_certs: List[TlsSniCert] = List[TlsSniCert](),
     ) raises:
         """Construct the config; validates inter-field invariants.
 
@@ -233,6 +249,10 @@ struct TlsServerConfig(Copyable):
         self.enable_session_tickets = enable_session_tickets
         self.ticket_lifetime_s = ticket_lifetime_s
         self.handshake_timeout_ms = handshake_timeout_ms
+        for i in range(len(sni_certs)):
+            if sni_certs[i].host.byte_length() == 0:
+                raise Error("TlsServerConfig: an SNI certificate needs a host")
+        self.sni_certs = sni_certs^
 
 
 # Protocol version constants. Mirror OpenSSL's
@@ -352,28 +372,55 @@ struct TlsAcceptor(Movable):
                     alpn_blob.append(b)
             self._ctx.set_alpn(alpn_blob)
 
+        # Minimum protocol version. It was stored and never applied, so a
+        # TLS 1.3-only configuration still accepted TLS 1.2.
+        if config.min_protocol != TLS_PROTOCOL_TLS12:
+            self._ctx.set_min_protocol(config.min_protocol)
+
         # mTLS.
         if config.require_client_cert:
             self._ctx.set_verify_client_cert(config.client_ca_bundle)
 
-        # Session resumption (RFC 5077 / RFC 8446 §4.6.1).
-        # Default-on; cheap to keep enabled because the inner
-        # SSL_CTX_set_options only clears the no-ticket bit, and
-        # SSL_CTX_set_session_id_context is a one-shot at ctx
-        # construction time.
+        # Session resumption (RFC 5077 / RFC 8446 §4.6.1) is opt-in.
+        # Either way the context is configured explicitly: leaving it
+        # alone would keep OpenSSL's defaults, where tickets and the
+        # server session cache are on.
         if config.enable_session_tickets:
             self._ctx.enable_session_tickets(config.ticket_lifetime_s)
+        else:
+            self._ctx.disable_session_tickets()
+
+        for i in range(len(config.sni_certs)):
+            ref c = config.sni_certs[i]
+            self._ctx.set_cert(c.host, c.cert_file, c.key_file)
 
         self.config = config^
 
+    def into_ctx(deinit self) -> ServerCtx:
+        """Hand over the configured ``SSL_CTX`` (ALPN, mTLS, minimum
+        version, session-ticket policy applied), e.g. to the HTTP
+        reactor, which drives its own non-blocking handshakes."""
+        return self._ctx^
+
     def reload(mut self) raises:
-        """Re-read the cert + key files from ``config`` and
-        atomically swap into the underlying ``SSL_CTX``.
-        In-flight handshakes hold the old cert; new handshakes
-        pick up the new one. Designed for cert rotation under
-        live traffic.
+        """Re-read the cert + key files from ``config`` and swap in
+        a freshly built ``SSL_CTX``.
+
+        The replacement context is constructed from ``config`` first
+        and only then installed, so a failed reload (unreadable file,
+        cert / key mismatch) raises and leaves the running context
+        untouched. In-flight sessions keep their reference to the
+        old context and finish with the old cert; new handshakes
+        pick up the new one.
+
+        A new ``SSL_CTX`` has its own random session-ticket keys and
+        an empty session cache, so a reload also rotates the ticket
+        key: a ticket or cached session issued before the reload does
+        not resume after it (the peer falls back to a full
+        handshake). This is what ``docs/threat-model.md`` promises.
         """
-        self._ctx.reload(self.config.cert_file, self.config.key_file)
+        var fresh = TlsAcceptor(self.config.copy())
+        self = fresh^
 
     def handshake_fd(mut self, fd: Int) raises -> Tuple[Int, TlsInfo]:
         """Drive the ``SSL_accept`` state machine on ``fd`` to

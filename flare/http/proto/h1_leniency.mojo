@@ -84,7 +84,11 @@ struct H1LeniencyConfig(Copyable):
     ``CRLF``; many older clients emit bare ``LF`` between the
     request line, headers, and the trailing blank line. The
     parser's tokeniser still rejects mixed terminators (``CR``
-    not followed by ``LF``)."""
+    not followed by ``LF``). The reactor's raw-byte framing
+    (``Transfer-Encoding`` / ``Content-Length``) always reads the
+    request line and header lines as ending at ``LF``, so it
+    frames the request the way this flag makes the parser read it;
+    the end of the header block is still the first ``CRLF CRLF``."""
 
     var allow_mixed_case_method: Bool
     """Accept method tokens with mixed case (e.g. ``Get`` /
@@ -99,7 +103,11 @@ struct H1LeniencyConfig(Copyable):
     §5.1 explicitly forbids whitespace before the ``:``; this
     is the classic request-smuggling vector
     (CVE-2022-24999-class). Defaults off; flip only if a
-    trusted upstream emits ``Header :value``."""
+    trusted upstream emits ``Header :value``. The reactor's
+    raw-byte framing (``Transfer-Encoding`` and
+    ``Content-Length``) always skips that whitespace, so it frames
+    such a request the way the parser reads it; with the flag off
+    the parser then rejects the request."""
 
     var allow_obs_fold: Bool
     """Accept line-folded header values (``LWS`` continuation
@@ -162,7 +170,10 @@ struct H1LeniencyConfig(Copyable):
     that recipients SHOULD treat the bytes as opaque but MAY
     reject them. Defaults off because legitimate clients
     rarely emit obs-text and the bytes are a common
-    fuzzing-discovered crash vector."""
+    fuzzing-discovered crash vector. The bytes are opaque on the
+    wire but the parsed value is a ``String``, which holds UTF-8:
+    a value (or an obs-fold continuation) that is not valid UTF-8
+    is rejected even with this flag on."""
 
     var accept_invalid_chunk_extension_chars: Bool
     """Accept characters that violate the chunk-extension
@@ -170,7 +181,9 @@ struct H1LeniencyConfig(Copyable):
     ``;ext=value`` portion of a chunk-size line. RFC 9112
     §7.1.1 defines the grammar strictly. Defaults off; flip
     only if you trust the upstream's chunk-extension
-    formatting.
+    formatting. A bare ``LF`` inside a chunk-size or trailer line is
+    never accepted, whatever this flag says: an LF-splitting front
+    end would end the body somewhere else (request smuggling).
 
     .. note::
 

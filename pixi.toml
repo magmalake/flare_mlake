@@ -3,12 +3,12 @@ authors = ["ehsanmok <ehsanmok@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "flare"
 platforms = ["osx-arm64", "linux-aarch64", "linux-64"]
-version = "0.10.2"
+version = "0.13.0"
 preview = ["pixi-build"]
 
 [package]
 name = "flare_mlake"
-version = "0.10.2"
+version = "0.13.0"
 
 [package.build]
 # Lower bound only, deliberately.
@@ -39,13 +39,14 @@ scripts = ["flare/tls/ffi/build.sh", "flare/http/ffi/build.sh", "flare/tls/ffi/b
 # as a library picks up. Contributor-only tooling (docs generator, pre-commit
 # hooks) lives under [feature.dev] and is opted into via `pixi install -e dev`.
 [dependencies]
-mojo             = ">=1.1.0,<2.0.0"
+mojo             = ">=1.2.0,<2.0.0"
 openssl          = ">=3.6.1,<4"    # TLS: libssl + libcrypto (SHA-1 for WS handshake)
 ca-certificates  = ">=2025.1.31"   # TLS default CA bundle → $CONDA_PREFIX/ssl/cacert.pem
 zlib             = ">=1.3.1,<2"    # HTTP: Content-Encoding gzip/deflate decompression
-libbrotlicommon  = ">=1,<2"        # HTTP: Content-Encoding br (shared brotli tables)
-libbrotlidec     = ">=1,<2"        # HTTP: brotli decoder
-libbrotlienc     = ">=1,<2"        # HTTP: brotli encoder
+libbrotlicommon  = ">=1.2.1,<2"        # HTTP: Content-Encoding br (shared brotli tables)
+libbrotlidec     = ">=1.2.1,<2"        # HTTP: brotli decoder
+libbrotlienc     = ">=1.2.1,<2"        # HTTP: brotli encoder
+libdeflate       = ">=1.22,<2"     # HTTP: gzip encoder for Content-Encoding responses
 # magmalake/json_mlake rather than ehsanmok/json: this distribution depends on
 # magmalake tins so a consumer resolves one org's packages. json_mlake tracks
 # upstream json with only packaging deltas; the module is still imported as
@@ -97,12 +98,9 @@ gdb        = ">=14"
 valgrind   = ">=3.22"
 heaptrack  = ">=1.5"
 
-# mozz tracks main directly, same as json/mojodoc above. A nightly fuzz
-# failure can in principle come from a dependency that moved rather than
-# from flare, but pinning to a specific commit re-pins its own transitive
-# mojo/build-backend constraints too, which is what forced this file's
-# json/mozz/mojodoc pins to be updated by hand on every upstream release.
-# Tracking main keeps all four repos moving together.
+# mozz is pinned to a release tag, same as json/mojodoc above, so a nightly
+# fuzz failure cannot come from a dependency that moved underneath flare.
+# Bump the three tags (and recipe.yaml's json rev) together on each release.
 #
 # (The flare-side fuzz-http-server crash -- raw wire bytes reflected
 # into Error messages -- is fixed in
@@ -248,6 +246,7 @@ fuzz-headers       = "mojo -I . fuzz/fuzz_http_headers.mojo"
 fuzz-http-response = "mojo -I . fuzz/fuzz_http_response.mojo"
 fuzz-http-server   = "mojo -I . fuzz/fuzz_http_server.mojo"
 fuzz-ws-server     = "mojo -I . fuzz/fuzz_ws_server.mojo"
+fuzz-ws-protocol   = "mojo -I . fuzz/fuzz_ws_protocol.mojo"
 prop-ws            = "mojo -I . fuzz/prop_ws_roundtrip.mojo"
 prop-headers       = "mojo -I . fuzz/prop_headers.mojo"
 prop-auth          = "mojo -I . fuzz/prop_auth.mojo"
@@ -283,6 +282,7 @@ fuzz-quic-early-data-len = "mojo -I . fuzz/fuzz_quic_early_data_len.mojo"  # 0-R
 fuzz-quic-early-data-strike = "mojo -I . fuzz/fuzz_quic_early_data_strike.mojo"  # cross-connection 0-RTT strike set vs reference model (200K)
 fuzz-h3-frame      = "mojo -I . fuzz/fuzz_h3_frame.mojo"            # v0.8 — HTTP/3 frame codec + SETTINGS payload round-trip (200K)
 fuzz-h3-server     = "mojo -I . fuzz/fuzz_h3_server.mojo"           # Http3Connection sans-I/O feed safety (200K)
+fuzz-h3-capsule    = "mojo -I . fuzz/fuzz_h3_capsule.mojo"          # RFC 9297 Capsule Protocol parser: bounds, split invariance, round trip (200K)
 fuzz-h3-response-reader = "mojo -I . fuzz/fuzz_h3_response_reader.mojo" # Http3ResponseReader sans-I/O feed safety + split-invariance (200K)
 fuzz-quic-frame-decode    = "mojo -I . fuzz/fuzz_quic_frame_decode.mojo"     # RFC 9000 §19 frame codec safety + idempotence (200K)
 fuzz-quic-retry           = "mojo -I . fuzz/fuzz_quic_retry.mojo"            # v0.9 - RFC 9000 Retry token + RFC 9001 integrity verify never panic (100K)
@@ -301,7 +301,7 @@ fuzz-byte-cursor   = "mojo -I . fuzz/fuzz_byte_cursor.mojo"      # v0.9 A3 — B
 fuzz-frame-mux     = "mojo -I . fuzz/fuzz_frame_mux.mojo"        # v0.9 B3 — FrameDemux reassembly + codec round-trip + split-invariance (200K)
 fuzz-quic-migration = "mojo -I . fuzz/fuzz_quic_migration.mojo"  # v0.9 — RFC 9000 §19.15-§19.18 migration state transitions (200K)
 fuzz-quic-migration-amplification = "mojo -I . fuzz/fuzz_quic_migration_amplification.mojo"  # RFC 9000 sec 8.1 strict-hold 3x anti-amplification budget invariant (200K)
-fuzz-all           = { depends-on = ["fuzz-ws", "fuzz-pmd-context", "fuzz-url", "fuzz-headers", "fuzz-http-response", "fuzz-http-server", "fuzz-ws-server", "prop-ws", "prop-headers", "prop-auth", "fuzz-encoding", "fuzz-cookie", "fuzz-reactor-churn", "prop-timer-wheel", "fuzz-server-reactor-chunks", "fuzz-router-paths", "fuzz-scheduler-shutdown", "fuzz-extractors", "fuzz-routes-comptime", "fuzz-header-scan", "fuzz-form", "fuzz-multipart", "fuzz-session-decode", "fuzz-fs-range", "fuzz-h2-frame", "fuzz-hpack-decoder", "fuzz-huffman-simd", "fuzz-ws-deflate", "fuzz-extended-connect", "fuzz-h2-preface-peek", "fuzz-h2-continuation", "fuzz-h2-rapid-reset", "fuzz-proxy-protocol", "fuzz-io-uring-sqe", "fuzz-uring-reactor", "fuzz-grpc-lpm-decoder", "fuzz-quic-varint", "fuzz-quic-long-header", "fuzz-quic-early-data-len", "fuzz-quic-early-data-strike", "fuzz-h3-frame", "fuzz-cache-control-parser", "fuzz-alt-svc-parser", "fuzz-alpn-dispatch", "fuzz-proto-reader", "fuzz-conditional", "fuzz-quic-frame-decode", "fuzz-qpack-decode", "fuzz-quic-transport-params", "fuzz-quic-packet-decrypt", "fuzz-quic-initial-handshake", "fuzz-quic-connection-id", "fuzz-h3-server", "fuzz-h3-response-reader", "fuzz-byte-cursor", "fuzz-frame-mux", "fuzz-quic-migration", "fuzz-quic-migration-amplification", "fuzz-qpack-dynamic", "fuzz-quic-retry", "fuzz-chunked-decoder", "fuzz-chunked-framing", "fuzz-template"] }
+fuzz-all           = { depends-on = ["fuzz-ws", "fuzz-pmd-context", "fuzz-url", "fuzz-headers", "fuzz-http-response", "fuzz-http-server", "fuzz-ws-server", "fuzz-ws-protocol", "prop-ws", "prop-headers", "prop-auth", "fuzz-encoding", "fuzz-cookie", "fuzz-reactor-churn", "prop-timer-wheel", "fuzz-server-reactor-chunks", "fuzz-router-paths", "fuzz-scheduler-shutdown", "fuzz-extractors", "fuzz-routes-comptime", "fuzz-header-scan", "fuzz-form", "fuzz-multipart", "fuzz-session-decode", "fuzz-fs-range", "fuzz-h2-frame", "fuzz-hpack-decoder", "fuzz-huffman-simd", "fuzz-ws-deflate", "fuzz-extended-connect", "fuzz-h2-preface-peek", "fuzz-h2-continuation", "fuzz-h2-rapid-reset", "fuzz-proxy-protocol", "fuzz-io-uring-sqe", "fuzz-uring-reactor", "fuzz-grpc-lpm-decoder", "fuzz-quic-varint", "fuzz-quic-long-header", "fuzz-quic-early-data-len", "fuzz-quic-early-data-strike", "fuzz-h3-frame", "fuzz-cache-control-parser", "fuzz-alt-svc-parser", "fuzz-alpn-dispatch", "fuzz-proto-reader", "fuzz-conditional", "fuzz-quic-frame-decode", "fuzz-qpack-decode", "fuzz-quic-transport-params", "fuzz-quic-packet-decrypt", "fuzz-quic-initial-handshake", "fuzz-quic-connection-id", "fuzz-h3-server", "fuzz-h3-capsule", "fuzz-h3-response-reader", "fuzz-byte-cursor", "fuzz-frame-mux", "fuzz-quic-migration", "fuzz-quic-migration-amplification", "fuzz-qpack-dynamic", "fuzz-quic-retry", "fuzz-chunked-decoder", "fuzz-chunked-framing", "fuzz-template"] }
 
 [feature.dev.tasks]
 # ── Docs (powered by mojodoc; dev-only because mojodoc is in feature.dev) ────
@@ -335,6 +335,31 @@ format             = { cmd = "mojo format flare tests benchmark examples fuzz", 
 # details + the healthy-posture interpretation guide.
 perf-server-alloc  = "bash benchmark/scripts/perf_profile_server.sh"
 
+# ── Formal verification (Lean 4 models + proofs under formal/) ─────────────
+# Opt in with: pixi run -e formal formal-build
+# Core Lean only (no Mathlib); conda-forge ships lean + lake for all three
+# platforms. Own solve-group so the Lean toolchain never perturbs the
+# default runtime solve.
+[feature.formal.dependencies]
+lean4 = ">=4.33.0,<4.34"
+
+[feature.formal.tasks]
+formal-build = { cmd = "lake build", cwd = "formal" }
+formal-check = "bash formal/scripts/check.sh"
+# Re-lock theorem statements and spec definitions after a human reviewed the change.
+# Agents must never run this (a Cursor hook denies it); see formal/scripts/spec_guard.py.
+formal-spec-lock = "python3 formal/scripts/spec_guard.py --lock"
+# Drift gate run by the `formal-drift` pre-commit hook (anchors, build, spec guard, difftest).
+formal-precommit = "bash formal/scripts/precommit.sh"
+formal-anchors = "python3 formal/scripts/anchors.py check"   # every stale anchor, by tier
+formal-status  = "python3 formal/scripts/status.py"          # anchors, spec guard, difftest, obligations
+# Differential testing: Lean impl/spec models vs the Mojo code (formal/difftest/).
+# The runner builds the oracle here and the Mojo drivers in the default env.
+formal-oracle-build = { cmd = "lake build flare-oracle", cwd = "formal" }
+difftest       = "python3 formal/difftest/run.py"                    # every target, 3000 cases each
+difftest-quick = "python3 formal/difftest/run.py --quick --affected"  # targets touched since HEAD, 1000 cases
+difftest-soak  = "python3 formal/difftest/run.py --soak 600"         # fresh seeds for 10 minutes
+
 [environments]
 # Lean default env — only flare's runtime deps. Ships tests, examples,
 # microbenchmarks, and format-check out of the box. Contributors who
@@ -344,6 +369,7 @@ dev     = { features = ["dev"], solve-group = "default" }
 fuzz    = { features = ["dev", "fuzz"], solve-group = "default" }
 bench   = { features = ["dev", "bench"], solve-group = "default" }
 metrics = { features = ["metrics"], solve-group = "default" }
+formal  = { features = ["formal"], solve-group = "formal" }
 
 [tasks]
 # ── Lint jobs (load-bearing for the sans-I/O sublayer + future API surface) ──
@@ -493,10 +519,13 @@ test-handler         = "mojo -I . tests/http/test_handler.mojo"            # v0.
 test-router          = "mojo -I . tests/http/test_router.mojo"             # v0.4.0 Track 1 — Router path/method dispatch (~23 tests)
 test-router-copy     = "mojo -I . tests/http/test_router_copy.mojo"        # v0.7 — Router-Copyable refcount-shared boxed handlers (~5 tests)
 test-server-handler  = "mojo -I . tests/http/test_server_handler.mojo"     # v0.4.0 Track 1 — HttpServer.serve[H: Handler & Copyable] single-worker (~6 tests)
-test-serve-comptime  = "mojo -I . tests/http/test_server_serve_comptime.mojo" # v0.4.0 Track 1 — comptime serve overload (~6 tests)
-test-thread-ffi      = "mojo -I . tests/runtime/test_thread_ffi.mojo"         # v0.4.0 Track 3 — pthread + CPU pinning FFI (~10 tests)
+test-server-config-check = "mojo -I . tests/http/test_server_config_check.mojo" # ServerConfig.check comptime invariants (~6 tests)
+test-thread-ffi      = "mojo -I . tests/runtime/test_thread_ffi.mojo"         # v0.4.0 Track 3 — thread handles + CPU pinning FFI (~11 tests)
+test-thread-engine   = "mojo -I . tests/runtime/test_thread_engine.mojo"      # AsyncRT thread engine: tasks, joins, serving leases, fork fallback (~13 tests)
+bench-threads        = "bash benchmark/scripts/bench_threads.sh"             # spawn/join, fan-out and block_in_pool cost: AsyncRT tasks vs OS threads
 test-reuseport       = "mojo -I . tests/runtime/test_reuseport.mojo"          # v0.4.0 Track 3 — SO_REUSEPORT helper (~6 tests)
 test-scheduler       = "mojo -I . tests/runtime/test_scheduler.mojo"          # v0.4.0 Track 3 — multicore Scheduler lifecycle (~6 tests)
+test-balance         = "mojo -I . tests/runtime/test_balance.mojo"            # accept-time connection balancing across workers (~12 tests)
 test-server-multicore = "mojo -I . tests/http/test_server_multicore.mojo"  # v0.4.0 Track 3 — HttpServer multicore (~7 tests)
 test-extractors      = "mojo -I . tests/http/test_extractors.mojo"         # v0.4.1 Track 2 — Typed extractors + Extracted[H] (~42 tests)
 test-extractors-concrete = "mojo -I . tests/http/test_extractors_concrete.mojo"  # v0.5.0 Step 2 — concrete PathInt/PathStr/etc. (~30 tests)
@@ -569,7 +598,7 @@ test-request-factories = "mojo -I . tests/http/test_request_factories.mojo"     
 test-request-builder = "mojo -I . tests/http/test_request_builder.mojo"           # client RequestBuilder: per-request headers/query/body/content-type (7 cases)
 test-handler-extractor = "mojo -I . tests/http/test_handler_extractor.mojo"       # v0.7 — HandlerExtractor convenience trait composition (~4 tests)
 test-h1-trailers     = "mojo -I . tests/http/test_h1_trailers.mojo"               # v0.7 — HTTP/1.1 trailer fields: client decode + server emit + smuggling guard (~8 tests)
-test-multi-listener  = "mojo -I . tests/http/test_multi_listener.mojo"            # v0.7 — HttpServer.bind_many: multi-listener accept demux + drain (~4 tests)
+test-multi-listener  = "mojo -I . tests/http/test_multi_listener.mojo"            # v0.7 — HttpServer.bind(List[SocketAddr]): multi-listener accept demux + drain (~4 tests)
 test-tls-resume      = "mojo -I . tests/tls/test_tls_resume.mojo"                # v0.7 — TLS session resumption (RFC 5077 / RFC 8446 §4.6.1) (~3 tests)
 test-h2c-client-upgrade = "mojo -I . tests/http/test_h2c_client_upgrade.mojo"     # v0.7 — h2c-via-Upgrade client (RFC 7540 §3.2) round-trip + body + back-to-back (~3 tests)
 test-h2c-client-double-body = "mojo -I . tests/http/test_h2c_client_double_body.mojo"  # v0.7.1 — regression: h2c-Upgrade client must not double-count single-recv-blob response bodies (Span lifetime)
@@ -623,10 +652,14 @@ test-uring-serve-static = "mojo -I . tests/http/test_uring_serve_static.mojo"   
 test-uring-serve-handler = "mojo -I . tests/http/test_uring_serve_handler.mojo"   # End-to-end HttpServer.serve(handler) through run_uring_bufring_reactor_loop; forks a child server, drives sequential keep-alive churn (8 conns x 50 reqs = 400 round-trips) + concurrent fan-out (8 parallel x 30 reqs); validates the buffer-ring substrate + cancel-before-free contract; 2 tests, no-op skip on non-io_uring hosts / FLARE_DISABLE_IO_URING=1. Back in the `tests` aggregate: the prior "Linux 6.8 disarms IORING_RECV_MULTISHOT after ~240 round-trips" note was a misdiagnosis. Root cause was an IoUringDriver mmap-sizing bug -- the SQE/CQE arrays were sized from the sq_off/cq_off ring_entries OFFSET (24) instead of the entry COUNT (4096), so the SQE mmap was one page (64 slots); once cumulative multishot re-arms pushed the SQ tail past idx 64, next_sqe handed out a slot in the next, unmapped page and the SQE write faulted. Fixed by sizing both mmaps from the authoritative params.sq_entries/cq_entries.
 test-uring-serve-handler-load = "mojo -I . tests/http/test_uring_serve_handler_load.mojo"  # io_uring buffer-ring handler-path sustained-load floor test. 8 sequential conns × 10 keep-alive reqs = 80 round-trips with a real bufring server in a fork(); asserts all 80 succeed. Floor-level regression guard against a "totally broken bufring" failure mode. 1 test, no-op skip on non-io_uring hosts.
 test-uring-bufring-dispatch = "mojo -I . tests/runtime/test_uring_bufring_dispatch.mojo"  # v0.7.1 — regression: bufring dispatch must stage kernel-pool bytes into read_buf BEFORE the handler runs (destructor reorder + Span origin tightening)
-test-static-multicore   = "mojo -I . tests/http/test_static_multicore.mojo"       # End-to-end HttpServer.serve_static_multicore through StaticScheduler + run_reactor_loop_static_shared; forks a child server with 4 workers, drives 8x50 sequential keep-alive churn + 8x30 concurrent fan-out; validates the multi-worker static fast path. 2 tests, cross-platform (no io_uring dependency).
-test-safety-asserts  = "mojo -I . tests/runtime/test_safety_asserts.mojo"             # v0.7 — bounds-check + debug_assert[assert_mode="safe"] guards on FFI substrate (run under -D ASSERT=all to exercise; see .cursor/rules/sanitizers-and-bounds-checking.mdc, ~14 tests)
+test-idle-timer-reap = "mojo -I . tests/http/test_idle_timer_reap.mojo"  # deferred idle-timer reaping - a connection whose timer fired is reaped only if nothing re-armed, cleared or replaced it while the poll's events were handled (fd reuse, cleared timer, closed conn)
+test-bufring-ledger = "mojo -I . tests/http/test_bufring_ledger.mojo"  # buffer-ring receive kernel: every completion that took a provided buffer returns it exactly once (Lean: formal/Flare/Kernels/BufLedger.lean)
+test-uring-bufring-buffers = "mojo -I . tests/http/test_uring_bufring_buffers.mojo"  # regression: buffer-ring loop returns the provided buffer of every recv CQE, including completions for connections already gone (two-write h2-opening churn, 20 x 64 conns over a 256-buffer pool); no-op skip on non-io_uring hosts
+test-uring-bufring-partial = "mojo -I . tests/http/test_uring_bufring_partial.mojo"  # regression: a request split across receive completions (split body, >8 KiB body, pipelined + split) is answered by the buffer-ring loop without stalling other connections, in sync-send and FLARE_SUBMIT_SEND=1 modes; no-op skip on non-io_uring hosts
+test-static-multicore   = "mojo -I . tests/http/test_static_multicore.mojo"       # End-to-end HttpServer.serve_static(resp, n) through StaticScheduler + run_reactor_loop_static_shared; forks a child server with 4 workers, drives 8x50 sequential keep-alive churn + 8x30 concurrent fan-out; validates the multi-worker static fast path. 2 tests, cross-platform (no io_uring dependency).
+test-safety-asserts  = "mojo -I . tests/runtime/test_safety_asserts.mojo"             # v0.7 — bounds-check + debug_assert[assert_mode="safe"] guards on FFI substrate (run under -D ASSERT=all to exercise; see .agent/rules/sanitizers-and-bounds-checking.mdc, ~14 tests)
 
-# ── Sanitizer + assertion harness (see .cursor/rules/sanitizers-and-bounds-checking.mdc) ──
+# ── Sanitizer + assertion harness (see .agent/rules/sanitizers-and-bounds-checking.mdc) ──
 # tests-asserts-all: run the full functional suite with -D ASSERT=all, so
 #                    every debug_assert (both assert_mode="safe" and the
 #                    default flavour) compiles in. Catches O(n) invariants
@@ -739,7 +772,7 @@ example-http2-config    = "mojo -I . examples/advanced/http2_config.mojo"     # 
 example-uds-sidecar     = "mojo -I . examples/advanced/uds_sidecar.mojo"      # UnixListener + UnixStream
 example-streaming-proxy = "mojo -I . examples/advanced/streaming_proxy.mojo"  # v0.9 — StreamHandler + UpstreamChunkSource + backpressure
 example-openai-sse-front = "mojo -I . examples/advanced/openai_sse_front.mojo"  # OpenAI-shaped SSE front over a token backend + backpressure
-example-https           = "mojo -I . examples/advanced/https_server.mojo"     # HTTPS server: bind_tls / serve_tls + chunked streaming over SSL_write
+example-https           = "mojo -I . examples/advanced/https_server.mojo"     # HTTPS server: bind_tls / serve + chunked streaming over SSL_write
 
 # Every example, once. Generated from the example-* tasks and kept in
 # step by tests/tools/check_example_tasks.py -- this was a hand-written
@@ -817,6 +850,7 @@ examples = { depends-on = [
     "example-work-stealing",
     "example-ws",
     "example-ws-over-h2",
+    "example-ws-over-h3",
     "example-ws-permessage-deflate",
     "example-ws-server",
 ] }
@@ -825,10 +859,11 @@ example-http2-server-router = "mojo -I . examples/advanced/http2_server_router.m
 example-ok-json-typed = "mojo -I . examples/intermediate/ok_json_typed.mojo"  # v0.7 — typed JSON request -> typed JSON response via ok_json_value
 example-infallible-handler = "mojo -I . examples/intermediate/infallible_handler.mojo"  # v0.7 — HandlerInfallible vs Handler
 example-trailers     = "mojo -I . examples/intermediate/trailers.mojo"          # v0.7 — HTTP/1.1 trailer fields (gRPC-shaped status trailer demo)
-example-multi-listener = "mojo -I . examples/intermediate/multi_listener.mojo" # v0.7 — HttpServer.bind_many: one process, three loopback ports
+example-multi-listener = "mojo -I . examples/intermediate/multi_listener.mojo" # v0.7 — HttpServer.bind(List[SocketAddr]): one process, three loopback ports
 example-h2c-client   = "mojo -I . examples/advanced/h2c_client.mojo"         # v0.7 — HTTP/2 cleartext via Upgrade (RFC 7540 §3.2) client
 example-client-pool  = "mojo -I . examples/advanced/client_pool.mojo"        # v0.7 — HttpClient.with_pool() keep-alive idle-reuse demo
 example-ws-over-h2   = "mojo -I . examples/advanced/ws_over_h2.mojo"         # v0.7 — RFC 8441 Extended CONNECT + WS-over-HTTP/2 stream <-> frame adapter
+example-ws-over-h3   = "mojo -I . examples/advanced/ws_over_h3.mojo"         # RFC 9220 WebSocket over HTTP/3, live server + client
 example-ws-permessage-deflate = "mojo -I . examples/advanced/ws_permessage_deflate.mojo"  # v0.7 — RFC 7692 permessage-deflate codec + offer/negotiate demo
 example-production-setup = "mojo -I . examples/advanced/production_setup.mojo"          # production-shaped server: RequestId + StructuredLogger + CatchPanic + /healthz
 example-template-inheritance = "mojo -I . examples/intermediate/template_inheritance.mojo"  # v0.8 Track J — {% block %} / {% extends %} demo

@@ -47,9 +47,11 @@ def load_stop_flag(addr: Int) -> Bool:
 
 
 # ── Per-worker stats cell (D6 drain accounting + D9 crash visibility) ─────────
-# Each worker owns a heap cell of two ``Int64`` slots the worker writes
+# Each worker owns a heap cell of ``Int64`` slots the worker writes
 # and the scheduler (main thread) reads. Slot 0 is the live-connection
-# snapshot (updated each reactor iteration); slot 1 is the exit status.
+# snapshot (updated each reactor iteration); slot 1 is the exit status;
+# slots 3-4 are written once by the scheduler and name the worker's place
+# in the accept-balancing group.
 # Release-store / acquire-load makes the worker's writes visible to the
 # scheduler after it joins the worker. A ``base_addr`` of 0 disables the
 # writes (single-worker / non-scheduler paths pay nothing).
@@ -58,7 +60,16 @@ comptime WORKER_STAT_INFLIGHT: Int = 0
 """Slot index: connections still registered on this worker."""
 comptime WORKER_STAT_STATUS: Int = 1
 """Slot index: worker exit status (see ``WORKER_STATUS_*``)."""
-comptime WORKER_STAT_SLOTS: Int = 2
+comptime WORKER_STAT_DONE: Int = 2
+"""Slot index: 1 once the worker's thread has returned from
+``run_worker``, whatever the frontend reported. ``Scheduler.drain``
+waits on it with a deadline instead of blocking in ``pthread_join``."""
+comptime WORKER_STAT_GROUP: Int = 3
+"""Slot index: address of the scheduler's accept-balancing group block
+(``flare.runtime._balance``), or 0 when balancing is off."""
+comptime WORKER_STAT_INDEX: Int = 4
+"""Slot index: this worker's index inside the balancing group."""
+comptime WORKER_STAT_SLOTS: Int = 5
 """Number of Int64 slots per worker cell."""
 
 comptime WORKER_STATUS_RUNNING: Int = 0

@@ -18,10 +18,10 @@ alongside the QUIC server.
 | Protocols | TLS 1.2 + 1.3. TLS 1.0 / 1.1 explicitly refused. |
 | Cipher policy | Forward-secret AEAD whitelist. RC4 / 3DES / CBC chains absent from the negotiated set. |
 | ALPN | Advertised on both sides; refusal-to-downgrade enforced. |
-| Cert reload | ``TlsAcceptor.reload()`` atomic swap (no in-flight drop). |
-| Session resumption | RFC 5077 tickets + RFC 8446 §4.6.1 ``NewSessionTicket`` capture/replay. Server-side opt-in via ``TlsServerConfig.enable_session_tickets``; client-side opt-in via ``TlsConfig.enable_session_resumption``. |
+| Cert reload | ``TlsAcceptor.reload()`` atomic swap (no in-flight drop; a failed reload keeps the old cert). Also rotates the session-ticket key. |
+| Session resumption | RFC 5077 tickets + RFC 8446 §4.6.1 ``NewSessionTicket`` capture/replay. Server-side opt-in via ``TlsServerConfig.enable_session_tickets`` (default ``False``; off sends no tickets and keeps no session cache); client-side opt-in via ``TlsConfig.enable_session_resumption``. |
 | mTLS | Construction-time CA chain validation; ``TlsAcceptor.with_client_cert_verification`` enforces presence + chain. |
-| HTTPS server termination | In-process, non-blocking, reactor-multiplexed. ``HttpServer.bind_tls`` / ``serve_tls`` terminate TLS on a ``TlsConnHandle`` and serve HTTP/1.1 or HTTP/2 by ALPN (buffered + chunked-streaming) over ``SSL_read`` / ``SSL_write``. See below. |
+| HTTPS server termination | In-process, non-blocking, reactor-multiplexed. ``HttpServer.bind_tls`` + ``serve`` terminate TLS on a ``TlsConnHandle`` and serve HTTP/1.1 or HTTP/2 by ALPN (buffered + chunked-streaming) over ``SSL_read`` / ``SSL_write``. See below. |
 | OCSP stapling | Not in-tree. Most production deployments terminate TLS at a proxy with stapling enabled. |
 | Encrypted ClientHello (ECH) | Not in-tree. The plan is to land it when OpenSSL stable carries it. |
 
@@ -47,11 +47,11 @@ var srv = HttpServer.bind_tls(
     key_file="server.key",
     alpn=["http/1.1"],
 )
-srv.serve_tls(router^)
+srv.serve(router^)
 ```
 
 ``bind_tls`` loads the PEM cert/key into a server ``SSL_CTX`` and
-advertises ALPN; ``serve_tls`` runs the accept loop, driving each
+advertises ALPN; ``serve`` runs the accept loop, driving each
 connection through the handshake and an HTTP/1.1 keep-alive loop that
 reuses the **exact** plaintext request-parse + response-serialise
 helpers -- only the byte transport differs. Streaming composes for
@@ -66,9 +66,9 @@ wire is an implementation detail). See
 Scope today: TLS is terminated on the unified reactor. Many TLS
 connections are in flight on one event loop, ``num_workers > 1``
 scales them across cores, and the negotiated ALPN selects HTTP/1.1 or
-HTTP/2 -- an ``h2`` connection is served, not closed. ``serve_tls`` is
-a named alias for ``serve`` on a TLS-bound server; there is one TLS
-code path.
+HTTP/2 -- an ``h2`` connection is served, not closed. ``serve_tls`` was a
+deprecated alias for ``serve`` on a TLS-bound server and was removed in
+v0.12; there is one TLS code path.
 
 ## Why OpenSSL + FFI rather than a Mojo-native stack
 

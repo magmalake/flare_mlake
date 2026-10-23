@@ -178,7 +178,7 @@ def _request_path(req: Request) -> String:
 
 
 def _alloc_store_or_zero[
-    S: CacheStore & Deinitable & Movable & Defaultable,
+    S: CacheStore & Deinitable,
 ]() -> Int:
     """Heap-allocate a fresh ``S`` and return its address, or 0
     on allocator failure. Defaultable middleware ``__init__``
@@ -227,8 +227,8 @@ struct Cache[
     ``ArcPointer`` upgrade can swap the leak for ref-counting.
 
     Parameters:
-        Inner: the inner handler.
-        S: the cache store; must satisfy the :class:`CacheStore`
+        Inner: The inner handler.
+        S: The cache store; must satisfy the :class:`CacheStore`
            trait.
 
     Example::
@@ -295,7 +295,7 @@ struct Cache[
             String("http"),
             _request_authority(req),
             _request_path(req),
-            pairs^,
+            pairs,
         )
 
     def _store_response(
@@ -329,7 +329,27 @@ struct Cache[
             return response^
         if _has_set_cookie(response.headers):
             return response^
+        # This store is shared by every client of the process, so the
+        # shared-cache rules of RFC 9111 apply. Before them, Alice's
+        # ``GET /me`` (Authorization, ``private, max-age=60``) was stored
+        # under ``GET host/me`` and served to Bob as a HIT.
+        if cc.private:
+            return response^
         var vary_value = _response_vary(response.headers)
+        # sec 3.5: a response to a request with Authorization is stored
+        # only when the response explicitly allows a shared cache to.
+        if req.headers.contains("authorization") and not (
+            cc.public or Bool(cc.s_maxage) or cc.must_revalidate
+        ):
+            return response^
+        # A Cookie-bearing request is personalised unless the response
+        # says otherwise: ``public``, or a ``Vary`` that keys on Cookie.
+        if (
+            req.headers.contains("cookie")
+            and not cc.public
+            and "cookie" not in vary_value.lower()
+        ):
+            return response^
         var headers_copy = List[Tuple[String, String]]()
         var names_to_keep = self._user_visible_header_names(response.headers)
         for i in range(len(names_to_keep)):
@@ -348,7 +368,7 @@ struct Cache[
                 vary=vary_value,
                 date_ms=Optional[Int64](),
             )
-            self._store_ptr()[].put(base_key, entry^)
+            self._store_ptr()[].put(base_key, entry)
         else:
             var marker = CacheEntry(
                 status=response.status,
@@ -359,7 +379,7 @@ struct Cache[
                 vary=vary_value,
                 date_ms=Optional[Int64](),
             )
-            self._store_ptr()[].put(base_key, marker^)
+            self._store_ptr()[].put(base_key, marker)
             var full_key = self._build_full_key(req, vary_value)
             var entry = CacheEntry(
                 status=response.status,
@@ -370,7 +390,7 @@ struct Cache[
                 vary=vary_value,
                 date_ms=Optional[Int64](),
             )
-            self._store_ptr()[].put(full_key, entry^)
+            self._store_ptr()[].put(full_key, entry)
         return response^
 
     def _user_visible_header_names(self, headers: HeaderMap) -> List[String]:

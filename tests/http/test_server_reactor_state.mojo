@@ -19,6 +19,8 @@ from flare.net import SocketAddr
 from flare.tcp import TcpStream, TcpListener
 from flare.http.request import Request
 from flare.http.response import Response
+from flare.http import ok, precompute_response, WsUpgrade
+from flare.http.handler import FnHandler
 from flare.http.server import ServerConfig
 from flare.http._server_reactor_impl import (
     ConnHandle,
@@ -27,6 +29,7 @@ from flare.http._server_reactor_impl import (
     STATE_WRITING,
     STATE_CLOSING,
 )
+from flare.ws import WsConnection
 from flare.runtime import (
     Reactor,
     Event,
@@ -497,6 +500,317 @@ def test_step_result_defaults() raises:
     assert_false(sr.want_write)
     assert_false(sr.done)
     assert_equal(sr.idle_timeout_ms, -1)
+
+
+def _wait_readable(mut ch: ConnHandle, mut r: Reactor) raises:
+    """Block (bounded) until the conn's fd is readable, via the Reactor."""
+    var fd = ch.fd()
+    r.register(fd, UInt64(1), INTEREST_READ)
+    var events = List[Event]()
+    var waited = 0
+    var got = False
+    while waited < 2000 and not got:
+        events.clear()
+        _ = r.poll(50, events)
+        for i in range(len(events)):
+            if events[i].token == UInt64(1) and events[i].is_readable():
+                got = True
+        waited += 50
+    r.unregister(fd)
+
+
+def test_static_head_queues_head_only() raises:
+    """APP-04: a HEAD request on the static fast path queues only the
+    pre-encoded head (up to the first CRLFCRLF), keeps the connection
+    alive, and GET still queues the whole pre-encoded response."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    var cfg = _default_config()
+    var resp = precompute_response(
+        status=200, content_type="text/plain", body="Hello, World!"
+    )
+    _ = client.write(
+        Span[UInt8](_bytes_of("HEAD / HTTP/1.1\r\nHost: a\r\n\r\n"))
+    )
+    _wait_readable(ch, r)
+    _ = ch.on_readable_static(resp, cfg)
+    assert_equal(ch.state, STATE_WRITING)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    var hdr_end = wire.find("\r\n\r\n")
+    assert_true(hdr_end >= 0)
+    assert_equal(len(ch.write_buf), hdr_end + 4)
+    assert_true("Connection: keep-alive" in wire)
+    assert_false(ch.should_close)
+
+    # The connection stays usable: a following GET gets head + body.
+    _ = ch.on_writable(cfg)
+    assert_equal(ch.state, STATE_READING)
+    _ = client.write(
+        Span[UInt8](_bytes_of("GET / HTTP/1.1\r\nHost: a\r\n\r\n"))
+    )
+    _wait_readable(ch, r)
+    _ = ch.on_readable_static(resp, cfg)
+    assert_equal(len(ch.write_buf), len(resp.keepalive_bytes))
+    client.close()
+
+
+def _ws_noop(mut c: WsConnection) raises -> None:
+    pass
+
+
+def test_ws_426_closes_connection() raises:
+    """APP-01: the 426 for a bad Sec-WebSocket-Version says
+    ``Connection: close`` and then actually closes: ``should_close`` is set,
+    the flush ends the connection, and a pipelined request behind it is
+    never served."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    var cfg = _default_config()
+    cfg.ws = WsUpgrade(_ws_noop)
+    var req = _bytes_of(
+        "GET /chat HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 8\r\n\r\n"
+        "GET /after HTTP/1.1\r\nHost: a\r\n\r\n"
+    )
+    _ = client.write(Span[UInt8](req))
+    _ = _drive_readable(ch, r, _echo_handler, cfg)
+    assert_equal(ch.state, STATE_WRITING)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_true(wire.startswith("HTTP/1.1 426"))
+    assert_true("Connection: close" in wire)
+    assert_true("Sec-WebSocket-Version: 13" in wire)
+    # Only the 426 is queued: the pipelined GET is not dispatched.
+    assert_false("200 OK" in wire)
+    assert_true(ch.should_close)
+    var step = ch.on_writable(cfg)
+    assert_true(step.done)
+    assert_false(step.want_read)
+    client.close()
+
+
+def _url_handler(req: Request) raises -> Response:
+    return ok(req.url)
+
+
+def test_pipelined_requests_flush_together_in_order() raises:
+    """Whole requests buffered behind the first are served in the same pass
+    and their responses queued in order, so one flush answers them all. A
+    request carrying Upgrade ends the batch and waits for the flush."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    var cfg = _default_config()
+    var req = _bytes_of(
+        "GET /a HTTP/1.1\r\nHost: a\r\n\r\n"
+        "GET /b HTTP/1.1\r\nHost: a\r\n\r\n"
+        "GET /c HTTP/1.1\r\nHost: a\r\n\r\n"
+        "GET /d HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n\r\n"
+    )
+    _ = client.write(Span[UInt8](req))
+    _ = _drive_readable(ch, r, _url_handler, cfg)
+    assert_equal(ch.state, STATE_WRITING)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_equal(wire.count("HTTP/1.1 200"), 3)
+    var a = wire.find("\r\n\r\n/a")
+    var b = wire.find("\r\n\r\n/b")
+    var c = wire.find("\r\n\r\n/c")
+    assert_true(a >= 0 and a < b and b < c)
+    assert_false("/d" in wire)
+    client.close()
+
+
+# ── Error responses to HEAD carry no content (APP-05) ───────────────────────
+
+
+def _queued_error(
+    request: String,
+    handler: def(Request) raises thin -> Response,
+    cfg: ServerConfig,
+) raises -> String:
+    """Feed ``request`` to a fresh ConnHandle and return the bytes it queued."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    _ = client.write(Span[UInt8](_bytes_of(request)))
+    _ = _drive_readable(ch, r, handler, cfg)
+    assert_true(ch.should_close)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    client.close()
+    return wire^
+
+
+def _assert_head_only(wire: String, status: String) raises:
+    assert_true(status in wire)
+    var hdr_end = wire.find("\r\n\r\n")
+    assert_true(hdr_end >= 0)
+    assert_equal(len(wire.as_bytes()), hdr_end + 4)
+
+
+def test_handler_error_for_head_has_no_body() raises:
+    """APP-05: the 500 queued for a HEAD whose handler raised ends at the
+    header terminator; the same error for GET still has its body."""
+    var cfg = _default_config()
+    _assert_head_only(
+        _queued_error(
+            "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n", _raising_handler, cfg
+        ),
+        " 500 ",
+    )
+    var get_wire = _queued_error(
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n", _raising_handler, cfg
+    )
+    var hdr_end = get_wire.find("\r\n\r\n")
+    assert_true(len(get_wire.as_bytes()) > hdr_end + 4)
+
+
+def test_parse_errors_for_head_have_no_body() raises:
+    """APP-05: errors raised before the request is parsed (400, 413, 431)
+    also leave HEAD without content."""
+    var cfg = _default_config()
+    _assert_head_only(
+        _queued_error(
+            "HEAD / HTTP/1.1\r\nno colon here\r\n\r\n", _echo_handler, cfg
+        ),
+        " 400 ",
+    )
+    var cfg413 = _default_config()
+    cfg413.max_body_size = 10
+    _assert_head_only(
+        _queued_error(
+            "HEAD /x HTTP/1.1\r\nHost: h\r\nContent-Length: 1000\r\n\r\n",
+            _echo_handler,
+            cfg413,
+        ),
+        " 413 ",
+    )
+    var cfg431 = _default_config()
+    cfg431.max_header_size = 64
+    _assert_head_only(
+        _queued_error(
+            "HEAD / HTTP/1.1\r\nX: " + String("a") * 200,
+            _echo_handler,
+            cfg431,
+        ),
+        " 431 ",
+    )
+    # Control: the same 413 for a POST keeps its body.
+    var post = _queued_error(
+        "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 1000\r\n\r\n",
+        _echo_handler,
+        cfg413,
+    )
+    assert_true(len(post.as_bytes()) > post.find("\r\n\r\n") + 4)
+
+
+def test_error_after_head_on_keepalive_conn_keeps_body() raises:
+    """APP-05: a HEAD served earlier on the connection must not make a later
+    GET's error response bodyless."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    var cfg = _default_config()
+    _ = client.write(
+        Span[UInt8](_bytes_of("HEAD / HTTP/1.1\r\nHost: x\r\n\r\n"))
+    )
+    _ = _drive_readable(ch, r, _echo_handler, cfg)
+    _ = ch.on_writable(cfg)
+    assert_equal(ch.state, STATE_READING)
+    _ = client.write(
+        Span[UInt8](_bytes_of("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+    )
+    _ = _drive_readable(ch, r, _raising_handler, cfg)
+    assert_true(ch.should_close)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_true(len(wire.as_bytes()) > wire.find("\r\n\r\n") + 4)
+    client.close()
+
+
+# ── Read-buffer cap with an unlimited body cap (APP-06) ──────────────────────
+
+
+def test_unlimited_body_cap_serves_request() raises:
+    """APP-06: ``max_header_size + max_body_size`` used to wrap for
+    ``max_body_size = Int.MAX`` and every request got 413."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    var cfg = _default_config()
+    cfg.max_body_size = Int.MAX
+    _ = client.write(
+        Span[UInt8](_bytes_of("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+    )
+    _ = _drive_readable(ch, r, _echo_handler, cfg)
+    assert_equal(ch.state, STATE_WRITING)
+    assert_false(ch.should_close)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_true(" 200 " in wire)
+    assert_false(" 413 " in wire)
+    client.close()
+
+
+def test_unlimited_body_cap_bufring_path() raises:
+    """APP-06: the io_uring buffer-ring ingest path has the same cap."""
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    var cfg = _default_config()
+    cfg.max_body_size = Int.MAX
+    var h = FnHandler(_echo_handler)
+    var req = _bytes_of("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    _ = ch.on_readable_from_buf(Span[UInt8](req), h, cfg)
+    assert_equal(ch.state, STATE_WRITING)
+    assert_false(ch.should_close)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_true(" 200 " in wire)
+    client.close()
+
+
+def test_body_cap_still_rejects_oversized_input() raises:
+    """APP-06: the subtraction form keeps rejecting a buffer larger than
+    ``max_header_size + max_body_size`` (here 64 + 64 = 128 bytes)."""
+    var cfg = _default_config()
+    cfg.max_header_size = 64
+    cfg.max_body_size = 64
+    var big = String("POST / HTTP/1.1\r\nHost: x\r\nX: ") + String("a") * 200
+    var wire = _queued_error(big, _echo_handler, cfg)
+    assert_true(" 413 " in wire)
 
 
 def test_response_includes_date_header_from_cache() raises:

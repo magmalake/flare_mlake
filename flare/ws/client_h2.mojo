@@ -34,6 +34,8 @@ Public surface:
 from std.testing import assert_true
 
 from .frame import (
+    DEFAULT_MAX_FRAME_BYTES,
+    WS_TOO_BIG_MARKER,
     WsFrame,
     WsOpcode,
     WsCloseCode,
@@ -128,14 +130,13 @@ struct WsOverH2Stream(Movable):
     var read_buffer: List[UInt8]
     """Accumulated, undecoded receive bytes from
     :attr:`Stream.data`. Refilled on every :meth:`pull_frames`."""
-    var mask_counter: UInt32
-    """Monotonic counter used to derive a 4-byte masking key per
-    outbound frame; sufficient when TLS already protects the
-    wire. A future iteration will swap this for a CSPRNG-derived
-    key."""
     var closed: Bool
     """Set to ``True`` after a CLOSE frame is sent or received.
     Subsequent send/recv attempts raise."""
+    var max_frame_size: Int
+    """Largest frame payload :meth:`try_pull_frame` accepts. A frame that
+    declares more is answered with CLOSE 1009 (MESSAGE_TOO_BIG) and the
+    pull raises. Defaults to :data:`DEFAULT_MAX_FRAME_BYTES`."""
 
     def __init__(out self, stream_id: Int):
         """Create an adapter bound to ``stream_id``.
@@ -147,8 +148,8 @@ struct WsOverH2Stream(Movable):
         """
         self.stream_id = stream_id
         self.read_buffer = List[UInt8]()
-        self.mask_counter = 1
         self.closed = False
+        self.max_frame_size = DEFAULT_MAX_FRAME_BYTES
 
     # ── Send path ────────────────────────────────────────────────
 
@@ -159,8 +160,10 @@ struct WsOverH2Stream(Movable):
         stream.
 
         Per RFC 6455 §5.3 we mask the payload (mandatory on the
-        client side); the masking key is a 32-bit counter rotated
-        on every send. The ``end_stream`` flag is set IFF the
+        client side) with a fresh key from the OS CSPRNG. It was a
+        32-bit counter, which the RFC rules out: the key must be
+        unpredictable to whoever controls the payload, or masking does
+        not stop intermediary cache poisoning. The ``end_stream`` flag is set IFF the
         frame is a CLOSE frame, which mirrors RFC 8441 §5.5
         ("close handshake completion translates to half-close").
 
@@ -170,12 +173,10 @@ struct WsOverH2Stream(Movable):
         """
         if self.closed:
             raise Error("WsOverH2Stream: send on closed stream")
-        var k0 = UInt8((self.mask_counter >> 24) & 0xFF)
-        var k1 = UInt8((self.mask_counter >> 16) & 0xFF)
-        var k2 = UInt8((self.mask_counter >> 8) & 0xFF)
-        var k3 = UInt8(self.mask_counter & 0xFF)
-        self.mask_counter += 1
-        var key = SIMD[DType.uint8, 4](k0, k1, k2, k3)
+        from flare.crypto.random import random_bytes
+
+        var r = random_bytes(4)
+        var key = SIMD[DType.uint8, 4](r[0], r[1], r[2], r[3])
         var wire = frame.encode_with_key(True, key)
         var end = frame.opcode == WsOpcode.CLOSE
         conn.send_data(self.stream_id, Span[UInt8, _](wire), end)
@@ -225,13 +226,18 @@ struct WsOverH2Stream(Movable):
         var slice = Span[UInt8, _](self.read_buffer)
         var dr: _DecodeResult
         try:
-            dr = WsFrame.decode_one(slice)
+            dr = WsFrame.decode_one(slice, max_payload=self.max_frame_size)
         except e:
             # Distinguish "short read" (need more bytes -- bail and
             # wait) from "protocol violation" (re-raise).
             var msg = String(e)
             if msg.find("decode_one: need") >= 0 or msg.find("truncated") >= 0:
                 return None
+            if WS_TOO_BIG_MARKER in msg:
+                try:
+                    self.close(conn, WsCloseCode.MESSAGE_TOO_BIG)
+                except:
+                    self.closed = True
             raise e^
         var consumed = dr.consumed
         var got = dr^.take_frame()

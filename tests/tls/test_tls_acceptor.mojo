@@ -433,5 +433,92 @@ def test_slice_derived_missing_cert_still_raises() raises:
         _ = TlsAcceptor(cfg^)
 
 
+def _sigpipe_handler_word() raises -> Int:
+    """First word of ``struct sigaction`` for SIGPIPE: the handler, on
+    both Linux and macOS. ``SIG_DFL`` is 0, ``SIG_IGN`` is 1."""
+    from std.ffi import c_int, external_call
+    from std.memory import stack_allocation
+
+    var buf = stack_allocation[256, UInt8]()
+    for i in range(256):
+        buf.unsafe_offset(i).unsafe_write(UInt8(0))
+    var null_addr = 0
+    var none = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=null_addr)
+    if external_call["sigaction", c_int](c_int(13), none, buf) != c_int(0):
+        raise Error("sigaction failed")
+    return Int(buf.unsafe_bitcast[Int64]()[])
+
+
+def test_tls_setup_stops_sigpipe_from_killing_the_process() raises:
+    """OpenSSL's socket BIO writes without MSG_NOSIGNAL, so writing to a
+    peer that had gone raised SIGPIPE, whose default action ends the
+    process. Setting up TLS now ignores SIGPIPE when nobody has claimed
+    it; the write fails with EPIPE instead."""
+    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
+    _ = TlsAcceptor(cfg^)
+    assert_equal(_sigpipe_handler_word(), 1)
+
+
+def test_failed_reload_keeps_the_serving_pair() raises:
+    """Reload installed the chain and the key on the live context before
+    checking them. A key that did not match failed the reload, but the
+    context was left with the new key and no usable certificate."""
+    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
+    var acc = TlsAcceptor(cfg^)
+    assert_true(acc._ctx.key_matches())
+    var raised = False
+    try:
+        acc._ctx.reload(_CERT, "tests/tls/fixtures/rustls-quic-cert/key.pem")
+    except:
+        raised = True
+    assert_true(raised, "a mismatched key reloaded")
+    assert_true(acc._ctx.key_matches(), "failed reload broke the context")
+    acc.reload()  # the good pair still reloads
+    assert_true(acc._ctx.key_matches())
+
+
+def _sni_seen_for(connect_host: String) raises -> String:
+    """Handshake a forked client that dials ``connect_host`` and return
+    the SNI this side received."""
+    from flare.tls import TlsConfig, TlsStream
+    from flare.tls._server_ffi import server_ssl_free
+
+    var lis = TcpListener.bind(SocketAddr.localhost(0))
+    var port = lis.local_addr().port
+    var pid = fork()
+    if pid == 0:
+        try:
+            var c = TlsStream.connect(connect_host, port, TlsConfig.insecure())
+            c.close()
+        except:
+            pass
+        exit()
+    var stream = lis.accept()
+    var cfg = TlsServerConfig(
+        cert_file="tests/certs/server.crt", key_file="tests/certs/server.key"
+    )
+    var acc = TlsAcceptor(cfg^)
+    var sni = String("?")
+    try:
+        var r = acc.handshake_fd(Int(stream._socket.fd))
+        sni = r[1].sni_host.copy()
+        server_ssl_free(acc._ctx, r[0])
+    except:
+        pass
+    # Held to here: the fd is only borrowed by the handshake, and the
+    # stream would otherwise close it straight after its last use.
+    _ = stream^
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+    return sni^
+
+
+def test_client_sends_no_sni_for_an_ip_literal() raises:
+    """RFC 6066 sec 3: a literal IP address is not permitted in SNI. The
+    client sent one whenever it dialled an IP."""
+    assert_equal(_sni_seen_for("localhost"), "localhost")
+    assert_equal(_sni_seen_for("127.0.0.1"), "")
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

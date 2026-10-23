@@ -2,8 +2,7 @@
 
 The :class:`ServerConfig` value type (read/buffer sizing, timeouts,
 keep-alive policy, leniency + bufring toggles) plus the startup
-``FLARE_BUFRING_HANDLER`` env read and the comptime default used by
-``HttpServer.serve_comptime``. Extracted from ``flare.http.server`` to
+``FLARE_BUFRING_HANDLER`` env read. Extracted from ``flare.http.server`` to
 keep the reactor module within the file-size budget;
 ``flare.http.server`` re-exports every name so existing
 ``from flare.http.server import ServerConfig`` call sites keep
@@ -21,12 +20,17 @@ from ..proto.h2_config import Http2Config
 # No import cycle: ``flare.ws.server`` reaches into ``flare.http`` only
 # for ``flare.http.response`` (a leaf) -- never for the server or this
 # package.
-from ...ws.server import WsConnection
+from ...ws.server import DEFAULT_MAX_OFFLOADED_WS, WsConnection
+from ...ws.server_reactor import (
+    WsReactorHandler,
+    WsReactorHooks,
+    make_ws_reactor_hooks,
+)
 
 comptime WsHandlerFn = def(mut WsConnection) raises thin -> None
 """The opt-in WebSocket handler signature. Identical to
 ``WsServer.serve``'s callback, so a handler written for a standalone
-``WsServer`` plugs into ``HttpServer.serve_ws_upgrade`` unchanged."""
+``WsServer`` plugs into ``ServerConfig.ws = WsUpgrade(...)`` unchanged."""
 
 
 @fieldwise_init
@@ -50,20 +54,66 @@ struct WsUpgrade(Copyable, Defaultable):
     var offload: Bool
     """Run each upgraded socket on its own detached thread."""
 
+    var max_offloaded: Int
+    """Detached threads the process runs at once. An upgrade past it is
+    answered 503, so clients cannot open threads without bound."""
+
+    var reactor: Optional[WsReactorHooks]
+    """Event-driven handler run on the reactor, set by :meth:`on_reactor`.
+    Takes precedence over ``handler``."""
+
     def __init__(out self):
         """No WebSocket handling."""
         self.handler = None
         self.offload = False
+        self.max_offloaded = DEFAULT_MAX_OFFLOADED_WS
+        self.reactor = None
 
-    def __init__(out self, handler: WsHandlerFn, offload: Bool = False):
+    @staticmethod
+    def on_reactor[
+        W: WsReactorHandler
+    ](
+        var handler: W,
+        max_message: Int = 16 * 1024 * 1024,
+        max_outbox: Int = 4 * 1024 * 1024,
+        idle_timeout_ms: Int = 60_000,
+    ) raises -> WsUpgrade:
+        """Handle upgrades with an event-driven ``handler`` on the reactor
+        worker: no thread per connection, the RFC 6455 rules enforced for
+        the handler, a client that stops reading closed with 1008 once
+        ``max_outbox`` bytes wait for it, and a connection idle for
+        ``idle_timeout_ms`` dropped.
+
+        Each connection gets its own copy of ``handler``.
+        """
+        var out = WsUpgrade()
+        out.reactor = make_ws_reactor_hooks(
+            handler^, max_message, max_outbox, idle_timeout_ms
+        )
+        return out^
+
+    def __init__(
+        out self,
+        handler: WsHandlerFn,
+        offload: Bool = True,
+        max_offloaded: Int = DEFAULT_MAX_OFFLOADED_WS,
+    ):
         """Handle WebSocket upgrades with ``handler``.
 
         Args:
             handler: Called once per upgraded connection.
-            offload: Give each socket its own detached thread.
+            offload: Give each socket its own detached thread (the
+                default since v0.11). With ``False`` the handler runs on
+                the reactor thread for the socket's whole lifetime, so
+                one WebSocket client stalls every other connection on
+                that worker.
+            max_offloaded: Detached threads the process runs at once;
+                an upgrade past it gets 503.
         """
         self.handler = Optional[WsHandlerFn](handler)
         self.offload = offload
+        self.max_offloaded = max_offloaded
+        self.reactor = None
 
 
 struct ServerConfig(Copyable):
@@ -75,9 +125,10 @@ struct ServerConfig(Copyable):
         max_body_size: Maximum bytes for the request body (default 10MB).
         max_uri_length: Maximum bytes for the request URI (default 8192).
         keep_alive: Enable HTTP/1.1 keep-alive (default True).
-        max_keepalive_requests: Max requests per connection before forcing close (default 100).
+        max_keepalive_requests: Max requests per connection before forcing close (default 1000).
         idle_timeout_ms: Max ms a connection may stay idle before the
-            reactor closes it (default 500). 0 disables.
+            reactor closes it (default 500), including a connection
+            that has not sent its first byte yet. 0 disables.
         write_timeout_ms: Max ms allowed for a partial write to complete
             (default 5000). 0 disables.
         shutdown_timeout_ms: Max ms graceful shutdown waits for in-flight
@@ -92,19 +143,21 @@ struct ServerConfig(Copyable):
             last body byte (default 30_000). 0 disables. Guards the
             slow-body-upload variant of the slow-client DoS surface.
             Mirrors nginx's ``client_body_timeout``.
-        handler_timeout_ms: Max ms ``Handler.serve`` (or
-            ``CancelHandler.serve``) is allowed to run before the
-            reactor flips ``Cancel.TIMEOUT`` (default 30_000). 0
-            disables. Cooperative — the handler observes the flip on
-            its next ``cancel.cancelled()`` poll. Guards the
-            handler-watchdog variant of the slow-client DoS surface.
-        request_timeout_ms: Max ms wall-time from request line in to
-            response bytes out (default 60_000). 0 disables. The
-            reactor enforces this as the outermost deadline; the
-            other two cooperate via ``Cancel``. Must be >=
-            ``handler_timeout_ms`` and >=
-            ``read_body_timeout_ms`` (checked at compile time in
-            ``serve_comptime``).
+        handler_timeout_ms: Intended cap on ``Handler.serve`` (or
+            ``CancelHandler.serve``) wall time (default 30_000). **Not
+            enforced yet**: handlers run synchronously on the worker
+            thread and nothing flips ``Cancel.TIMEOUT`` while one is
+            running. Kept so configs that set it stay valid, and still
+            checked against ``request_timeout_ms`` by
+            ``ServerConfig.check``.
+        request_timeout_ms: Max ms to read one whole request, head and
+            body, from its first byte (default 60_000); the reactor
+            answers 408 and closes when it runs out. 0 disables. It
+            bounds the peer that trickles bytes just inside
+            ``idle_timeout_ms``, which re-arms on every read. It does
+            not interrupt a running handler. Must be >=
+            ``handler_timeout_ms`` and >= ``read_body_timeout_ms``
+            (checked at compile time by ``ServerConfig.check``).
         use_bufring: Opt into the io_uring buffer-ring single-worker
             reactor (HTTP/1.1-only, single-listener-only) on Linux
             ``>= 6.0``. When ``False`` (default), every entry point
@@ -148,6 +201,12 @@ struct ServerConfig(Copyable):
     ignore headers (TFB plaintext, fixed health-checks,
     low-latency micro-services).
 
+    The fast path also skips header *validation*: field names, field
+    values and the request target are not checked, and
+    ``h1_leniency`` has no effect. Framing (``Content-Length`` and
+    ``Transfer-Encoding``) is still decided strictly. Do not enable
+    it behind a proxy that forwards whatever it is sent.
+
     Default ``False`` -- the standard full-parse behaviour.
     Set ``True`` on production servers whose handler shape
     doesn't depend on headers."""
@@ -161,7 +220,7 @@ struct ServerConfig(Copyable):
     a mid-flight env-var flip cannot reroute live connections.
     Linux-only, HTTP/1.1-only, single-listener-only -- the
     field is silently ignored on macOS / for HTTP/2 / for
-    ``HttpServer.bind_many``."""
+    a multi-address ``HttpServer.bind(List[SocketAddr])``."""
     var h1_leniency: H1LeniencyConfig
     """HTTP/1.1 parser leniency configuration. Strict by default
     (every flag off); each named flag relaxes a specific RFC 9112
@@ -180,14 +239,13 @@ struct ServerConfig(Copyable):
     var ws: WsUpgrade
     """WebSocket-on-the-same-port configuration. Default: HTTP only.
 
-    Replaces the loose ``ws_handler`` / ``ws_offload`` fields in v0.11.
-    ``HttpServer.serve_ws_upgrade`` sets this for you."""
+    Replaced the loose ``ws_handler`` / ``ws_offload`` fields in v0.11."""
 
     var h2: Http2Config
     """HTTP/2 SETTINGS and per-stream limits, applied when a connection
     negotiates h2 by ALPN or upgrades via h2c.
 
-    Replaces the ``h2_config`` argument that every ``bind*`` used to
+    Replaced the ``h2_config`` argument that every ``bind*`` used to
     take separately in v0.11."""
 
     def __init__(
@@ -197,7 +255,7 @@ struct ServerConfig(Copyable):
         max_body_size: Int = 10 * 1024 * 1024,
         max_uri_length: Int = 8192,
         keep_alive: Bool = True,
-        max_keepalive_requests: Int = 100,
+        max_keepalive_requests: Int = 1000,
         idle_timeout_ms: Int = 500,
         write_timeout_ms: Int = 5000,
         shutdown_timeout_ms: Int = 5000,
@@ -246,10 +304,11 @@ struct ServerConfig(Copyable):
         ``read_body_timeout_ms``, or the handler could keep working past
         the request deadline -- the bug these checks exist to prevent.
 
-        Added in v0.11. These lived inside ``HttpServer.serve_comptime``,
+        Added in v0.11. These used to live inside the
+        ``HttpServer.serve_comptime`` entry point (removed in v0.12),
         which meant the only way to get them was to also accept that
         method's single-worker, single-listener, no-TLS reactor. They are
-        reusable now.
+        callable anywhere now.
 
         Parameters:
             cfg: The configuration to validate.
@@ -316,6 +375,28 @@ struct ServerConfig(Copyable):
         )
 
 
+def bufring_gap(cfg: ServerConfig) -> String:
+    """What ``cfg`` needs that the io_uring buffer-ring loop does not do,
+    or ``""`` when that loop can serve it.
+
+    The loop serves plain HTTP/1.1 and arms no timers and no connection
+    cap, so a config that relies on any of them is served by the reactor
+    loop instead: running it there would drop the limit silently.
+    """
+    if cfg.ws.handler or cfg.ws.reactor:
+        return "WebSocket upgrades"
+    if (
+        cfg.idle_timeout_ms > 0
+        or cfg.write_timeout_ms > 0
+        or cfg.read_body_timeout_ms > 0
+        or cfg.request_timeout_ms > 0
+    ):
+        return "timeouts"
+    if cfg.max_connections > 0:
+        return "max_connections"
+    return ""
+
+
 def _resolve_bufring_handler_env() -> Bool:
     """Read ``FLARE_BUFRING_HANDLER`` once at startup.
 
@@ -325,11 +406,3 @@ def _resolve_bufring_handler_env() -> Bool:
     a mid-flight ``setenv`` cannot reroute live connections.
     """
     return getenv("FLARE_BUFRING_HANDLER") == "1"
-
-
-# Comptime-friendly default config. Used as the default for
-# ``HttpServer.serve_comptime[handler, config = ...]()``. Any user who
-# wants a non-default comptime config must declare their own
-# ``comptime my_cfg: ServerConfig = ServerConfig(...)`` because Mojo
-# ``comptime assert`` checks need comptime-stable values.
-comptime _DEFAULT_SERVER_CONFIG: ServerConfig = ServerConfig()

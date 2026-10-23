@@ -8,10 +8,12 @@ value flows back) plus a new "runs on a different kernel thread"
 contract that the ``test_runs_on_different_thread`` test pins.
 """
 
-from std.ffi import external_call
+from std.ffi import external_call, c_int
+from std.memory import stack_allocation
 from std.sys.info import CompilationTarget
 from std.testing import (
     assert_equal,
+    assert_false,
     assert_true,
     assert_raises,
     TestSuite,
@@ -20,6 +22,7 @@ from std.testing import (
 from flare.runtime import block_in_pool, MAX_POOL_SIZE
 from flare.runtime.blocking import _pool_reset, _pool_try_acquire, _pool_release
 from flare.http import Cancel, CancelCell, CancelReason
+from flare.utils import exit, fork
 
 
 # ── Platform gate ──────────────────────────────────────────────────────────
@@ -274,6 +277,160 @@ def test_pool_cap_enforced_and_recovers() raises:
     # Restore the slots we still hold so later tests see a full pool.
     for _ in range(got):
         _pool_release()
+
+
+def test_pool_cap_is_exactly_max_pool_size() raises:
+    """RT-06: exactly ``MAX_POOL_SIZE`` slots can be held at once; the next
+    claim is refused. On macOS arm64 the variadic ``sem_open`` call used
+    to fail (garbage ``value`` argument) and the fail-open acquire then
+    admitted every claim, so the cap did not exist."""
+    _pool_reset()
+    var got = 0
+    for _ in range(MAX_POOL_SIZE):
+        if _pool_try_acquire():
+            got += 1
+    assert_equal(got, MAX_POOL_SIZE)
+    assert_false(
+        _pool_try_acquire(),
+        "the claim after MAX_POOL_SIZE slots must be refused",
+    )
+    for _ in range(got):
+        _pool_release()
+    # Fully released: the whole cap is available again, and not more.
+    var again = 0
+    for _ in range(MAX_POOL_SIZE + 1):
+        if _pool_try_acquire():
+            again += 1
+    assert_equal(again, MAX_POOL_SIZE)
+    for _ in range(again):
+        _pool_release()
+    _pool_reset()
+
+
+# ── sem_open failure: no crash (RT-08), fail closed (RT-07) ─────────────────
+#
+# Each case forks a child (the pool semaphore is named by pid, so the
+# child has its own), fills the child's fd table so the next ``sem_open``
+# fails with EMFILE, and reports through its exit status. The default
+# SIGSEGV action is restored first: the Mojo runtime's handler would
+# otherwise turn a fault into exit(1).
+
+comptime _SIGSEGV = 11
+comptime _CHILD_ACQUIRED = 11
+comptime _CHILD_REFUSED = 10
+comptime _CHILD_NO_FILL = 12
+comptime _CASE_ACQUIRE_FAILS = 0
+comptime _CASE_RELEASE_FAILS = 1
+comptime _CASE_DRIFT = 2
+
+
+def _rlimit_nofile() -> c_int:
+    comptime if CompilationTarget.is_macos():
+        return c_int(8)
+    else:
+        return c_int(7)
+
+
+def _fill_fd_table(mut dups: List[c_int]) -> Bool:
+    """Shrink RLIMIT_NOFILE and dup until the fd table is full, so the
+    next ``sem_open`` fails with EMFILE. The dups are collected so the
+    caller can free the table again."""
+    var rl = stack_allocation[2, UInt64]()
+    _ = external_call["getrlimit", c_int](_rlimit_nofile(), rl)
+    rl[unsafe_offset=0] = UInt64(128)
+    _ = external_call["setrlimit", c_int](_rlimit_nofile(), rl)
+    for _ in range(1000):
+        var d = external_call["dup", c_int](c_int(0))
+        if d < 0:
+            return True
+        dups.append(d)
+    return False
+
+
+def _free_fd_table(dups: List[c_int]):
+    for i in range(len(dups)):
+        _ = external_call["close", c_int](dups[i])
+
+
+def _drain_pool() -> Int:
+    """Acquire until refused (bounded), release everything, return how many
+    slots could be held at once."""
+    var held = 0
+    while held < MAX_POOL_SIZE + 8 and _pool_try_acquire():
+        held += 1
+    for _ in range(held):
+        _pool_release()
+    return held
+
+
+def _sem_failure_child(which: Int) -> Int:
+    _ = external_call["signal", Int](c_int(_SIGSEGV), Int(0))
+    _pool_reset()
+    var dups = List[c_int]()
+    if which == _CASE_RELEASE_FAILS:
+        if not _pool_try_acquire():
+            return _CHILD_REFUSED
+        if not _fill_fd_table(dups):
+            return _CHILD_NO_FILL
+        _pool_release()  # sem_open fails: must return, not sem_post(NULL)
+        return _CHILD_ACQUIRED
+    if not _fill_fd_table(dups):
+        return _CHILD_NO_FILL
+    var took = _pool_try_acquire()  # sem_open fails
+    if which == _CASE_ACQUIRE_FAILS:
+        return _CHILD_ACQUIRED if took else _CHILD_REFUSED
+    # _CASE_DRIFT: free the table, pair the acquire with a release if it
+    # claimed a slot, then count how many slots can really be held.
+    _free_fd_table(dups)
+    if took:
+        _pool_release()
+    var held = _drain_pool()
+    _pool_reset()
+    return held + (64 if took else 0)
+
+
+def _run_sem_failure_child(which: Int) raises -> Int:
+    """Fork, run ``_sem_failure_child`` and return the child's exit code;
+    raise if it was killed by a signal."""
+    var pid = fork()
+    assert_true(pid >= 0, "fork failed")
+    if pid == 0:
+        exit(_sem_failure_child(which))
+    var status = stack_allocation[1, c_int]()
+    status[unsafe_offset=0] = c_int(0)
+    _ = external_call["waitpid", c_int](c_int(pid), Int(status), c_int(0))
+    var sig = Int(status[unsafe_offset=0] & 0x7F)
+    assert_equal(
+        sig,
+        0,
+        "child killed by a signal (sem_open failure dereferenced SEM_FAILED?): "
+        + String(sig),
+    )
+    return Int((status[unsafe_offset=0] >> 8) & 0xFF)
+
+
+def test_acquire_survives_sem_open_failure() raises:
+    """RT-08: with the fd table full ``sem_open`` fails (EMFILE) and
+    returns ``SEM_FAILED`` -- NULL on glibc, -1 on Darwin. The acquire
+    must treat that as a failed open, not hand NULL to ``sem_trywait``
+    (SIGSEGV, which killed the whole server). RT-07: and it fails closed
+    (refuses the slot)."""
+    assert_equal(_run_sem_failure_child(_CASE_ACQUIRE_FAILS), _CHILD_REFUSED)
+
+
+def test_release_survives_sem_open_failure() raises:
+    """RT-08: ``_pool_release`` has the same ``SEM_FAILED`` test; with
+    ``sem_open`` failing it must return instead of ``sem_post(NULL)``."""
+    assert_equal(_run_sem_failure_child(_CASE_RELEASE_FAILS), _CHILD_ACQUIRED)
+
+
+def test_failed_sem_open_does_not_raise_the_cap() raises:
+    """RT-07: an acquire made while ``sem_open`` fails used to return True
+    without decrementing, while its paired release did post, leaving the
+    semaphore at 33 (cap raised for the rest of the process). The acquire
+    now fails closed, so exactly ``MAX_POOL_SIZE`` slots are available
+    afterwards and the faulty acquire did not claim one."""
+    assert_equal(_run_sem_failure_child(_CASE_DRIFT), MAX_POOL_SIZE)
 
 
 def main() raises:

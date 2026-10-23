@@ -69,6 +69,23 @@ def _router() raises -> ComptimeRouter[_BASE_ROUTES]:
 # ── Literal matches ─────────────────────────────────────────────────────────
 
 
+def _trailer(req: Request) raises -> Response:
+    return ok("trailer:" + req.trailers.get("x-sum"))
+
+
+comptime _TRAILER_ROUTES: List[ComptimeRoute] = [
+    ComptimeRoute(Method.POST, "/upload", _trailer),
+]
+
+
+def test_handler_sees_the_whole_request() raises:
+    """The matched handler gets the request as sent, trailers included."""
+    var r = ComptimeRouter[_TRAILER_ROUTES]()
+    var req = Request(method=Method.POST, url="/upload")
+    req.trailers.append("x-sum", "42")
+    assert_equal(r.serve(req).text(), "trailer:42")
+
+
 def test_literal_root() raises:
     var r = _router()
     var resp = r.serve(Request(method=Method.GET, url="/"))
@@ -205,6 +222,44 @@ def test_comptime_matches_runtime_route_shape() raises:
     var r = _router()
     var resp = r.serve(Request(method=Method.GET, url="/"))
     assert_equal(resp.text(), "home")
+
+
+# ── Non-final wildcard (APP-10) ─────────────────────────────────────────────
+
+
+def _meta(req: Request) raises -> Response:
+    return ok("meta:" + req.param("*"))
+
+
+comptime _BAD_WILDCARD_ROUTES: List[ComptimeRoute] = [
+    ComptimeRoute(Method.GET, "/files/*/meta", _meta),
+    ComptimeRoute(Method.GET, "/*/x", _meta),
+    ComptimeRoute(Method.GET, "/ok/*", _get_files),
+]
+
+
+def test_non_final_wildcard_matches_nothing() raises:
+    """APP-10: ``*`` is only valid as the last segment (the runtime
+    ``Router`` rejects such a pattern); the comptime router must not treat a
+    middle ``*`` as a tail wildcard."""
+    var r = ComptimeRouter[_BAD_WILDCARD_ROUTES]()
+    for url in [
+        "/files/a",
+        "/files/a/meta",
+        "/files/a/b/c",
+        "/a/x",
+        "/a/b",
+    ]:
+        var resp = r.serve(Request(method=Method.GET, url=String(url)))
+        assert_equal(resp.status, Status.NOT_FOUND)
+
+
+def test_final_wildcard_still_captures_rest() raises:
+    """APP-10: a table with an invalid route keeps routing its valid ones."""
+    var r = ComptimeRouter[_BAD_WILDCARD_ROUTES]()
+    var resp = r.serve(Request(method=Method.GET, url="/ok/a/b"))
+    assert_equal(resp.status, Status.OK)
+    assert_equal(resp.text(), "files=a/b")
 
 
 # ── Entry ──────────────────────────────────────────────────────────────────

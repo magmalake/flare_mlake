@@ -33,6 +33,7 @@ from ._reactor import (
 from ._server_reactor_epoll import (
     _poll_timeout_ms,
     _accept_errno_is_retry,
+    _arm_accept_timer,
     _conn_alloc_addr,
     _conn_free_addr,
     _conn_ptr_from_int,
@@ -40,7 +41,6 @@ from ._server_reactor_epoll import (
     _cleanup_conn,
     _accept_loop,
     _accept_loop_fd,
-    run_reactor_loop,
     run_reactor_loop_shared,
     run_reactor_loop_static,
     run_reactor_loop_static_shared,
@@ -52,5 +52,5 @@ from ._server_reactor_uring import (
     run_uring_reactor_loop_static,
     run_uring_bufring_reactor_loop,
     run_uring_bufring_reactor_loop_shared,
-    _probe_bufring_setup_flags,
 )
+from ._server_uring_setup import _probe_bufring_setup_flags

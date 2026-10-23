@@ -39,6 +39,7 @@ SANS_IO_FILES=(
     "flare/http/headers.mojo"
     "flare/http/header_view.mojo"
     "flare/http/header_phf.mojo"
+    "flare/ws/protocol.mojo"
     "flare/http/intern.mojo"
     "flare/http/simd_parsers.mojo"
     "flare/http/hpack_huffman.mojo"
@@ -52,12 +53,16 @@ SANS_IO_FILES=(
     "flare/quic/varint.mojo"
     "flare/quic/packet.mojo"
     "flare/quic/frame.mojo"
+    "flare/quic/_frame_types.mojo"
     "flare/quic/transport_params.mojo"
     "flare/quic/state.mojo"
+    "flare/quic/_state_types.mojo"
     "flare/http3/request_reader.mojo"
     "flare/http3/response_writer.mojo"
+    "flare/http3/capsule.mojo"
     "flare/qpack/static_table.mojo"
     "flare/qpack/codec.mojo"
+    "flare/http/_bufring_ledger.mojo"
 )
 
 # Forbidden import patterns. Each matches both ``from flare.<X>`` /

@@ -33,6 +33,15 @@ from test_udp import (
 from test_udp import (
     test_recv_timeout_raises as test_udp__test_recv_timeout_raises,
 )
+from test_udp import (
+    test_bind_ipv6_and_refuse_a_second_bind as test_udp__test_bind_ipv6_and_refuse_a_second_bind,
+)
+from test_udp import (
+    test_recv_from_reports_ipv6_sender as test_udp__test_recv_from_reports_ipv6_sender,
+)
+from test_udp import (
+    test_try_recv_from_reports_ipv6_sender as test_udp__test_try_recv_from_reports_ipv6_sender,
+)
 from test_udp_batch import (
     test_recvmmsg_batch_round_trip as test_udp_batch__test_recvmmsg_batch_round_trip,
 )
@@ -41,6 +50,21 @@ from test_udp_batch import (
 )
 from test_udp_batch import (
     test_gso_segmented_send as test_udp_batch__test_gso_segmented_send,
+)
+from test_udp_batch import (
+    test_send_batch_failure_frees_its_buffers_once as test_udp_batch__test_send_batch_failure_frees_its_buffers_once,
+)
+from test_udp_batch import (
+    test_batch_receiver_refuses_overflowing_data_region as test_udp_batch__test_batch_receiver_refuses_overflowing_data_region,
+)
+from test_udp_batch import (
+    test_batch_receiver_refuses_overflowing_header_arrays as test_udp_batch__test_batch_receiver_refuses_overflowing_header_arrays,
+)
+from test_udp_batch import (
+    test_batch_receiver_refuses_non_positive_arguments as test_udp_batch__test_batch_receiver_refuses_non_positive_arguments,
+)
+from test_udp_batch import (
+    test_batch_receiver_accepts_sane_arguments as test_udp_batch__test_batch_receiver_accepts_sane_arguments,
 )
 
 
@@ -57,8 +81,22 @@ def main() raises:
     suite.test[test_udp__test_datagram_too_large_raises]()
     suite.test[test_udp__test_datagram_large_payload]()
     suite.test[test_udp__test_recv_timeout_raises]()
+    suite.test[test_udp__test_bind_ipv6_and_refuse_a_second_bind]()
+    suite.test[test_udp__test_recv_from_reports_ipv6_sender]()
+    suite.test[test_udp__test_try_recv_from_reports_ipv6_sender]()
     # tests/udp/test_udp_batch.mojo
     suite.test[test_udp_batch__test_recvmmsg_batch_round_trip]()
     suite.test[test_udp_batch__test_sendmmsg_batch_round_trip]()
     suite.test[test_udp_batch__test_gso_segmented_send]()
+    suite.test[test_udp_batch__test_send_batch_failure_frees_its_buffers_once]()
+    suite.test[
+        test_udp_batch__test_batch_receiver_refuses_overflowing_data_region
+    ]()
+    suite.test[
+        test_udp_batch__test_batch_receiver_refuses_overflowing_header_arrays
+    ]()
+    suite.test[
+        test_udp_batch__test_batch_receiver_refuses_non_positive_arguments
+    ]()
+    suite.test[test_udp_batch__test_batch_receiver_accepts_sane_arguments]()
     suite^.run()

@@ -1151,10 +1151,12 @@ workload variants the assessment called for:
 
 - **HTTP/2 (h2c):** [`benchmark/scripts/bench_h2.sh`](../benchmark/scripts/bench_h2.sh)
   drives `h2load` over cleartext HTTP/2 against the flare unified server
-  and the nginx / Go / Rust baselines under
+  under
   [`benchmark/configs/h2_throughput.yaml`](../benchmark/configs/h2_throughput.yaml),
   mirroring `bench_h3.sh`. Run with `pixi run --environment bench bench-h2`
-  (or `bench-h2-flare` for the flare row only).
+  (or `bench-h2-flare` for the flare row only). It also launches the nginx /
+  Go / Rust baselines, but those serve HTTP/1.1 only and read `0 req/s` until
+  they enable h2c.
 - **TLS termination, uploads, downloads, mixed keep-alive:** the
   workload Lua scripts already live under `benchmark/scripts/`
   (`wrk_tls_handshake.lua`, `wrk_upload_{4kb,64kb,1mb,16mb}.lua`,
@@ -1875,3 +1877,206 @@ Functional parity is covered by the unchanged QUIC/H3 suites
 which stay green after these changes. Run `bench-vs-baseline` /
 `bench-h3*` on a quiet host to confirm throughput/tail parity with the
 headline numbers above before a release.
+
+## v0.11.0 Linux re-validation
+
+Re-run on the same EPYC 7R32 box with Mojo 1.1.0 (the tables above used
+1.0.0rc0). Single calibrated runs vary about `+/- 5 %`, so regressions were
+judged on paired, interleaved `wrk2 -R400000` runs.
+
+- **1 worker:** flare `73.7k`, nginx `77.1k`, Go `40.3k req/s`. nginx and Go
+  match their published numbers; flare is inside its historical `70-79k`
+  peak-finder range, and a paired run against a Mojo-1.0-era tree is equal.
+- **4 workers** (paired overdrive, req/s): `flare_mc_static` ~299k,
+  `flare_mc` ~266k, actix ~269k, hyper ~226k, axum ~203k.
+- **AsyncRT (`-D FLARE_ASYNCRT`, then opt-in)** equals pthreads within noise in
+  every case. AsyncRT is now the only engine; see the next section.
+- **Fixed in this cycle:** `serve_static(num_workers=N)` ran one worker
+  (58k to 268k req/s at 4 workers); a per-call dict in the QPACK encoder halved
+  h3 throughput (41.6k to 75k req/s).
+- **h3:** `74-76k req/s` with `--log-file` off. The harness passes
+  `--log-file`, which slows the h2load client: flare `61.9k`, quiche `73.2k`
+  with it on.
+
+## Xeon 8488C re-baseline (AsyncRT thread engine)
+
+Every suite re-run on a larger box after AsyncRT became flare's only thread
+engine (commit `20f20918`). The numbers are not comparable with the EPYC
+tables above; compare rows within a table.
+
+- **Host:** AWS Xeon Platinum 8488C, 48 vCPU (24 cores, 2 threads each), one
+  NUMA node, Linux 6.12.
+- **Toolchains:** Mojo 1.1.0, rustc 1.98.1, Go 1.24.13, nginx 1.25.3.
+- **Method:** the calibrated sustainable-peak harness from
+  [Methodology](#methodology): the highest rate whose p99 stays under 50 ms,
+  then five 30 s runs at that rate, reported as `median ± σ`. "Raw capacity"
+  is the harness's 15 s overdrive probe, which has no latency bound.
+
+### HTTP/1.1, 4 workers (`throughput_mc`: wrk2, 8 threads, 256 connections)
+
+One harness run for all five servers; flare workers pinned (the benchmark
+default, `FLARE_BENCH_PIN=1`). Absolute numbers move by about 5 % between
+runs on this shared box, so compare rows within one run.
+
+| Server | Workers | Req/s | σ% | p50 (ms) | p99 (ms) | p99.9 (ms) | p99.99 (ms) | Raw capacity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **flare_mc_static** | **4** | **705,569** | **0.20** | **1.07 ± 0.02** | **2.82 ± 0.06** | **3.40 ± 3.69** | **4.98 ± 6.26** | **903k** |
+| actix_web | 4 | 610,408 | 0.32 | 1.03 ± 0.01 | 2.78 ± 0.12 | 3.48 ± 6.86 | 4.66 ± 9.04 | 781k |
+| **flare_mc** (handler) | **4** | **607,940** | **0.20** | **1.06 ± 0.02** | **3.00 ± 0.11** | **6.30 ± 2.34** | **14.49 ± 7.69** | **737k** |
+| hyper | 4 | 556,619 | 0.20 | 1.05 ± 0.00 | 2.67 ± 1.85 | 3.20 ± 7.50 | 3.59 ± 8.70 | 569k |
+| axum | 4 | 489,422 | 0.32 | 1.08 ± 0.00 | 2.71 ± 0.01 | 3.23 ± 0.02 | 3.71 ± 1.14 | 512k |
+
+- The handler path reads `1.00x` actix in this run (`0.96x` in a second
+  run of the three on the same box); on raw capacity it is `0.94x`. It is
+  `+9 %` against hyper and `+24 %` against axum.
+- The static path reads `1.16x` actix (`1.08x` in the second run) and has
+  the most raw capacity of any server (`+16 %` over actix).
+- The handler path's p99.9 and p99.99 are the loosest of the five rows
+  (`6.30` and `14.49 ms`).
+
+### Handler path against actix_web: profile
+
+Why the sustainable peak and the raw capacity differ: the sustainable peak
+is the rate where p99 stops growing, which the busiest worker sets, so an
+uneven spread of connections costs far more than a few percent of
+per-request CPU.
+
+**Profile** (4 workers, fixed 400k req/s, 8 wrk2 threads, 256 connections;
+user-space `perf` `cpu-clock` sampling because the VM exposes no hardware
+counters, CPU per request from `/proc/<pid>/stat`, syscalls from `strace -c`):
+
+| Server | user µs/req | sys µs/req | total µs/req | `recv` per request |
+|---|---:|---:|---:|---:|
+| flare_mc_static | 0.61 | 4.17 | 4.78 | 1 |
+| actix_web | 1.43 | 4.03 | 5.47 | 1 |
+| flare_mc (handler) | 1.44 | 4.04 | 5.47 | 1 |
+
+The `sys` column is the kernel's TCP work and dominates every row. The
+handler path's user CPU is spread thin: request parse, response serialise,
+`HeaderMap::set`, `_wants_close`, `request_te_framing`, and the
+`Request`/`Response` lifecycle. There is no single hot spot, and closing the
+rest of the distance to the static path would take changes to those types
+rather than to the reactor.
+
+**Balance.** Per-worker `SO_REUSEPORT` listeners let the kernel hash each
+connection to a worker, which is random: left alone, the busiest of four
+workers takes `26-32 %` of the CPU where actix, whose single acceptor deals
+connections out round-robin, takes `25.0 %`. Accepted connections are
+therefore balanced across the workers of a scheduler
+(`flare/runtime/_balance.mojo`): a worker that is more than one connection
+ahead of the least-loaded peer hands the new stream to it through a small
+inbox and wakes it. Connection counts sit at `63-65` of 256 per worker.
+`FLARE_BALANCE_ACCEPT=0` turns it off. It covers the unified reactor loop
+that `HttpServer.serve` uses and the static loop behind `serve_static`, on
+Linux, for two or more workers; the io_uring buffer-ring and the plain h1
+loops accept without it.
+
+**One `recv` per request.** The drain loop stops after a short read instead
+of probing for EAGAIN, in the unified loop and the static loop. A peer
+shutdown still gets the full drain, so a request sent together with a FIN is
+answered with `Connection: close`.
+
+### HTTP/1.1, 1 worker (same load)
+
+| Server | Workers | Req/s | σ% | p50 (ms) | p99 (ms) | p99.9 (ms) | p99.99 (ms) | Raw capacity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| nginx (`worker_processes 1`) | 1 | 211,873 | 0.28 | 1.17 ± 0.02 | 7.43 ± 4.62 | 16.66 ± 10.11 | 18.70 ± 11.11 | 227k |
+| **flare** (reactor) | **1** | **168,128** | **0.16** | **1.01 ± 0.02** | **2.28 ± 0.10** | **4.67 ± 3.45** | **6.45 ± 4.04** | **189k** |
+| Go `net/http` (`GOMAXPROCS=1`) | 1 | 98,691 | 0.21 | 1.10 ± 0.02 | 3.82 ± 7.60 | 14.98 ± 11.41 | 17.38 ± 12.61 | 106k |
+
+At 256 connections nginx does `1.26x` flare on one worker. flare holds the
+lowest p50 and p99 of the three, and does `1.7x` Go. At 64 connections (the
+single-thread config below) nginx leads flare by `5 %` (`203k` against `193k req/s`), so the single reactor loses ground as
+the connection count grows.
+
+### HTTP/1.1, one load thread (`throughput` and `mixed_keepalive`: wrk2, 1 thread, 64 connections)
+
+One wrk2 thread tops out near 200k req/s, so every server sits close to the
+client's ceiling and these rows rank the load generator more than the
+servers. The Rust servers still run 4 workers; nginx, Go and `flare` run one.
+
+| Server | `throughput` | `mixed_keepalive` (20 % `Connection: close`) |
+|---|---:|---:|
+| nginx | 203,075 | 189,196 |
+| **flare** | **193,289** | **185,274** |
+| hyper | 184,624 | 168,513 |
+| axum | 177,270 | 184,158 |
+| **flare_mc_static** | **168,608** | **168,654** |
+| **flare_mc** | **149,601** | **169,804** |
+| actix_web | 141,610 | 173,879 |
+| Go `net/http` | 104,579 | 107,962 |
+
+### HTTP/3 (1 client, 100 streams, h2load with `--log-file`)
+
+| Server | Req/s | σ% | p50 (ms) | p99 (ms) | p99.9 (ms) | p99.99 (ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| **flare_h3** | **189,901** | **0.31** | **0.52 ± 0.00** | **0.95 ± 0.02** | **1.15 ± 0.03** | **1.34 ± 0.13** |
+| quiche | 152,064 | 2.92 | 0.63 ± 0.01 | 0.88 ± 0.03 | 1.02 ± 0.05 | 3.33 ± 0.10 |
+
+Re-run for 0.13.0 (`pixi run -e bench bench-h3-flare`, then
+`bench-h3-quiche`, same box): flare is at `1.25x` quiche, up from `0.84x`
+(`129,635` against `153,494`), with a lower p50 and p99.99. The gain is
+the 0.13.0 transport work: rustls packet functions resolved once, no
+per-byte copies on either path, ACK ranges retired without copies, GSO
+egress, one drain per receive burst. quinn read `428 req/s` with 98 % of
+streams errored, the known harness artifact, and stays excluded.
+
+Multi-worker (`QuicServerConfig.num_workers`, `FLARE_BENCH_WORKERS`), one run,
+h2load with 16 client threads x 1 connection x 100 streams, 10 s:
+
+| Workers | Req/s |
+|---:|---:|
+| 1 | 282,782 |
+| 4 | 958,690 |
+| 8 | 1,942,413 |
+
+### HTTP/2 (h2c, 1 client, 100 streams)
+
+flare: `54,857 req/s`, σ `0.43 %`, p50 `1.74 ms`, p99 `2.04 ± 0.16 ms`,
+p99.99 `2.98 ± 0.30 ms`. There is no cross-framework h2 row: `bench_h2.sh`
+launches the HTTP/1.1 baselines unchanged, none of them accepts h2c prior
+knowledge (hyper is built on `http1::Builder`, nginx listens without
+`http2`), and h2load gets no response from them, so they read `0 req/s`.
+
+### Thread engine: pthreads against AsyncRT
+
+Paired runs: `A` is the pthread engine (main at `a843268a`), `B` the AsyncRT
+engine, both built once and run interleaved, six pairs per row (ten and eight
+for the two h2 rows). Throughput is the wrk2 overdrive rate at 8 threads and
+256 connections; `B/A` is the median of the per-pair ratios.
+
+| Config | Workers | A req/s | B req/s | B/A |
+|---|---:|---:|---:|---:|
+| flare_mc | 1 | 147,967 | 155,799 | 1.020 |
+| flare_mc | 4 | 694,347 | 701,880 | 1.006 |
+| flare_mc | 16 | 1,391,768 | 1,377,861 | 0.991 |
+| flare_mc | 48 | 1,086,858 | 1,082,323 | 0.990 |
+| flare_mc_static | 4 | 835,811 | 837,481 | 1.008 |
+| flare_mc_static | 48 | 1,129,095 | 1,123,055 | 1.004 |
+| flare_mc, mixed keep-alive | 4 | 84,743 | 85,053 | 1.002 |
+| flare_mc, h2c, 8 connections | 4 | 230,110 | 229,770 | 1.009 |
+| flare_mc, h2c, 64 connections | 4 | 254,712 | 253,135 | 0.992 |
+
+At a fixed rate the p99 is `2.62 ms` (A) against `2.64 ms` (B) on 4 workers
+and `3.49 ms` against `3.24 ms` on 48. Every row is inside `±1 %` except the
+1-worker row, where AsyncRT is `2 %` ahead.
+
+Spawn cost from `pixi run bench-threads`:
+
+| Workload | AsyncRT task | OS thread |
+|---|---:|---:|
+| spawn + join, n = 2000 | 6.3 µs | 57.2 µs |
+| fan-out, per task, m = 1000 | 0.43 µs | 32.9 µs |
+| `block_in_pool` round trip, n = 500 | 37.6 µs | |
+
+### Running it on a fresh box
+
+- Unset `CARGO_TARGET_DIR`. The harness runs each Rust baseline from its own
+  `target/`, so a global override leaves those servers unbuilt and their rows
+  at zero.
+- Build the rustls QUIC library before h3:
+  `pixi run -e bench bash flare/tls/ffi/build_rustls.sh`.
+- Install `lsof`. The harness frees the port with it; without it a leftover
+  nginx keeps answering on 8080 and the next target's rows are wrong.
+- h3 needs the h3-enabled h2load on the library path:
+  `LD_LIBRARY_PATH=/usr/local/lib/h3-stack/lib`.

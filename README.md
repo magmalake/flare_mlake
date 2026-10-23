@@ -34,18 +34,24 @@ interesting than that.
 As little as possible. The intent is that this stays a thin layer that could be
 deleted at any time.
 
-**Four features that are open pull requests upstream** — merged here only
-because magmalake needs them now, and they are still awaiting review there:
+**Three source deltas**, each small and each worth sending upstream:
 
-| upstream PR | what it adds |
-|---|---|
-| [#11](https://github.com/ehsanmok/flare/pull/11) | expose the handshake `Origin` on `WsConnection` |
-| [#14](https://github.com/ehsanmok/flare/pull/14) | bound body reads, not just connect |
-| [#15](https://github.com/ehsanmok/flare/pull/15) | serve HTTP and WebSocket on one port |
-| [#16](https://github.com/ehsanmok/flare/pull/16) | opt-in `ws_offload`, one thread per WebSocket |
+- **`flare/runtime/_thread.mojo` starts and joins OS threads through
+  threads.mojo.** Mojo declares an extern per signature, and flare's
+  `pthread_create`/`pthread_join` are spelled differently from threads.mojo's,
+  so a program that uses both (Arrow Flight from flare over an Iceberg scan
+  threaded by threads.mojo) would not link. Everything else in that file is
+  upstream's.
+- **macOS defaults to one shared listener** in `flare/runtime/scheduler.mojo`.
+  BSD's `SO_REUSEPORT` does not spread connections across listeners, so the
+  per-worker shape runs a multi-worker server on one core.
+  `FLARE_REUSEPORT_WORKERS=1` restores it.
+- **`tests/tools/proto_gen.py` decodes `repeated string`/`bytes` one element
+  per field.** They are never packed; decoding them as a packed block fails on
+  any real message.
 
-Every one of these should land upstream and be dropped from here. They are
-carried, not owned.
+The four upstream pull requests this distribution used to carry (#11, #14,
+#15, #16) have all merged upstream.
 
 **Packaging changes** needed to publish and to consume from magmalake. These are
 listed in [CHANGELOG.md](CHANGELOG.md) as they are made.

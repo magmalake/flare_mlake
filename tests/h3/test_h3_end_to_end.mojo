@@ -8,7 +8,7 @@ pump on :class:`flare.http.HttpServer` materializes the request,
 calls a user :trait:`flare.http.Handler`, encodes the
 :class:`flare.http.Response` back into the slot's H3 outbox, and
 the bytes accumulate in
-:attr:`flare.quic.server.QuicListener.http3_response_egress` for the
+the stream's ``QuicConnection.h3_tx`` record for the
 1-RTT egress wiring to pick up.
 
 The 1-RTT wire path (rustls KeyChange surfacing 1-RTT traffic
@@ -193,7 +193,7 @@ def _bind_listener() raises -> QuicListener:
     cfg.host = String("127.0.0.1")
     cfg.port = UInt16(0)
     cfg.rustls_config = RustlsQuicConfig()
-    return QuicListener.bind(cfg^)
+    return QuicListener.bind(cfg)
 
 
 def _seed_slot(mut listener: QuicListener) raises -> Int:
@@ -267,7 +267,7 @@ def test_get_request_dispatches_through_handler() raises:
     var req = listener.take_http3_request(slot, Int(stream_id))
     assert_equal(req.method, String("GET"))
     assert_equal(req.url, String("/hello"))
-    var resp = handler.serve(req^)
+    var resp = handler.serve(req)
     assert_equal(resp.status, 200)
     listener.emit_http3_response(slot, Int(stream_id), resp^)
 
@@ -300,7 +300,7 @@ def test_post_request_body_echo() raises:
     var req = listener.take_http3_request(slot, Int(stream_id))
     assert_equal(req.method, String("POST"))
     assert_equal(len(req.body), 5)
-    var resp = handler.serve(req^)
+    var resp = handler.serve(req)
     assert_equal(resp.status, 200)
     assert_equal(len(resp.body), 5)
     listener.emit_http3_response(slot, Int(stream_id), resp^)
@@ -334,7 +334,7 @@ def test_concurrent_streams_on_one_connection() raises:
     for i in range(len(ready)):
         var sid = ready[i]
         var req = listener.take_http3_request(slot, sid)
-        var resp = handler.serve(req^)
+        var resp = handler.serve(req)
         listener.emit_http3_response(slot, sid, resp^)
 
     var egress_a = listener.take_http3_response_egress(slot, 0)
@@ -365,13 +365,13 @@ def test_multiple_connections_dispatch_independently() raises:
     var ready_a = listener.take_http3_completed_streams(slot_a)
     assert_equal(len(ready_a), 1)
     var req_a_recv = listener.take_http3_request(slot_a, ready_a[0])
-    var resp_a = handler.serve(req_a_recv^)
+    var resp_a = handler.serve(req_a_recv)
     listener.emit_http3_response(slot_a, ready_a[0], resp_a^)
 
     var ready_b = listener.take_http3_completed_streams(slot_b)
     assert_equal(len(ready_b), 1)
     var req_b_recv = listener.take_http3_request(slot_b, ready_b[0])
-    var resp_b = handler.serve(req_b_recv^)
+    var resp_b = handler.serve(req_b_recv)
     listener.emit_http3_response(slot_b, ready_b[0], resp_b^)
 
     var egress_a = listener.take_http3_response_egress(slot_a, 0)
@@ -458,12 +458,13 @@ def test_streaming_response_incremental_data() raises:
     var resp = stream_response(src^)
     listener.emit_http3_response(slot, Int(sid), resp^)
 
-    var key = String("0:0")
-    # HEADERS rode the egress immediately; the stream is registered and
-    # not yet done (no DATA pulled).
-    assert_true(key in listener.http3_streams, "stream must be registered")
-    assert_false(listener.http3_streams[key].done)
-    var headers_only = listener.http3_response_egress[key].copy()
+    var key = Int(sid)
+    # HEADERS rode the egress immediately; the stream keeps its source
+    # and is not yet done (no DATA pulled).
+    ref txs = listener.connections[slot].h3_tx
+    assert_true(txs[key].src_addr != 0, "stream must keep its source")
+    assert_false(txs[key].done)
+    var headers_only = txs[key].buf.copy()
     assert_true(len(headers_only) > 0, "HEADERS must be queued on emit")
     assert_equal(
         len(_extract_h3_data_payload(headers_only)),
@@ -475,15 +476,14 @@ def test_streaming_response_incremental_data() raises:
     for _ in range(3):
         var adv = listener.pump_http3_streams(Cancel.never())
         assert_equal(adv, 1)
-        assert_true(key in listener.http3_streams)
-        assert_false(listener.http3_streams[key].done)
+        assert_false(listener.connections[slot].h3_tx[key].done)
 
     # Fourth pump hits end-of-stream: still counts as advanced, marks
     # done, and frees the boxed source.
     var adv_eos = listener.pump_http3_streams(Cancel.never())
     assert_equal(adv_eos, 1)
-    assert_true(listener.http3_streams[key].done, "EOS must set done")
-    assert_equal(listener.http3_streams[key].src_addr, 0, "source freed")
+    assert_true(listener.connections[slot].h3_tx[key].done, "EOS sets done")
+    assert_equal(listener.connections[slot].h3_tx[key].src_addr, 0, "freed")
 
     # A further pump is a no-op (source exhausted).
     var adv_none = listener.pump_http3_streams(Cancel.never())
@@ -491,7 +491,7 @@ def test_streaming_response_incremental_data() raises:
 
     # The accumulated egress (HEADERS + 3 DATA frames) decodes to the
     # concatenated chunk payloads in order.
-    var full = listener.http3_response_egress[key].copy()
+    var full = listener.take_http3_response_egress(slot, key)
     var body = _extract_h3_data_payload(full)
     assert_equal(len(body), 9)  # "aaa" + "bbbb" + "cc"
     var expect = _bytes("aaabbbbcc")
@@ -500,7 +500,7 @@ def test_streaming_response_incremental_data() raises:
 
 
 def test_buffered_response_not_registered_as_stream() raises:
-    """A plain buffered Response never lands in ``http3_streams`` and
+    """A plain buffered Response keeps no chunk source and
     still emits HEADERS+DATA up front -- the byte-identical original
     path, unaffected by the streaming machinery."""
     var listener = _bind_listener()
@@ -512,18 +512,185 @@ def test_buffered_response_not_registered_as_stream() raises:
     _ = listener.take_http3_completed_streams(slot)
     var req = listener.take_http3_request(slot, Int(sid))
     var handler = _OkHandler(body=String("hello"))
-    var resp = handler.serve(req^)
+    var resp = handler.serve(req)
     listener.emit_http3_response(slot, Int(sid), resp^)
 
-    var key = String("0:0")
-    assert_false(
-        key in listener.http3_streams, "buffered must not register a stream"
-    )
+    ref st = listener.connections[slot].h3_tx[Int(sid)]
+    assert_equal(st.src_addr, 0, "buffered must not keep a source")
+    assert_true(st.done, "buffered is complete on emit")
     # A pump does nothing for buffered responses.
     assert_equal(listener.pump_http3_streams(Cancel.never()), 0)
-    var full = listener.http3_response_egress[key].copy()
+    var full = listener.take_http3_response_egress(slot, Int(sid))
     var body = _extract_h3_data_payload(full)
     assert_equal(len(body), 5)  # "hello" emitted as DATA up front
+
+
+@fieldwise_init
+struct _RaisingHandler(Copyable, Handler):
+    """Raises on ``/boom``, answers everything else."""
+
+    def serve(self, req: Request) raises -> Response:
+        if req.url == "/boom":
+            raise Error("handler blew up with a secret: hunter2")
+        return ok("fine")
+
+
+def test_a_raising_handler_is_contained_to_its_stream() raises:
+    """A handler raise escaped pump_http3_handler_once and serve_http3,
+    which stopped the server for every connection. Now it becomes a 500
+    on that stream (without the exception text) and the next stream on
+    the same connection is still answered."""
+    var tcp_addr = SocketAddr(IpAddr.localhost(), UInt16(0))
+    var udp_cfg = QuicServerConfig()
+    udp_cfg.host = String("127.0.0.1")
+    udp_cfg.port = UInt16(0)
+    var srv = HttpServer.bind_with_http3(tcp_addr, udp_cfg^)
+    var listener_borrow = srv._http3_listener.take()
+    var slot = _seed_slot(listener_borrow)
+    var ev0 = _make_stream_event(UInt64(0), _build_get_request("/boom"))
+    listener_borrow._route_http3_stream_chunks(slot, ev0)
+    var ev4 = _make_stream_event(UInt64(4), _build_get_request("/ok"))
+    listener_borrow._route_http3_stream_chunks(slot, ev4)
+    srv._http3_listener = listener_borrow^
+
+    var handler = _RaisingHandler()
+    var dispatched = srv.pump_http3_handler_once[_RaisingHandler](handler)
+    assert_equal(dispatched, 2)
+    var listener_reborrow = srv._http3_listener.take()
+    var boom = listener_reborrow.take_http3_response_egress(slot, 0)
+    var fine = listener_reborrow.take_http3_response_egress(slot, 4)
+    srv._http3_listener = listener_reborrow^
+    assert_true(len(boom) > 0, "the raising stream got no response")
+    assert_true(len(fine) > 0, "the next stream was not answered")
+    var text = String("")
+    for b in boom:
+        text += chr(Int(b))
+    assert_false("hunter2" in text, "exception text reached the client")
+
+
+def _chunk_event(
+    sid: UInt64, offset: UInt64, n: Int
+) raises -> ConnectionEvents:
+    var events = empty_events()
+    events.stream_chunks.append(
+        StreamFrame(
+            stream_id=sid,
+            offset=offset,
+            data=List[UInt8](length=n, fill=UInt8(0x21)),
+            fin=False,
+        )
+    )
+    return events^
+
+
+def test_stream_limits_and_flow_control_are_enforced() raises:
+    """Any stream id, any number of streams and any amount of data were
+    accepted, and credit was granted from what the peer had sent."""
+    # A stream id only the server may open.
+    var l1 = _bind_listener()
+    var s1 = _seed_slot(l1)
+    l1._route_http3_stream_chunks(s1, _chunk_event(UInt64(1), UInt64(0), 10))
+    assert_false(l1.connections[s1].alive, "server-initiated id accepted")
+    # More client bidi streams than advertised (100 by default).
+    var l2 = _bind_listener()
+    var s2 = _seed_slot(l2)
+    l2._route_http3_stream_chunks(
+        s2, _chunk_event(UInt64(4 * 100), UInt64(0), 10)
+    )
+    assert_false(l2.connections[s2].alive, "stream past MAX_STREAMS accepted")
+    # Data past the connection's MAX_DATA (1 MiB initially).
+    var l3 = _bind_listener()
+    var s3 = _seed_slot(l3)
+    l3._route_http3_stream_chunks(
+        s3, _chunk_event(UInt64(0), UInt64(2 * 1024 * 1024), 10)
+    )
+    assert_false(l3.connections[s3].alive, "data past MAX_DATA accepted")
+    # A retransmit counts once.
+    var l4 = _bind_listener()
+    var s4 = _seed_slot(l4)
+    l4._route_http3_stream_chunks(s4, _chunk_event(UInt64(0), UInt64(0), 1000))
+    l4._route_http3_stream_chunks(s4, _chunk_event(UInt64(0), UInt64(0), 1000))
+    assert_true(l4.connections[s4].alive)
+    assert_equal(Int(l4.connections[s4].fc_received), 1000)
+
+
+def test_undecodable_field_section_closes_the_connection() raises:
+    """QPACK-05: a HEADERS frame whose section cannot be decoded
+    (``01 00 80``: Required Insert Count 1, table capacity 0, 0 blocked
+    streams) is a connection error QPACK_DECOMPRESSION_FAILED; the
+    listener closes the slot with 0x200 instead of leaving the request
+    unanswered on a connection that stays up."""
+    var listener = _bind_listener()
+    var slot = _seed_slot(listener)
+    var section: List[UInt8] = [0x01, 0x00, 0x80]
+    var frame = List[UInt8]()
+    encode_http3_frame(H3_FRAME_TYPE_HEADERS, Span[UInt8, _](section), frame)
+    listener._route_http3_stream_chunks(
+        slot, _make_stream_event(UInt64(0), frame^)
+    )
+    assert_false(listener.connections[slot].alive, "connection stayed up")
+    assert_equal(Int(listener.connections[slot].conn.close_error_code), 0x200)
+    # A valid request on a sibling connection is unaffected.
+    var other = _seed_slot(listener)
+    listener._route_http3_stream_chunks(
+        other, _make_stream_event(UInt64(0), _build_get_request("/fine"))
+    )
+    assert_true(listener.connections[other].alive)
+    assert_equal(len(listener.take_http3_completed_streams(other)), 1)
+
+
+def test_http3_config_reaches_each_connection() raises:
+    """``QuicServerConfig.http3`` builds every accepted connection's H3
+    driver; the drivers were always built with the defaults."""
+    var cfg = QuicServerConfig()
+    cfg.host = String("127.0.0.1")
+    cfg.port = UInt16(0)
+    cfg.http3.max_field_section_size = UInt64(1234)
+    var listener = QuicListener.bind(cfg)
+    var slot = _seed_slot(listener)
+    assert_equal(
+        listener.http3_connections[slot].config.max_field_section_size,
+        UInt64(1234),
+    )
+
+
+def test_a_gap_within_flow_control_keeps_the_connection() raises:
+    """3 MiB arriving behind a 1-byte gap, inside the granted windows, is
+    held and delivered once the gap fills. The reassembly held only
+    2 MiB, while flow control let a peer send up to 16 MiB past a gap,
+    so a lossy upload was closed with H3_GENERAL_PROTOCOL_ERROR."""
+    var cfg = QuicServerConfig()
+    cfg.host = String("127.0.0.1")
+    cfg.port = UInt16(0)
+    cfg.initial_max_data = UInt64(8 * 1024 * 1024)
+    var listener = QuicListener.bind(cfg)
+    var slot = _seed_slot(listener)
+    var body = List[UInt8](length=3 * 1024 * 1024, fill=UInt8(0x42))
+    var req = _build_post_request("/up", body)
+    var pos = 1
+    while pos < len(req):
+        var end = min(pos + 60_000, len(req))
+        var ev = empty_events()
+        ev.stream_chunks.append(
+            StreamFrame(
+                UInt64(0),
+                UInt64(pos),
+                List[UInt8](Span[UInt8, _](req)[pos:end]),
+                end == len(req),
+            )
+        )
+        listener._route_http3_stream_chunks(slot, ev)
+        pos = end
+    assert_true(listener.connections[slot].alive, "closed for the gap")
+    var first = empty_events()
+    first.stream_chunks.append(
+        StreamFrame(
+            UInt64(0), UInt64(0), List[UInt8](Span[UInt8, _](req)[0:1]), False
+        )
+    )
+    listener._route_http3_stream_chunks(slot, first)
+    assert_equal(len(listener.take_http3_completed_streams(slot)), 1)
+    assert_equal(len(listener.take_http3_request(slot, 0).body), len(body))
 
 
 def main() raises:
@@ -533,6 +700,11 @@ def main() raises:
     test_multiple_connections_dispatch_independently()
     test_pump_http3_handler_once_drives_handler()
     test_pump_http3_handler_once_zero_when_no_streams_ready()
+    test_a_raising_handler_is_contained_to_its_stream()
     test_streaming_response_incremental_data()
     test_buffered_response_not_registered_as_stream()
-    print("test_h3_end_to_end: 8 passed")
+    test_stream_limits_and_flow_control_are_enforced()
+    test_undecodable_field_section_closes_the_connection()
+    test_http3_config_reaches_each_connection()
+    test_a_gap_within_flow_control_keeps_the_connection()
+    print("test_h3_end_to_end: 13 passed")

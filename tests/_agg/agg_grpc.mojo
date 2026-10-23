@@ -82,6 +82,12 @@ from test_grpc_compression import (
 from test_grpc_compression import (
     test_compressed_request_without_encoding_raises as test_grpc_compression__test_compressed_request_without_encoding_raises,
 )
+from test_grpc_compression import (
+    test_decompression_cap_covers_the_whole_call as test_grpc_compression__test_decompression_cap_covers_the_whole_call,
+)
+from test_grpc_compression import (
+    test_streaming_decompression_cap_covers_the_whole_call as test_grpc_compression__test_streaming_decompression_cap_covers_the_whole_call,
+)
 from test_grpc_interceptor_health import (
     test_interceptor_passthrough_and_after as test_grpc_interceptor_health__test_interceptor_passthrough_and_after,
 )
@@ -102,6 +108,9 @@ from test_grpc_interceptor_health import (
 )
 from test_grpc_interceptor_health import (
     test_health_request_roundtrip as test_grpc_interceptor_health__test_health_request_roundtrip,
+)
+from test_grpc_interceptor_health import (
+    test_health_request_huge_length_raises as test_grpc_interceptor_health__test_health_request_huge_length_raises,
 )
 from test_grpc_interceptor_health import (
     test_watch_replays_status_transitions as test_grpc_interceptor_health__test_watch_replays_status_transitions,
@@ -126,6 +135,15 @@ from test_grpc_proto import (
 )
 from test_grpc_proto import (
     test_skip_unknown_field as test_grpc_proto__test_skip_unknown_field,
+)
+from test_grpc_proto import (
+    test_skip_rejects_length_beyond_message as test_grpc_proto__test_skip_rejects_length_beyond_message,
+)
+from test_grpc_proto import (
+    test_read_bytes_rejects_length_beyond_message as test_grpc_proto__test_read_bytes_rejects_length_beyond_message,
+)
+from test_grpc_proto import (
+    test_skip_len_exact_remaining_ok as test_grpc_proto__test_skip_len_exact_remaining_ok,
 )
 from test_grpc_reflection import (
     test_request_decode_list_services as test_grpc_reflection__test_request_decode_list_services,
@@ -257,6 +275,9 @@ from test_server import (
     test_run_unary_call_handler_raise_emits_internal as test_server__test_run_unary_call_handler_raise_emits_internal,
 )
 from test_server import (
+    test_grpc_message_is_percent_encoded_and_decoded as test_server__test_grpc_message_is_percent_encoded_and_decoded,
+)
+from test_server import (
     test_emit_trailing_headers_status_ok_minimal as test_server__test_emit_trailing_headers_status_ok_minimal,
 )
 from test_server import (
@@ -305,6 +326,12 @@ def main() raises:
     suite.test[
         test_grpc_compression__test_compressed_request_without_encoding_raises
     ]()
+    suite.test[
+        test_grpc_compression__test_decompression_cap_covers_the_whole_call
+    ]()
+    suite.test[
+        test_grpc_compression__test_streaming_decompression_cap_covers_the_whole_call
+    ]()
     # tests/grpc/test_grpc_interceptor_health.mojo
     suite.test[
         test_grpc_interceptor_health__test_interceptor_passthrough_and_after
@@ -315,6 +342,9 @@ def main() raises:
     suite.test[test_grpc_interceptor_health__test_health_not_serving]()
     suite.test[test_grpc_interceptor_health__test_health_unknown_service]()
     suite.test[test_grpc_interceptor_health__test_health_request_roundtrip]()
+    suite.test[
+        test_grpc_interceptor_health__test_health_request_huge_length_raises
+    ]()
     suite.test[
         test_grpc_interceptor_health__test_watch_replays_status_transitions
     ]()
@@ -328,6 +358,9 @@ def main() raises:
     suite.test[test_grpc_proto__test_fixed_and_float]()
     suite.test[test_grpc_proto__test_embedded_message]()
     suite.test[test_grpc_proto__test_skip_unknown_field]()
+    suite.test[test_grpc_proto__test_skip_rejects_length_beyond_message]()
+    suite.test[test_grpc_proto__test_read_bytes_rejects_length_beyond_message]()
+    suite.test[test_grpc_proto__test_skip_len_exact_remaining_ok]()
     # tests/grpc/test_grpc_reflection.mojo
     suite.test[test_grpc_reflection__test_request_decode_list_services]()
     suite.test[test_grpc_reflection__test_list_services_response]()
@@ -401,6 +434,7 @@ def main() raises:
         test_server__test_run_unary_call_truncated_lpm_emits_invalid_argument
     ]()
     suite.test[test_server__test_run_unary_call_handler_raise_emits_internal]()
+    suite.test[test_server__test_grpc_message_is_percent_encoded_and_decoded]()
     suite.test[test_server__test_emit_trailing_headers_status_ok_minimal]()
     suite.test[
         test_server__test_emit_trailing_headers_status_err_with_message

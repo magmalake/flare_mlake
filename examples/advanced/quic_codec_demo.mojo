@@ -27,6 +27,7 @@ from std.collections.span import Span
 
 from flare.quic import (
     AckFrame,
+    AckFrequencyFrame,
     AckRange,
     ConnectionCloseFrame,
     DatagramFrame,
@@ -149,7 +150,10 @@ struct _DemoHandler(FrameHandler, Movable):
     def on_datagram(mut self, dg: DatagramFrame) raises:
         pass
 
-    def on_unknown(mut self, type_id: UInt64) raises:
+    def on_ack_frequency(mut self, f: AckFrequencyFrame) raises:
+        pass
+
+    def on_immediate_ack(mut self) raises:
         pass
 
 

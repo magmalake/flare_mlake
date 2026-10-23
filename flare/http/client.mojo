@@ -78,6 +78,8 @@ from ._client.parse import (
     _extract_body_and_trailers,
     _parse_http_response,
     _read_http_response_framed_tcp,
+    _wire_method,
+    NO_REPLY_ERROR,
     _read_http_response_framed_tls,
     _read_http_response_tcp,
     _read_http_response_tls,
@@ -89,9 +91,9 @@ from ._client.stream_response import HttpStreamResponse
 from ._client.h2_download import Http2Download
 from ._client.h2_transport import _H2Transport
 from ._client.h2_send import (
+    H2Link,
+    h2_roundtrip,
     _build_h2_request_headers,
-    _send_h2_over_tcp,
-    _send_h2_over_tls,
     _send_h2c_via_upgrade,
 )
 from ._client.alt_svc import (
@@ -100,7 +102,7 @@ from ._client.alt_svc import (
     decide_http3_wire,
     monotonic_now_s,
 )
-from ._client.quic_pool import QuicConnectionPool
+from ._client.quic_pool import IdleConnPool, QuicConnectionPool
 from ._client.tls_pool import TlsConnectionPool
 from ._client.h3_race import (
     RACE_H3,
@@ -134,20 +136,50 @@ def _chunk_frame_prefix(n: Int) -> String:
     return out + "\r\n"
 
 
+comptime _H3_SENT_ERROR: String = "HTTP/3 request failed after sending: "
+"""Prefix marking an h3 failure after the request reached a connection:
+the caller must not fall back to another wire and send it again."""
+
+
+def _same_origin(a: String, b: String) -> Bool:
+    """Scheme, host and port all equal (RFC 6454). Unparseable means
+    not the same."""
+    try:
+        var ua = Url.parse(a)
+        var ub = Url.parse(b)
+        return (
+            ua.scheme.lower() == ub.scheme.lower()
+            and ua.host.lower() == ub.host.lower()
+            and ua.port == ub.port
+        )
+    except:
+        return False
+
+
 def _is_idempotent(method: String) -> Bool:
     """Whether ``method`` is idempotent per RFC 9110 sec 9.2.2 (safe to
-    send more than once with the same effect). Only idempotent requests
-    are eligible for the happy-eyeballs race, which dispatches the
-    request on both the h3 and h2 wires concurrently."""
-    var m = method.upper()
-    return (
-        m == "GET"
-        or m == "HEAD"
-        or m == "OPTIONS"
-        or m == "PUT"
-        or m == "DELETE"
-        or m == "TRACE"
-    )
+    send more than once with the same effect). Gates the happy-eyeballs
+    race and every automatic replay. One definition for the tree: the
+    ``Retry`` middleware uses the same set."""
+    from flare.http.reliability import _is_idempotent_method
+
+    return _is_idempotent_method(method.upper())
+
+
+def _may_replay(method: String, write_failed: Bool, err: String) -> Bool:
+    """Whether a request that failed on a reused connection may be sent
+    again on a fresh one (RFC 9112 sec 9.3.1).
+
+    A failed write is the stale-connection signature before the
+    request reached the server. A read that failed before any reply
+    byte is the other (the peer closed an idle keep-alive), but the
+    request may have been processed, so only an idempotent one is
+    re-sent. Once reply bytes have arrived, nothing is re-sent.
+    """
+    if write_failed:
+        return True
+    # ``in``, not ``startswith``: String(e) prefixes the error type.
+    return NO_REPLY_ERROR in err and _is_idempotent(method)
 
 
 def _race_connect_leg(
@@ -185,7 +217,7 @@ struct PoolStats(Copyable):
     """QUIC connections dialled over this client's lifetime."""
 
 
-comptime FLARE_VERSION: String = "0.11.0"
+comptime FLARE_VERSION: String = "0.13.0"
 """The library version, as reported in the default ``User-Agent``.
 
 Bump alongside ``pixi.toml`` and ``recipe.yaml`` at release."""
@@ -281,6 +313,11 @@ struct HttpClient(Movable):
     by :meth:`http3_wire_choice` so an origin that advertised an h3
     endpoint upgrades transparently on the next request. Freed in
     :meth:`__deinit__`."""
+    var _h2_pool: IdleConnPool[H2Link]
+    """Idle HTTP/2 connections (h2 over TLS, and h2c prior knowledge)
+    keyed by ``scheme://host:port``. Every h2 request used to dial and
+    handshake a new connection and GOAWAY it after one response; gRPC
+    calls inherited that. Freed in :meth:`__deinit__`."""
     var _quic_pool: QuicConnectionPool
     """Idle HTTP/3 (QUIC) connection pool keyed on ``host:port``,
     behind a pointer-backed interior-mutable handle so the read-``self``
@@ -378,9 +415,11 @@ struct HttpClient(Movable):
             prefer_http3: When ``True``, ``https://`` requests prefer
                 HTTP/3 over QUIC on first contact rather than waiting
                 for an ``Alt-Svc`` advert; any QUIC dial failure falls
-                back transparently to h2/h1. (Without this, h3 still
+                back transparently to h2/h1. Without this, h3 still
                 kicks in automatically once a server advertises it via
-                ``Alt-Svc``.)
+                ``Alt-Svc``.
+            auto_decompress: When ``True`` (default), compressed response
+                bodies are decoded transparently.
         """
         self._config = TlsConfig()
         self._max_redirects = max_redirects
@@ -394,6 +433,7 @@ struct HttpClient(Movable):
         self._prefer_http3 = prefer_http3
         self._alt_svc = AltSvcStore.new()
         self._quic_pool = QuicConnectionPool.new()
+        self._h2_pool = IdleConnPool[H2Link].new()
         self._tls_pool = TlsConnectionPool.disabled()
         self._redirect_policy = RedirectPolicy.follow_all(max_redirects)
         self._auto_decompress = auto_decompress
@@ -429,6 +469,7 @@ struct HttpClient(Movable):
         self._prefer_http3 = prefer_http3
         self._alt_svc = AltSvcStore.new()
         self._quic_pool = QuicConnectionPool.new()
+        self._h2_pool = IdleConnPool[H2Link].new()
         self._tls_pool = TlsConnectionPool.disabled()
         self._redirect_policy = RedirectPolicy.follow_all(max_redirects)
         self._auto_decompress = auto_decompress
@@ -468,6 +509,7 @@ struct HttpClient(Movable):
         self._prefer_http3 = prefer_http3
         self._alt_svc = AltSvcStore.new()
         self._quic_pool = QuicConnectionPool.new()
+        self._h2_pool = IdleConnPool[H2Link].new()
         self._tls_pool = TlsConnectionPool.disabled()
         self._redirect_policy = RedirectPolicy.follow_all(max_redirects)
         self._auto_decompress = auto_decompress
@@ -507,6 +549,7 @@ struct HttpClient(Movable):
         self._prefer_http3 = prefer_http3
         self._alt_svc = AltSvcStore.new()
         self._quic_pool = QuicConnectionPool.new()
+        self._h2_pool = IdleConnPool[H2Link].new()
         self._tls_pool = TlsConnectionPool.disabled()
         self._redirect_policy = RedirectPolicy.follow_all(max_redirects)
         self._auto_decompress = auto_decompress
@@ -536,6 +579,7 @@ struct HttpClient(Movable):
             pass
         try:
             self._quic_pool.free()
+            self._h2_pool.free()
         except:
             pass
         try:
@@ -861,11 +905,11 @@ struct HttpClient(Movable):
         self._cookies = CookieStore.new()
         return self^
 
-    def cookie_header(imm self) raises -> String:
-        """The ``Cookie`` request header value the jar would send, or
-        ``""`` when cookies are disabled / the jar is empty. Useful for
-        tests and introspection."""
-        return self._cookies.request_header()
+    def cookie_header(imm self, url: String) raises -> String:
+        """The ``Cookie`` request header value the jar would send to
+        ``url``, or ``""`` when cookies are disabled / none match.
+        Useful for tests and introspection."""
+        return self._cookies.request_header(self._resolve_url(url))
 
     def record_alt_svc(self, origin: String, alt_svc_header: String) raises:
         """Record an origin's ``Alt-Svc`` response header (RFC 7838)
@@ -948,7 +992,10 @@ struct HttpClient(Movable):
         ``localhost`` on a typical Linux ``/etc/hosts``) may put the
         family the server isn't listening on first.
         """
-        var addrs = resolve(u.host)
+        var target = self._h3_dial_target(u)
+        var dial_host = target[0]
+        var dial_port = target[1]
+        var addrs = resolve(dial_host)
         var alpn = List[String]()
         alpn.append("h3")
         # Empty ca_bundle parity with the OpenSSL h1/h2 path: fall back
@@ -961,16 +1008,43 @@ struct HttpClient(Movable):
             connector = RustlsQuicConnector.with_system_roots(alpn^)
         var last_err = String("")
         for i in range(len(addrs)):
-            var peer = SocketAddr(addrs[i], u.port)
+            var peer = SocketAddr(addrs[i], dial_port)
             try:
-                var quic = QuicClientConnection.connect(peer, connector, u.host)
+                # SNI and certificate checks stay on the *origin* host:
+                # RFC 7838 sec 2.1 requires the alternative to be
+                # authoritative for the origin, not for itself.
+                var quic = QuicClientConnection.connect(
+                    peer,
+                    connector,
+                    u.host,
+                    token=self._quic_pool.token(
+                        QuicConnectionPool.build_key(u.host, Int(u.port))
+                    ),
+                )
                 self._quic_pool.note_dial()
                 return Http3ClientConnection(quic^)
             except e:
                 last_err = String(e)
         raise NetworkError(
-            "h3: all addresses failed for " + u.host + ": " + last_err
+            "h3: all addresses failed for " + dial_host + ": " + last_err
         )
+
+    def _h3_dial_target(self, u: Url) -> Tuple[String, UInt16]:
+        """Where to send QUIC packets for ``u``'s origin: the endpoint
+        its fresh ``Alt-Svc`` advert names, else the origin itself.
+
+        ``Alt-Svc: h3=":8443"`` or ``h3="alt.example.net:443"`` was
+        recorded and then ignored -- the client dialed the origin's own
+        port, which for a non-idempotent request cost a handshake timeout
+        on every call before falling back.
+        """
+        var origin = u.host + ":" + String(Int(u.port))
+        var ep = self._alt_svc.h3_endpoint(origin, monotonic_now_s())
+        if ep:
+            var hp = ep.value().copy()
+            var host = hp[0] if hp[0].byte_length() > 0 else u.host
+            return (host, hp[1])
+        return (u.host, u.port)
 
     def _run_http3_request(
         self,
@@ -1005,6 +1079,10 @@ struct HttpClient(Movable):
         var hr = h3.fetch(
             method, "https", authority, u.request_target(), headers, body
         )
+        self._quic_pool.remember_token(
+            QuicConnectionPool.build_key(u.host, Int(u.port)),
+            h3.quic.address_token(),
+        )
         var resp = Response(hr.status, "", hr.body.copy())
         for i in range(len(hr.headers)):
             resp.headers.set(hr.headers[i].name, hr.headers[i].value)
@@ -1023,7 +1101,7 @@ struct HttpClient(Movable):
         var pooled = self._quic_pool.acquire(key)
         if pooled:
             var existing = pooled.take()
-            if existing.is_established():
+            if existing.is_usable():
                 self._quic_pool.release(key, existing^)
                 return True
             existing.close()
@@ -1051,7 +1129,7 @@ struct HttpClient(Movable):
             tls_cfg.alpn.append("h2")
             tls_cfg.alpn.append("http/1.1")
         var stream = TlsStream.connect_timeout(
-            u.host, u.port, tls_cfg^, self._timeout_ms
+            u.host, u.port, tls_cfg, self._timeout_ms
         )
         self._arm_read_timeout(stream)
         var negotiated = stream.alpn_selected()
@@ -1083,31 +1161,56 @@ struct HttpClient(Movable):
         fallback to h2/h1.
         """
         var key = QuicConnectionPool.build_key(u.host, Int(u.port))
+        var idempotent = _is_idempotent(method)
         var pooled = self._quic_pool.acquire(key)
         if pooled:
             var h3 = pooled.take()
             var failed = False
+            var err = String("")
             var resp = Response(0, "", List[UInt8]())
             try:
                 resp = self._run_http3_request(
                     h3, u, method, extra_headers, body, auth_header
                 )
-            except:
+            except e:
                 failed = True
+                err = String(e)
             if not failed:
-                if h3.is_established():
+                if h3.is_usable():
                     self._quic_pool.release(key, h3^)
                 else:
                     h3.close()
                 return resp^
-            # Stale reused connection: drop it and dial fresh below.
             h3.close()
+            # The request went out on an established connection and may
+            # have been processed; only an idempotent one is re-sent.
+            if not idempotent:
+                raise Error(_H3_SENT_ERROR + err)
 
         var fresh = self._dial_http3(u)
+        if not idempotent:
+            # From here on the request reaches the server: a failure must
+            # not fall back to h2/h1 and send it a second time.
+            var resp_ni = Response(0, "", List[UInt8]())
+            var err_ni = String("")
+            try:
+                resp_ni = self._run_http3_request(
+                    fresh, u, method, extra_headers, body, auth_header
+                )
+            except e:
+                err_ni = String(e)
+            if err_ni.byte_length() > 0:
+                fresh.close()
+                raise Error(_H3_SENT_ERROR + err_ni)
+            if fresh.is_usable():
+                self._quic_pool.release(key, fresh^)
+            else:
+                fresh.close()
+            return resp_ni^
         var resp = self._run_http3_request(
             fresh, u, method, extra_headers, body, auth_header
         )
-        if fresh.is_established():
+        if fresh.is_usable():
             self._quic_pool.release(key, fresh^)
         else:
             fresh.close()
@@ -1144,6 +1247,14 @@ struct HttpClient(Movable):
         var pool_on = self._tls_pool.enabled() and proxy.byte_length() == 0
         var key = TlsConnectionPool.build_key(u.scheme, u.host, Int(u.port))
 
+        # 0. Reuse a pooled h2 connection to this origin.
+        if proxy.byte_length() == 0:
+            var reused_h2 = self._h2_pooled(
+                key, u, method, extra_headers, body, auth_header
+            )
+            if reused_h2:
+                return reused_h2.take()
+
         # 1. Reuse a pooled http/1.1-over-TLS connection if available.
         #    The helper owns the moved-in stream so a stale connection
         #    is closed there and signalled back as a miss (None).
@@ -1166,16 +1277,17 @@ struct HttpClient(Movable):
         var stream: TlsStream
         if proxy.byte_length() > 0:
             var tcp = self._connect_tunnel(proxy, u.host, u.port)
-            stream = TlsStream.connect_over_tcp(tcp^, u.host, tls_cfg^)
+            stream = TlsStream.connect_over_tcp(tcp^, u.host, tls_cfg)
         else:
             stream = TlsStream.connect_timeout(
-                u.host, u.port, tls_cfg^, self._timeout_ms
+                u.host, u.port, tls_cfg, self._timeout_ms
             )
         self._arm_read_timeout(stream)
         var negotiated = stream.alpn_selected()
         if negotiated == "h2":
-            var resp_h2 = _send_h2_over_tls(
-                stream^,
+            var link = H2Link(stream^)
+            var resp_h2 = h2_roundtrip(
+                link,
                 method,
                 u,
                 extra_headers,
@@ -1183,6 +1295,7 @@ struct HttpClient(Movable):
                 self._user_agent,
                 auth_header,
             )
+            self._h2_release(key, link^, proxy.byte_length() == 0)
             return resp_h2^
         # HTTP/1.1 over TLS.
         var wire_bytes = wire.as_bytes()
@@ -1192,15 +1305,65 @@ struct HttpClient(Movable):
         if pool_on:
             # Framed read so the connection can return to the pool.
             var can_reuse2 = False
-            var resp_f = _read_http_response_framed_tls(stream, can_reuse2)
+            var resp_f = _read_http_response_framed_tls(
+                stream, can_reuse2, method
+            )
             if can_reuse2:
                 self._tls_pool.release(key, stream^)
             else:
                 stream.close()
             return resp_f^
-        var resp = _read_http_response_tls(stream)
+        var resp = _read_http_response_tls(stream, method)
         stream.close()
         return resp^
+
+    def _h2_pooled(
+        self,
+        key: String,
+        u: Url,
+        method: String,
+        extra_headers: HeaderMap,
+        body: List[UInt8],
+        auth_header: String,
+    ) raises -> Optional[Response]:
+        """Run the request on a pooled HTTP/2 connection to ``key``, if
+        one is idle and usable; None means dial a fresh one. A pooled
+        connection that fails (closed while idle) is dropped; the request
+        is then re-sent on a fresh connection only when it is idempotent,
+        since the server may have processed it."""
+        var pooled = self._h2_pool.acquire(key)
+        if not pooled:
+            return None
+        var link = pooled.take()
+        if not link.usable():
+            link.retire()
+            return None
+        var resp: Response
+        try:
+            resp = h2_roundtrip(
+                link,
+                method,
+                u,
+                extra_headers,
+                body,
+                self._user_agent,
+                auth_header,
+            )
+        except e:
+            link.close()
+            if not _is_idempotent(method):
+                raise e^
+            return None
+        self._h2_release(key, link^, True)
+        return Optional(resp^)
+
+    def _h2_release(self, key: String, var link: H2Link, poolable: Bool) raises:
+        """Keep ``link`` for the next request to ``key`` (when it can take
+        one), else GOAWAY and close it."""
+        if poolable and link.usable():
+            self._h2_pool.release(key, link^)
+        else:
+            link.retire()
 
     def _send_h1_tls_pooled_once(
         self,
@@ -1225,22 +1388,29 @@ struct HttpClient(Movable):
                 st.write_all(Span[UInt8, _](body))
         except:
             io_failed = True
+        var read_err = String("")
         if not io_failed:
             var can_reuse = False
             var parsed = True
             var resp = Response(0, "", List[UInt8]())
             try:
-                resp = _read_http_response_framed_tls(st, can_reuse)
-            except:
+                resp = _read_http_response_framed_tls(
+                    st, can_reuse, _wire_method(wire)
+                )
+            except e:
                 parsed = False
+                read_err = String(e)
             if parsed:
                 if can_reuse:
                     self._tls_pool.release(key, st^)
                 else:
                     st.close()
                 return Optional(resp^)
-        # Stale connection: close and signal a pool miss.
         st.close()
+        # Signal a pool miss (the caller dials fresh and re-sends) only
+        # when re-sending cannot repeat the request's effect.
+        if not _may_replay(_wire_method(wire), io_failed, read_err):
+            raise NetworkError("HTTPS/1.1 request failed: " + read_err)
         return None
 
     # ── Streaming request body ────────────────────────────────────────────────
@@ -1278,6 +1448,9 @@ struct HttpClient(Movable):
                 exhaustion (``next`` returns ``None``).
             content_type: ``Content-Type`` header value. Defaults to
                 ``application/octet-stream``.
+            body_size: Total body length in bytes when known (sent as
+                ``Content-Length``); negative selects chunked framing.
+            cancel: Cancellation token checked while the body is pulled.
 
         Returns:
             The server's ``Response``.
@@ -1372,7 +1545,7 @@ struct HttpClient(Movable):
         tls_cfg.alpn = List[String]()
         tls_cfg.alpn.append("http/1.1")
         var stream = TlsStream.connect_timeout(
-            u.host, u.port, tls_cfg^, self._timeout_ms
+            u.host, u.port, tls_cfg, self._timeout_ms
         )
         self._arm_read_timeout(stream)
         var wb = wire.as_bytes()
@@ -1634,7 +1807,9 @@ struct HttpClient(Movable):
         if self._auth_header != "":
             headers.set("authorization", self._auth_header)
         if self._cookies.enabled():
-            var cookie = self._cookies.request_header()
+            var cookie = self._cookies.request_header(
+                self._resolve_url(req.url)
+            )
             if cookie != "":
                 headers.set("cookie", cookie)
 
@@ -1700,10 +1875,10 @@ struct HttpClient(Movable):
         var proxy = self._resolve_proxy(u)
         if proxy.byte_length() > 0:
             var tcp = self._connect_tunnel(proxy, u.host, u.port)
-            stream = TlsStream.connect_over_tcp(tcp^, u.host, tls_cfg^)
+            stream = TlsStream.connect_over_tcp(tcp^, u.host, tls_cfg)
         else:
             stream = TlsStream.connect_timeout(
-                u.host, u.port, tls_cfg^, self._timeout_ms
+                u.host, u.port, tls_cfg, self._timeout_ms
             )
         self._arm_read_timeout(stream)
         var negotiated = stream.alpn_selected()
@@ -1786,7 +1961,7 @@ struct HttpClient(Movable):
                 raise NetworkError(
                     "h2 streaming request: peer closed before response headers"
                 )
-            conn.feed(Span[UInt8, _](buf)[0:n])
+            conn.receive(Span[UInt8, _](buf)[0:n])
             var pending = conn.drain()
             if len(pending) > 0:
                 t.write_all(Span[UInt8, _](pending))
@@ -1831,7 +2006,7 @@ struct HttpClient(Movable):
         """
         var body_bytes = List[UInt8](body.as_bytes())
         var req = Request(
-            method=Method.POST, url=self._resolve_url(url), body=body_bytes^
+            method=Method.POST, url=self._resolve_url(url), body=body_bytes
         )
         req.headers.set("Content-Type", "application/json")
         return self.send(req)
@@ -1895,7 +2070,7 @@ struct HttpClient(Movable):
         """
         var body_bytes = List[UInt8](body.as_bytes())
         var req = Request(
-            method=Method.PUT, url=self._resolve_url(url), body=body_bytes^
+            method=Method.PUT, url=self._resolve_url(url), body=body_bytes
         )
         req.headers.set("Content-Type", "application/json")
         return self.send(req)
@@ -1993,7 +2168,7 @@ struct HttpClient(Movable):
         """
         var body_bytes = List[UInt8](body.as_bytes())
         var req = Request(
-            method=Method.PATCH, url=self._resolve_url(url), body=body_bytes^
+            method=Method.PATCH, url=self._resolve_url(url), body=body_bytes
         )
         req.headers.set("Content-Type", "application/json")
         return self.send(req)
@@ -2114,7 +2289,9 @@ struct HttpClient(Movable):
         while True:
             # Attach session cookies for this hop (jar wins over a stale
             # caller-supplied Cookie since it carries the live session).
-            var cookie_hdr = self._cookies.request_header()
+            var cookie_hdr = self._cookies.request_header(
+                self._resolve_url(current_url)
+            )
             if cookie_hdr.byte_length() > 0:
                 headers.set("Cookie", cookie_hdr)
 
@@ -2126,7 +2303,9 @@ struct HttpClient(Movable):
             if self._cookies.enabled():
                 var set_cookies = resp.headers.get_all("Set-Cookie")
                 for i in range(len(set_cookies)):
-                    self._cookies.record_set_cookie(set_cookies[i])
+                    self._cookies.record_set_cookie(
+                        set_cookies[i], self._resolve_url(current_url)
+                    )
 
             # Transparent Alt-Svc discovery (RFC 7838).
             var alt_svc = resp.headers.get("Alt-Svc")
@@ -2147,6 +2326,17 @@ struct HttpClient(Movable):
             )
 
             if decision.action == RedirectAction.FOLLOW:
+                # Credentials the *caller* attached were meant for the
+                # origin they asked for. Authorization is handled by the
+                # policy below; Cookie and Proxy-Authorization used to
+                # ride along to any origin a 3xx pointed at. Jar cookies
+                # are re-selected per hop by URL, so they stay scoped.
+                if not _same_origin(
+                    self._resolve_url(current_url),
+                    self._resolve_url(decision.next_url),
+                ):
+                    _ = headers.remove("Cookie")
+                    _ = headers.remove("Proxy-Authorization")
                 current_url = decision.next_url
                 method = decision.next_method
                 if decision.next_body_dropped:
@@ -2326,13 +2516,39 @@ struct HttpClient(Movable):
                     return self._send_http3(
                         u, method, extra_headers, body, auth_header
                     )
-                except:
-                    pass  # transparent fallback to h2/h1
+                except e:
+                    # Fall back to h2/h1 only when the request never
+                    # reached an h3 connection; otherwise that would send
+                    # a non-idempotent request twice.
+                    if _H3_SENT_ERROR in String(e):
+                        raise e^
             return self._send_h2_or_h1_tls(
                 u, method, extra_headers, body, wire, auth_header
             )
         else:
             var proxy = self._resolve_proxy(u)
+            if (
+                pool_enabled
+                and proxy.byte_length() == 0
+                and not self._prefer_h2c
+                and not self._h2c_upgrade
+            ):
+                # Pooled keep-alive path with one stale-conn retry
+                # (RFC 9112 sec 9.3.1; see _may_replay). Decided before
+                # dialing: this branch used to open a fresh connection
+                # first and close it unused, so every pooled request
+                # paid a TCP handshake and the server saw twice the
+                # connections. Skipped when a proxy tunnel is active
+                # (pooled direct connections would bypass the proxy).
+                var key = ClientPool.build_key(u.scheme, u.host, Int(u.port))
+                return self._send_h1_pooled(key, u.host, u.port, wire, body)
+            var h2c_key = ClientPool.build_key(u.scheme, u.host, Int(u.port))
+            if self._prefer_h2c and proxy.byte_length() == 0:
+                var reused = self._h2_pooled(
+                    h2c_key, u, method, extra_headers, body, auth_header
+                )
+                if reused:
+                    return reused.take()
             var stream: TcpStream
             if proxy.byte_length() > 0:
                 stream = self._connect_tunnel(proxy, u.host, u.port)
@@ -2347,8 +2563,9 @@ struct HttpClient(Movable):
                 # drive the request through Http2ClientConnection
                 # over the cleartext TCP stream. The response
                 # comes back lowered to a regular Response.
-                var resp_h2c = _send_h2_over_tcp(
-                    stream^,
+                var link = H2Link(stream^)
+                var resp_h2c = h2_roundtrip(
+                    link,
                     method,
                     u,
                     extra_headers,
@@ -2356,6 +2573,7 @@ struct HttpClient(Movable):
                     self._user_agent,
                     auth_header,
                 )
+                self._h2_release(h2c_key, link^, proxy.byte_length() == 0)
                 return resp_h2c^
             if self._h2c_upgrade:
                 # h2c via the RFC 7540 §3.2 Upgrade dance: send the
@@ -2373,21 +2591,11 @@ struct HttpClient(Movable):
                     auth_header,
                 )
                 return resp_upg^
-            if pool_enabled and proxy.byte_length() == 0:
-                # Pooled keep-alive path with one stale-conn retry.
-                # If the first attempt was on a pooled fd and the
-                # peer FIN'd the idle keep-alive while we were
-                # writing, retry once with a fresh connection (RFC
-                # 7230 §6.3.1). Skipped when a proxy tunnel is active
-                # (pooled direct connections would bypass the proxy).
-                stream.close()  # discard the fresh stream we just opened
-                var key = ClientPool.build_key(u.scheme, u.host, Int(u.port))
-                return self._send_h1_pooled(key, u.host, u.port, wire, body)
             var wire_bytes = wire.as_bytes()
             stream.write_all(Span[UInt8, _](wire_bytes))
             if len(body) > 0:
                 stream.write_all(Span[UInt8, _](body))
-            var resp = _read_http_response_tcp(stream)
+            var resp = _read_http_response_tcp(stream, method)
             stream.close()
             return resp^
 
@@ -2429,10 +2637,13 @@ struct HttpClient(Movable):
         except:
             io_failed = True
 
+        var read_err = String("")
         if not io_failed:
             var can_reuse = False
             try:
-                var resp = _read_http_response_framed_tcp(stream, can_reuse)
+                var resp = _read_http_response_framed_tcp(
+                    stream, can_reuse, _wire_method(wire)
+                )
                 if can_reuse:
                     # Release fd to pool: capture fd, neutralise the
                     # RawSocket so its destructor is a no-op, then
@@ -2443,15 +2654,19 @@ struct HttpClient(Movable):
                 else:
                     stream.close()
                 return resp^
-            except:
-                pass
+            except e:
+                read_err = String(e)
 
-        # IO or parse failure on a *pooled* fd is the canonical
-        # stale-conn signature. Retry once with a fresh connection.
+        # A failure on a *pooled* fd may be a stale keep-alive, and the
+        # request is re-sent on a fresh connection only when that cannot
+        # repeat its effect (see _may_replay). A read timeout after a
+        # POST was processed used to be replayed like any other error.
         # Failure on a *fresh* fd is a real error.
         stream.close()
         if not attempted_pooled:
-            raise NetworkError("HTTP/1.1 pooled request failed")
+            raise NetworkError("HTTP/1.1 pooled request failed: " + read_err)
+        if not _may_replay(_wire_method(wire), io_failed, read_err):
+            raise NetworkError("HTTP/1.1 request failed: " + read_err)
 
         var fresh = _connect_with_fallback(host, port, self._timeout_ms)
         self._arm_read_timeout(fresh)
@@ -2459,7 +2674,9 @@ struct HttpClient(Movable):
         if len(body) > 0:
             fresh.write_all(Span[UInt8, _](body))
         var can_reuse2 = False
-        var resp2 = _read_http_response_framed_tcp(fresh, can_reuse2)
+        var resp2 = _read_http_response_framed_tcp(
+            fresh, can_reuse2, _wire_method(wire)
+        )
         if can_reuse2:
             var fd2 = Int(fresh._socket.fd)
             fresh._socket.fd = INVALID_FD

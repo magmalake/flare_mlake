@@ -46,6 +46,7 @@ from flare.quic import (
     QuicListener,
     QuicServerConfig,
     StreamFrame,
+    CidKey,
     cid_to_hex,
     decode_packet_number,
     encode_long_header,
@@ -53,6 +54,14 @@ from flare.quic import (
     encode_varint,
     protect_initial_packet,
     unprotect_initial_packet,
+)
+from flare.quic.state import (
+    CONN_STATE_CLOSING,
+    CONN_STATE_ESTABLISHED,
+    CONN_STATE_HANDSHAKE,
+    empty_events,
+    handle_frame_buf,
+    new_connection,
 )
 
 
@@ -198,10 +207,14 @@ def test_protect_unprotect_round_trip() raises:
         )
 
 
-def test_handle_packet_drives_state_machine_through_stream_frame() raises:
-    """Build a synth Initial whose plaintext is a STREAM frame
-    on a fresh stream; assert the connection's stream slab grew
-    and the largest-received packet number advanced."""
+def test_initial_carrying_a_stream_frame_is_a_protocol_violation() raises:
+    """An Initial is protected with keys anyone can derive from its
+    DCID, so RFC 9000 sec 12.4 allows only PADDING, PING, ACK, CRYPTO
+    and CONNECTION_CLOSE in it. This test used to assert the opposite:
+    a STREAM frame in an Initial grew the stream slab, which is how a
+    request could run without a handshake."""
+    from flare.quic.state import CONN_STATE_CLOSING
+
     var dcid = _make_cid(UInt8(0x30), 8)
     var scid = _make_cid(UInt8(0x40), 8)
     var stream_bytes = _stream_frame_bytes(UInt64(4), _bytes(72, 73))
@@ -216,46 +229,126 @@ def test_handle_packet_drives_state_machine_through_stream_frame() raises:
         is_server=False,
     )
     var qc = QuicConnection(dcid, scid)
-    var events = qc.handle_packet(
-        Span[UInt8, _](protected), now_us=UInt64(1_000_000)
-    )
-    assert_equal(qc.conn.largest_received_packet, UInt64(0))
-    assert_equal(len(events.new_streams), 1)
-    assert_equal(events.new_streams[0], UInt64(4))
-    assert_equal(len(qc.conn.streams), 1)
+    var raised = False
+    try:
+        _ = qc.handle_packet(
+            Span[UInt8, _](protected), now_us=UInt64(1_000_000)
+        )
+    except:
+        raised = True
+    assert_true(raised, "a STREAM frame in an Initial was accepted")
+    assert_equal(len(qc.conn.streams), 0)
+    assert_equal(qc.conn.state, CONN_STATE_CLOSING)
 
 
-def test_listener_dispatch_routes_into_handle_packet() raises:
-    """End-to-end: dispatch_datagram allocates a new slot for an
-    unknown Initial *and* feeds the same datagram through
-    handle_packet on the new slot, so the stream-slab grows in
-    one call."""
-    var listener = _bind_loopback()
-    var dcid = _make_cid(UInt8(0x50), 8)
-    var scid = _make_cid(UInt8(0x60), 8)
-    var stream_bytes = _stream_frame_bytes(UInt64(0), _bytes(0x41))
-    var plaintext = _padded_plaintext(stream_bytes, 64)
+def test_server_rejects_handshake_done_from_the_client() raises:
+    """QUIC-09 (RFC 9000 sec 19.20): a server treats a received
+    HANDSHAKE_DONE as a PROTOCOL_VIOLATION. The frame must not move the
+    connection to ESTABLISHED or surface the handshake_done event."""
+    var qc = QuicConnection(_make_cid(UInt8(1), 8), _make_cid(UInt8(0x40), 8))
+    var payload = _bytes(0x1E)
+    var raised = False
+    try:
+        var ev = qc.dispatch_plaintext(
+            Span[UInt8, _](payload), UInt64(1_000_000), UInt64(0)
+        )
+        assert_false(ev.handshake_done)
+    except e:
+        raised = True
+        assert_true("PROTOCOL_VIOLATION" in String(e))
+    assert_true(raised, "the server accepted HANDSHAKE_DONE")
+    assert_equal(qc.conn.state, CONN_STATE_CLOSING)
+    assert_false(qc.conn.handshake_complete)
+
+
+def test_server_rejects_handshake_done_after_other_frames() raises:
+    """The rejection also holds when HANDSHAKE_DONE follows a PING in the
+    same packet, and once the connection is established."""
+    var qc = QuicConnection(_make_cid(UInt8(1), 8), _make_cid(UInt8(0x40), 8))
+    qc.conn.state = CONN_STATE_ESTABLISHED
+    qc.conn.handshake_complete = True
+    var payload = _bytes(0x01, 0x1E)
+    var raised = False
+    try:
+        _ = qc.dispatch_plaintext(
+            Span[UInt8, _](payload), UInt64(1_000_000), UInt64(0)
+        )
+    except e:
+        raised = True
+    assert_true(raised, "the established server accepted HANDSHAKE_DONE")
+    assert_equal(qc.conn.state, CONN_STATE_CLOSING)
+
+
+def test_client_role_still_accepts_handshake_done() raises:
+    """The sans-I/O Connection used by the client keeps applying
+    HANDSHAKE_DONE (only the server role rejects it)."""
+    var conn = new_connection()
+    var ev = empty_events()
+    var payload = _bytes(0x1E)
+    _ = handle_frame_buf(conn, Span[UInt8, _](payload), UInt64(1_000), ev)
+    assert_true(ev.handshake_done)
+    assert_equal(conn.state, CONN_STATE_ESTABLISHED)
+    assert_true(conn.state != CONN_STATE_HANDSHAKE)
+
+
+def test_handle_packet_applies_a_permitted_initial() raises:
+    """PING + PADDING is what an Initial may carry: it is processed and
+    the largest received packet number advances."""
+    var dcid = _make_cid(UInt8(0x31), 8)
+    var scid = _make_cid(UInt8(0x41), 8)
+    var ping = List[UInt8]()
+    ping.append(UInt8(0x01))
+    var plaintext = _padded_plaintext(ping, 64)
     var prefix = _build_initial_prefix(dcid, scid, 1, len(plaintext))
     var protected = protect_initial_packet(
         Span[UInt8, _](prefix),
-        packet_number=UInt64(0),
+        packet_number=UInt64(5),
         pn_length=1,
         plaintext=Span[UInt8, _](plaintext),
         dcid=dcid,
         is_server=False,
     )
+    var qc = QuicConnection(dcid, scid)
+    _ = qc.handle_packet(Span[UInt8, _](protected), now_us=UInt64(1_000_000))
+    assert_equal(qc.conn.largest_received_packet, UInt64(5))
+
+
+def test_listener_dispatch_routes_into_handle_packet() raises:
+    """End-to-end: dispatch_datagram allocates a new slot for an
+    unknown Initial *and* feeds the same datagram through
+    handle_packet on the new slot, so its packet number is recorded
+    in one call."""
+    var listener = _bind_loopback()
+    var dcid = _make_cid(UInt8(0x50), 8)
+    var scid = _make_cid(UInt8(0x60), 8)
+    var ping = List[UInt8]()
+    ping.append(UInt8(0x01))
+    var plaintext = _padded_plaintext(ping, 64)
+    var prefix = _build_initial_prefix(dcid, scid, 1, len(plaintext))
+    var protected = protect_initial_packet(
+        Span[UInt8, _](prefix),
+        packet_number=UInt64(7),
+        pn_length=1,
+        plaintext=Span[UInt8, _](plaintext),
+        dcid=dcid,
+        is_server=False,
+    )
+    while len(protected) < 1200:  # RFC 9000 sec 14.1 datagram floor
+        protected.append(UInt8(0))
     var peer = SocketAddr(IpAddr.localhost(), UInt16(54321))
     var slot = listener.dispatch_datagram(Span[UInt8, _](protected), peer)
     assert_equal(slot, 0)
     assert_equal(listener.connection_count(), 1)
-    assert_equal(listener.cid_table.lookup(cid_to_hex(dcid)), 0)
+    assert_equal(listener.cid_table.lookup(CidKey(dcid)), 0)
     var qc = listener.connections[0].copy()
-    assert_equal(qc.conn.largest_received_packet, UInt64(0))
     assert_equal(
-        len(qc.conn.streams),
-        1,
+        qc.conn.largest_received_packet,
+        UInt64(7),
         "dispatch_datagram must drive handle_packet, not just route",
     )
+    # Inbound processing ran on a clock stuck at 0, so activity time
+    # never moved and the 0-RTT strike set never aged.
+    assert_true(qc.conn.last_activity_us > UInt64(0), "clock was 0")
 
 
 def test_dispatch_garbled_initial_drops_silently() raises:
@@ -286,6 +379,8 @@ def test_dispatch_garbled_initial_drops_silently() raises:
     var dcid_offset = 5 + 1
     for i in range(len(dcid_b.bytes)):
         mutated[dcid_offset + i] = dcid_b.bytes[i]
+    while len(mutated) < 1200:  # RFC 9000 sec 14.1 datagram floor
+        mutated.append(UInt8(0))
     var peer = SocketAddr(IpAddr.localhost(), UInt16(54321))
     var slot = listener.dispatch_datagram(Span[UInt8, _](mutated), peer)
     assert_equal(slot, 0)
@@ -334,13 +429,42 @@ def test_handle_packet_drops_handshake_long_silently() raises:
     assert_equal(len(events.new_streams), 0)
 
 
+def test_listener_drops_an_initial_under_1200_bytes() raises:
+    """The server accepted an Initial of any size, so a 60-byte spoofed
+    packet bought a full handshake flight (RFC 9000 sec 14.1)."""
+    var listener = _bind_loopback()
+    var dcid = _make_cid(UInt8(0x52), 8)
+    var scid = _make_cid(UInt8(0x62), 8)
+    var ping = List[UInt8]()
+    ping.append(UInt8(0x01))
+    var plaintext = _padded_plaintext(ping, 64)
+    var prefix = _build_initial_prefix(dcid, scid, 1, len(plaintext))
+    var protected = protect_initial_packet(
+        Span[UInt8, _](prefix),
+        packet_number=UInt64(0),
+        pn_length=1,
+        plaintext=Span[UInt8, _](plaintext),
+        dcid=dcid,
+        is_server=False,
+    )
+    var peer = SocketAddr(IpAddr.localhost(), UInt16(54321))
+    var slot = listener.dispatch_datagram(Span[UInt8, _](protected), peer)
+    assert_equal(slot, -1)
+    assert_equal(listener.connection_count(), 0)
+
+
 def main() raises:
     test_decode_packet_number_rfc_a3()
     test_decode_packet_number_no_wrap()
     test_protect_unprotect_round_trip()
-    test_handle_packet_drives_state_machine_through_stream_frame()
+    test_initial_carrying_a_stream_frame_is_a_protocol_violation()
+    test_server_rejects_handshake_done_from_the_client()
+    test_server_rejects_handshake_done_after_other_frames()
+    test_client_role_still_accepts_handshake_done()
+    test_handle_packet_applies_a_permitted_initial()
     test_listener_dispatch_routes_into_handle_packet()
+    test_listener_drops_an_initial_under_1200_bytes()
     test_dispatch_garbled_initial_drops_silently()
     test_handle_packet_drops_short_header_silently()
     test_handle_packet_drops_handshake_long_silently()
-    print("test_quic_handle_packet: 8 passed")
+    print("test_quic_handle_packet: 13 passed")

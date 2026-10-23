@@ -19,6 +19,7 @@ from std.testing import assert_equal, assert_false, assert_raises, assert_true
 
 from flare.crypto import hmac_sha256
 from flare.http import (
+    DEFAULT_SESSION_TTL_S,
     BackedSessionStore,
     CookieSessionStore,
     InMemorySessionStore,
@@ -138,9 +139,31 @@ def test_cookie_store_missing_returns_empty() raises:
 
 def test_cookie_store_short_key_raises() raises:
     var bad_key = List[UInt8](length=8, fill=UInt8(1))
-    var store = CookieSessionStore(key=bad_key)
     with assert_raises():
-        _ = store.encode("oops")
+        _ = CookieSessionStore(key=bad_key)
+    with assert_raises():
+        _ = InMemorySessionStore(key=List[UInt8]())
+
+
+def test_cookie_forged_under_an_empty_key_is_rejected() raises:
+    """The bypass: a store built from an unset env var got an empty key,
+    refused to sign, and verified anything HMAC'd under the empty key.
+    """
+    var forged = signed_cookie_encode(
+        List[UInt8](String('{"user":"admin"}').as_bytes()), List[UInt8]()
+    )
+    with assert_raises():
+        _ = signed_cookie_decode(forged, List[UInt8]())
+    var store = CookieSessionStore(key=_make_key("k"))
+    var req = Request(method=Method.GET, url="/")
+    req.headers.set("Cookie", "flare_session=" + forged)
+    assert_false(store.load(req).present)
+
+
+def test_short_rotation_key_is_refused() raises:
+    var store = CookieSessionStore(key=_make_key("k"))
+    with assert_raises():
+        store.add_previous_key(List[UInt8]())
 
 
 def test_cookie_store_tampered_returns_empty() raises:
@@ -292,6 +315,136 @@ def test_session_store_trait_generic_over_impls() raises:
     assert_equal(s.value, "z")
 
 
+def test_cookie_store_keeps_utf8_values() raises:
+    var store = CookieSessionStore(key=_make_key("k"))
+    var enc = store.encode(String("名前=Zoë"))
+    var req = Request(method=Method.GET, url="/")
+    req.headers.set("Cookie", "flare_session=" + enc)
+    var s = store.load(req)
+    assert_true(s.present)
+    assert_equal(s.value, String("名前=Zoë"))
+
+
+# ── Server-side expiry (DOC-06) ───────────────────────────────────────────
+
+
+def _cookie_req(name: String, value: String) raises -> Request:
+    var req = Request(method=Method.GET, url="/")
+    req.headers.set("Cookie", name + "=" + value)
+    return req^
+
+
+def test_default_session_ttl_is_one_day() raises:
+    assert_equal(DEFAULT_SESSION_TTL_S, 86400)
+
+
+def test_cookie_store_cookie_expires_server_side() raises:
+    var store = CookieSessionStore(key=_make_key("k"), ttl_s=100)
+    var enc = store.encode_at("alice", 1000)
+    var req = _cookie_req("flare_session", enc)
+    assert_true(store.load_at(req, 1000).present)
+    assert_true(store.load_at(req, 1099).present)
+    assert_false(store.load_at(req, 1100).present)
+    assert_false(store.load_at(req, 1000 + 10 * 365 * 86400).present)
+
+
+def test_cookie_store_default_lifetime_is_bounded() raises:
+    var store = CookieSessionStore(key=_make_key("k"))
+    var enc = store.encode_at("alice", 0)
+    var req = _cookie_req("flare_session", enc)
+    assert_true(store.load_at(req, DEFAULT_SESSION_TTL_S - 1).present)
+    assert_false(store.load_at(req, DEFAULT_SESSION_TTL_S).present)
+
+
+def test_cookie_store_refuses_a_signed_value_without_expiry() raises:
+    """The repro: a payload that is just a validly signed value (what the
+    old ``encode`` emitted) carries no expiry and is refused."""
+    var key = _make_key("k")
+    var store = CookieSessionStore(key=key)
+    var bare = signed_cookie_encode(_bytes("user=alice"), key)
+    assert_false(store.load(_cookie_req("flare_session", bare)).present)
+    assert_false(store.load_at(_cookie_req("flare_session", bare), 0).present)
+    var past = signed_cookie_encode(_bytes("1|user=alice"), key)
+    assert_false(store.load(_cookie_req("flare_session", past)).present)
+    var junk = signed_cookie_encode(_bytes("12x|user=alice"), key)
+    assert_false(store.load_at(_cookie_req("flare_session", junk), 0).present)
+
+
+def test_cookie_store_ttl_zero_opts_out_of_expiry() raises:
+    var store = CookieSessionStore(key=_make_key("k"), ttl_s=0)
+    var enc = store.encode_at("alice", 5)
+    var req = _cookie_req("flare_session", enc)
+    assert_true(store.load_at(req, 5 + 10 * 365 * 86400).present)
+
+
+def test_cookie_store_value_may_contain_the_separator() raises:
+    var store = CookieSessionStore(key=_make_key("k"))
+    var enc = store.encode_at("a|b|c", 10)
+    var s = store.load_at(_cookie_req("flare_session", enc), 11)
+    assert_true(s.present)
+    assert_equal(s.value, "a|b|c")
+
+
+def test_cookie_store_expiry_survives_key_rotation() raises:
+    var old_key = _make_key("old")
+    var old_store = CookieSessionStore(key=old_key, ttl_s=50)
+    var enc = old_store.encode_at("alice", 0)
+    var store = CookieSessionStore(key=_make_key("new"), ttl_s=50)
+    store.add_previous_key(old_key)
+    var req = _cookie_req("flare_session", enc)
+    assert_true(store.load_at(req, 49).present)
+    assert_false(store.load_at(req, 50).present)
+
+
+def test_in_memory_store_entry_expires_server_side() raises:
+    var store = InMemorySessionStore(key=_make_key("k"), ttl_s=100)
+    store.insert_at("sid-1", "alice", 1000)
+    var req = _cookie_req("flare_session", store.encode_id("sid-1"))
+    assert_true(store.load_at(req, 1099).present)
+    assert_false(store.load_at(req, 1100).present)
+    assert_equal(store.__len__(), 1)
+    assert_equal(store.sweep(1100), 1)
+    assert_equal(store.__len__(), 0)
+
+
+def test_in_memory_store_reinsert_refreshes_the_expiry() raises:
+    var store = InMemorySessionStore(key=_make_key("k"), ttl_s=100)
+    store.insert_at("sid-1", "alice", 1000)
+    store.insert_at("sid-1", "alice", 1050)
+    var req = _cookie_req("flare_session", store.encode_id("sid-1"))
+    assert_true(store.load_at(req, 1149).present)
+    assert_false(store.load_at(req, 1150).present)
+
+
+def test_in_memory_store_default_lifetime_is_bounded() raises:
+    var store = InMemorySessionStore(key=_make_key("k"))
+    store.insert_at("sid-1", "alice", 0)
+    var req = _cookie_req("flare_session", store.encode_id("sid-1"))
+    assert_false(store.load_at(req, DEFAULT_SESSION_TTL_S).present)
+    var forever = InMemorySessionStore(key=_make_key("k"), ttl_s=0)
+    forever.insert_at("sid-1", "alice", 0)
+    assert_true(forever.load_at(req, 10 * 365 * 86400).present)
+
+
+def test_backed_store_default_ttl_expires_the_session() raises:
+    var store = BackedSessionStore[MemorySessionBackend](
+        MemorySessionBackend(), key=_make_key("k")
+    )
+    var cookie = store.save("alice", now_s=0)
+    var req = _cookie_req("flare_session", cookie)
+    assert_true(store.load(req, now_s=10).present)
+    assert_false(store.load(req, now_s=10 * 365 * 86400).present)
+
+
+def test_backed_store_ttl_zero_opts_out_of_expiry() raises:
+    var store = BackedSessionStore[MemorySessionBackend](
+        MemorySessionBackend(), key=_make_key("k"), ttl_s=0
+    )
+    var cookie = store.save("alice", now_s=0)
+    var req = _cookie_req("flare_session", cookie)
+    assert_true(store.load(req, now_s=10 * 365 * 86400).present)
+
+
 def main() raises:
     test_signed_cookie_roundtrip()
     test_tampered_mac_rejected()
@@ -304,6 +457,8 @@ def main() raises:
     test_cookie_store_encode_load()
     test_cookie_store_missing_returns_empty()
     test_cookie_store_short_key_raises()
+    test_cookie_forged_under_an_empty_key_is_rejected()
+    test_short_rotation_key_is_refused()
     test_cookie_store_tampered_returns_empty()
     test_in_memory_store_insert_load()
     test_in_memory_store_remove()
@@ -317,4 +472,17 @@ def main() raises:
     test_backed_store_expired_session_is_empty()
     test_backed_store_forged_cookie_is_empty()
     test_session_store_trait_generic_over_impls()
-    print("test_session: 24 passed")
+    test_cookie_store_keeps_utf8_values()
+    test_default_session_ttl_is_one_day()
+    test_cookie_store_cookie_expires_server_side()
+    test_cookie_store_default_lifetime_is_bounded()
+    test_cookie_store_refuses_a_signed_value_without_expiry()
+    test_cookie_store_ttl_zero_opts_out_of_expiry()
+    test_cookie_store_value_may_contain_the_separator()
+    test_cookie_store_expiry_survives_key_rotation()
+    test_in_memory_store_entry_expires_server_side()
+    test_in_memory_store_reinsert_refreshes_the_expiry()
+    test_in_memory_store_default_lifetime_is_bounded()
+    test_backed_store_default_ttl_expires_the_session()
+    test_backed_store_ttl_zero_opts_out_of_expiry()
+    print("test_session: 39 passed")

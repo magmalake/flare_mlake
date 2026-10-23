@@ -8,6 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-23
+
+Tracks upstream **flare v0.13.0** (`00f5636d`, main at `8fe83c5e`), 434
+commits past `c3dc933`, including upstream's own move to Mojo 1.2.0.
+
+### Changed
+- **Mojo 1.2.0.** `mojo >=1.2.0,<2.0.0`, upstream's floor, in `pixi.toml` and
+  the recipe; the consume smoke project pins `==1.2.0`.
+- **`_thread.mojo` is upstream's again, with a two-call delta.** Upstream
+  rebuilt its threading on Mojo's AsyncRT pool (`spawn`, `spawn_serving`,
+  `wait_started`, affinity save/restore). The adapter this distribution
+  carried could not express that, so the file is now upstream's, and only
+  `spawn_os` and the OS-thread `join` go through threads.mojo: those are the
+  two symbols whose signatures still differ. `pthread_self`, `pthread_detach`,
+  `pthread_setaffinity_np`, `sysconf` and `sched_yield` are now spelled
+  identically on both sides.
+- Takes upstream's brotli and fs wrapper builds and its `libdeflate` and
+  `libbrotli* >=1.2.1` pins. The simdjson wrapper stays json_mlake's, as before;
+  upstream's recipe inlines json's source and this one depends on the package.
+- `json_mlake >=0.4.2,<0.5`, the Mojo 1.2.0 sync of json.
+
+### Removed — deltas upstream has absorbed
+- **The four carried pull requests** (#11, #14, #15, #16), all merged upstream.
+
 ## [0.10.2] - 2026-09-21
 
 Tracks upstream **flare main** at `c3dc933`, 72 commits past `1e92aa3`,

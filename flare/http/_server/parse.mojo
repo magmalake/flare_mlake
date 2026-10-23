@@ -16,14 +16,19 @@ from ..request import Request
 from ..headers import HeaderMap
 from ..proto.ascii import ascii_eq_ignore_case
 from ..proto.h1_leniency import H1LeniencyConfig
+from ..proto.chunked import TE_CHUNKED, classify_transfer_coding
+from .._scan import parse_content_length
+from ...io.byte_cursor import _is_valid_utf8
 from ...net import IpAddr, SocketAddr
 from ...tcp import TcpStream
 
 from .parse_util import (
     _ascii_safe,
+    _is_valid_http_version,
     _ascii_strip_slice,
     _ascii_unchecked_string,
     _find_crlfcrlf,
+    _is_field_value_char,
     _is_token_char,
     _parse_int_str,
     _read_line_buf,
@@ -32,34 +37,36 @@ from .parse_util import (
 )
 
 
-def _is_valid_http_version(v: String) raises -> Bool:
-    """RFC 9112 sec 2.3: ``HTTP/<DIGIT>.<DIGIT>`` and nothing else.
+def _check_field_value(v: String, accept_obs_text: Bool) raises:
+    """Refuse a field value that RFC 9110 sec 5.5 does not allow.
 
-    Without this any third token parses as a version, so a garbage
-    request line is answered 404 instead of 400 -- and a peer that
-    opened with something like an invalid HTTP/2 preface is left
-    holding a keep-alive connection it cannot interpret."""
-    if v.byte_length() != 8:
-        return False
-    var p = v.unsafe_ptr()
-    if (
-        p[unsafe_offset=0] != UInt8(ord("H"))
-        or p[unsafe_offset=1] != UInt8(ord("T"))
-        or p[unsafe_offset=2] != UInt8(ord("T"))
-        or p[unsafe_offset=3] != UInt8(ord("P"))
-        or p[unsafe_offset=4] != UInt8(ord("/"))
-        or p[unsafe_offset=6] != UInt8(ord("."))
-    ):
-        return False
-    if p[unsafe_offset=5] < UInt8(ord("0")) or p[unsafe_offset=5] > UInt8(
-        ord("9")
-    ):
-        return False
-    if p[unsafe_offset=7] < UInt8(ord("0")) or p[unsafe_offset=7] > UInt8(
-        ord("9")
-    ):
-        return False
-    return True
+    Runs on the value of a field's first line and on every obs-fold
+    continuation (RFC 9112 sec 5.2: the unfolded value is still a field
+    value; the continuation used to skip this check).
+
+    Bare CR / LF / NUL are always rejected (the smuggling-class bytes);
+    so is every other control byte (0x01-0x08, 0x0B-0x1F, DEL), which is
+    outside field-vchar. High-bit obs-text is gated on
+    ``accept_obs_text``. obs-text is opaque octets on the wire, but the
+    value is stored as a ``String``, which must hold valid UTF-8, so
+    obs-text that is not valid UTF-8 is refused too.
+
+    Raises:
+        Error: On the first offending byte.
+    """
+    var has_obs_text = False
+    for i in range(v.byte_length()):
+        var vc = v.unsafe_ptr()[unsafe_offset=i]
+        if vc == 0 or vc == 10 or vc == 13:
+            raise Error("invalid control character in header value")
+        if vc >= 128:
+            if not accept_obs_text:
+                raise Error("obs-text byte in header value rejected")
+            has_obs_text = True
+        elif not _is_field_value_char(vc):
+            raise Error("invalid control character in header value")
+    if has_obs_text and not _is_valid_utf8(v.as_bytes()):
+        raise Error("obs-text header value is not valid UTF-8")
 
 
 def _parse_http_request_bytes(
@@ -129,8 +136,14 @@ def _parse_http_request_bytes(
         if req_line.unsafe_ptr()[unsafe_offset=i] == 32:
             sp1 = i
             break
-    if sp1 < 0:
+    if sp1 <= 0:
         raise Error("malformed request line: " + _ascii_safe(req_line))
+    # RFC 9110 sec 9.1: a method is a token. Without this a request
+    # line such as ``TRANSFER-ENCODING:CHUNKED / HTTP/1.1`` or one with
+    # control bytes in the method reached routing and the handler.
+    for i in range(sp1):
+        if not _is_token_char(req_line.unsafe_ptr()[unsafe_offset=i]):
+            raise Error("invalid character in request method")
     # B3: try the StaticString intern table first — covers the 9
     # RFC 7231 method names (~99 % of real-world traffic is GET /
     # POST). On a hit, the returned String's backing comes from
@@ -191,6 +204,17 @@ def _parse_http_request_bytes(
     if not _is_valid_http_version(version):
         raise Error("malformed HTTP version in request line: " + version)
 
+    # RFC 9112 sec 3.2: the request-target is visible ASCII. A CR, a
+    # control byte or a high byte here reached ``req.url`` wrapped by
+    # ``_ascii_unchecked_string``, i.e. as a String that need not be
+    # valid UTF-8, and from there any log line or redirect built from it.
+    if path.byte_length() == 0:
+        raise Error("empty request target")
+    for i in range(path.byte_length()):
+        var tc = path.unsafe_ptr()[unsafe_offset=i]
+        if tc < 33 or tc > 126:
+            raise Error("invalid character in request target")
+
     if (
         not leniency.allow_oversized_request_uri
         and path.byte_length() > max_uri_length
@@ -206,6 +230,8 @@ def _parse_http_request_bytes(
     var prev_header_value = String("")
     var have_prev = False
     var content_length_seen: Int = -1
+    var te_joined = String("")
+    var te_seen = False
 
     while True:
         var line = _read_line_buf_lenient(
@@ -222,6 +248,8 @@ def _parse_http_request_bytes(
                 + " bytes"
             )
         if line.byte_length() == 0:
+            if have_prev:
+                headers.append(prev_header_name, prev_header_value)
             break
 
         # RFC 9112 §5.2 obs-fold: a continuation line starts with
@@ -233,8 +261,10 @@ def _parse_http_request_bytes(
             if not leniency.allow_obs_fold or not have_prev:
                 raise Error("obs-fold rejected (request smuggling vector)")
             var folded = _ascii_strip_slice(line.as_bytes())
+            # A continuation is field content like any other line's value
+            # (RFC 9112 sec 5.2): it gets the same byte checks.
+            _check_field_value(folded, leniency.accept_obs_text_in_field_value)
             prev_header_value = prev_header_value + " " + folded
-            headers.set(prev_header_name, prev_header_value)
             continue
 
         var colon = -1
@@ -243,7 +273,10 @@ def _parse_http_request_bytes(
                 colon = i
                 break
         if colon < 0:
-            continue
+            # A field line with no colon is malformed (RFC 9112 sec 5).
+            # Skipping it let `Transfer-Encoding chunked` vanish here
+            # while a more forgiving front end honoured it.
+            raise Error("header line without a colon")
 
         # RFC 9112 §5.1: no whitespace before the colon. Strict
         # rejects; lenient strips trailing whitespace from the
@@ -257,6 +290,8 @@ def _parse_http_request_bytes(
                 else:
                     break
 
+        if name_end == 0:
+            raise Error("empty header field name")
         var name_valid = True
         for i in range(name_end):
             if not _is_token_char(line.unsafe_ptr()[unsafe_offset=i]):
@@ -268,23 +303,16 @@ def _parse_http_request_bytes(
         var k = _ascii_strip_slice(line.as_bytes()[:name_end])
         var v = _ascii_strip_slice(line.as_bytes()[colon + 1 :])
 
-        # RFC 9112 §5.5: bare CR / LF / NUL always rejected (those
-        # are the smuggling-class bytes). High-bit obs-text is
-        # gated on the leniency flag — strict rejects; lenient
-        # treats the bytes as opaque.
-        for i in range(v.byte_length()):
-            var vc = v.unsafe_ptr()[unsafe_offset=i]
-            if vc == 0 or vc == 10 or vc == 13:
-                raise Error("invalid control character in header value")
-            if vc >= 128 and not leniency.accept_obs_text_in_field_value:
-                raise Error("obs-text byte in header value rejected")
+        _check_field_value(v, leniency.accept_obs_text_in_field_value)
 
         # RFC 9112 §6.3.5: duplicate ``Content-Length`` headers are
         # smuggling vectors unless every value agrees. Strict
         # treats the second occurrence as malformed; the leniency
         # flag accepts when the values match.
         if ascii_eq_ignore_case(k, "content-length"):
-            var n = _parse_int_str(v)
+            var n = parse_content_length(v)
+            if n < 0:
+                raise Error("malformed Content-Length: " + v)
             if content_length_seen >= 0 and n != content_length_seen:
                 raise Error(
                     "duplicate Content-Length headers with conflicting values"
@@ -296,10 +324,28 @@ def _parse_http_request_bytes(
                 raise Error("duplicate Content-Length headers rejected")
             content_length_seen = n
 
-        headers.set(k, v)
+        if ascii_eq_ignore_case(k, "transfer-encoding"):
+            if te_seen:
+                te_joined += ","
+            te_joined += v
+            te_seen = True
+
+        # Fields are appended, not set: a repeated field keeps every
+        # value (Cookie, Accept, ...), and ``get`` still answers with the
+        # first one. The previous field is committed only now, once we
+        # know this line is not an obs-fold continuation of it.
+        if have_prev:
+            headers.append(prev_header_name, prev_header_value)
         prev_header_name = k
         prev_header_value = v
         have_prev = True
+
+    # RFC 9112 sec 3.2: a request with more than one Host field gets a
+    # 400. With last-wins storage the second Host silently replaced the
+    # first, and a proxy that routed on the first sent flare a request
+    # for a different virtual host than the one it checked.
+    if len(headers.get_all("host")) > 1:
+        raise Error("more than one Host header")
 
     # RFC 9112 §6.3: ``Transfer-Encoding`` + ``Content-Length`` is
     # ambiguous. Strict rejects (smuggling-safe); the leniency
@@ -308,8 +354,17 @@ def _parse_http_request_bytes(
     # chunked request bodies, so the lenient path produces a
     # zero-body request; the flag still has parser-time effect
     # because it controls whether the request is rejected at all.
-    var te = headers.get("Transfer-Encoding").lower()
-    if "chunked" in te:
+    #
+    # Every Transfer-Encoding line counts (RFC 9110 sec 5.3), not the
+    # last one ``headers.set`` happened to keep: the reactor frames on
+    # the same joined list, and a parser that saw only the last line
+    # could be talked into CL.TE with ``TE: chunked`` + ``TE: identity``.
+    if te_seen:
+        var framing = classify_transfer_coding(te_joined)
+        if framing != TE_CHUNKED:
+            raise Error(
+                "unsupported or malformed Transfer-Encoding: " + te_joined
+            )
         if content_length_seen >= 0:
             if not leniency.allow_te_chunked_when_cl_present:
                 raise Error(
@@ -331,7 +386,17 @@ def _parse_http_request_bytes(
         if content_length > 0:
             var end = pos + content_length
             if end > len(data):
-                end = len(data)
+                # The caller framed fewer bytes than this request
+                # declares. Truncating silently would leave the rest
+                # of the body in the connection's buffer, where it is
+                # parsed as the next request.
+                raise Error(
+                    "request body shorter than its Content-Length ("
+                    + String(len(data) - pos)
+                    + " of "
+                    + String(content_length)
+                    + " bytes)"
+                )
             # Bulk-copy the body in one resize + memcpy. Per-byte
             # ``body.append`` was a measurable hot-path cost on POSTs.
             var n2 = end - pos
@@ -346,7 +411,7 @@ def _parse_http_request_bytes(
     var req = Request(
         method=method,
         url=path,
-        body=body^,
+        body=body,
         version=version,
         peer=peer,
         expose_errors=expose_errors,
@@ -461,7 +526,9 @@ def _parse_http_request_bytes_minimal(
         var body_start = header_end
         var body_end = body_start + content_length
         if body_end > len(data):
-            body_end = len(data)
+            # Same rule as the full parser: never serve a truncated
+            # body, the remainder would be read as the next request.
+            raise Error("request body shorter than its Content-Length")
         var n = body_end - body_start
         if n > 0:
             body.resize(n, UInt8(0))
@@ -474,7 +541,7 @@ def _parse_http_request_bytes_minimal(
     var req = Request(
         method=method,
         url=path,
-        body=body^,
+        body=body,
         version=version,
         peer=peer,
         expose_errors=expose_errors,
@@ -510,6 +577,8 @@ def _parse_http_request(
         var hdr_end = _find_crlfcrlf(buf, 0)
         if hdr_end >= 0:
             var cl = _scan_content_length(buf, hdr_end)
+            if cl < 0:
+                raise Error("malformed Content-Length")
             var total = hdr_end + cl
             while len(buf) < total:
                 n = stream.read(read_buf.unsafe_ptr(), 8192)
@@ -523,5 +592,5 @@ def _parse_http_request(
                 max_body_size,
                 peer=stream.peer_addr(),
             )
-        if len(buf) > max_header_size + max_body_size:
+        if len(buf) - max_header_size > max_body_size:
             raise Error("request too large")

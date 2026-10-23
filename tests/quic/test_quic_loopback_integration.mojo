@@ -59,6 +59,7 @@ from flare.quic import (
     QuicListener,
     QuicServerConfig,
     StreamFrame,
+    CidKey,
     cid_to_hex,
     encode_long_header,
     encode_stream,
@@ -138,18 +139,16 @@ def _build_synth_initial(
     dcid: ConnectionId,
     scid: ConnectionId,
     packet_number: UInt64,
-    stream_id: UInt64,
-    stream_payload: List[UInt8],
 ) raises -> List[UInt8]:
-    """Compose the full encrypted Initial datagram a real QUIC
-    client would put on the wire for its first ack-eliciting
-    Initial. Plaintext is one STREAM frame + PADDING up to a
-    64-byte ciphertext envelope (above the HP-sample lower
-    bound)."""
-    var stream_bytes = _stream_frame_bytes(stream_id, stream_payload.copy())
-    var plaintext = _padded_plaintext(stream_bytes, 64)
+    """Compose an encrypted, ack-eliciting Initial datagram. Plaintext
+    is a PING + PADDING up to a 64-byte ciphertext envelope (above the
+    HP-sample lower bound). It carried a STREAM frame, which RFC 9000
+    sec 12.4 does not allow in an Initial and the server now refuses."""
+    var ping = List[UInt8]()
+    ping.append(UInt8(0x01))
+    var plaintext = _padded_plaintext(ping, 64)
     var prefix = _build_initial_prefix(dcid, scid, 1, len(plaintext))
-    return protect_initial_packet(
+    var dg = protect_initial_packet(
         Span[UInt8, _](prefix),
         packet_number=packet_number,
         pn_length=1,
@@ -157,6 +156,11 @@ def _build_synth_initial(
         dcid=dcid,
         is_server=False,
     )
+    # RFC 9000 sec 14.1: the server drops an Initial in a datagram
+    # under 1200 bytes. Trailing zeros are datagram padding.
+    while len(dg) < 1200:
+        dg.append(UInt8(0))
+    return dg^
 
 
 def _bind_listener(idle_ms: UInt64 = UInt64(30_000)) raises -> QuicListener:
@@ -176,21 +180,14 @@ def test_loopback_initial_handshake_round_trip() raises:
     var client = UdpSocket.bind(SocketAddr(IpAddr.localhost(), UInt16(0)))
     var dcid = _make_cid(UInt8(0xA1), 8)
     var scid = _make_cid(UInt8(0xB2), 8)
-    var datagram = _build_synth_initial(
-        dcid, scid, UInt64(0), UInt64(4), _bytes(0x48, 0x49)
-    )
+    var datagram = _build_synth_initial(dcid, scid, UInt64(0))
     _ = client.send_to(Span[UInt8, _](datagram), server_addr)
     var got = listener.tick(500)
     assert_true(got, "listener.tick must observe the inbound datagram")
     assert_equal(listener.connection_count(), 1)
-    assert_equal(listener.cid_table.lookup(cid_to_hex(dcid)), 0)
+    assert_equal(listener.cid_table.lookup(CidKey(dcid)), 0)
     var qc = listener.connections[0].copy()
     assert_equal(qc.conn.largest_received_packet, UInt64(0))
-    assert_equal(
-        len(qc.conn.streams),
-        1,
-        "the STREAM frame must surface into the connection's stream slab",
-    )
     assert_true(qc.alive, "freshly-accepted connection must be alive")
     assert_true(
         qc.idle_timer_id != UInt64(0),
@@ -208,15 +205,11 @@ def test_loopback_retransmit_routes_to_existing_slot() raises:
     var client = UdpSocket.bind(SocketAddr(IpAddr.localhost(), UInt16(0)))
     var dcid = _make_cid(UInt8(0xC3), 8)
     var scid = _make_cid(UInt8(0xD4), 8)
-    var first = _build_synth_initial(
-        dcid, scid, UInt64(0), UInt64(0), _bytes(0x41)
-    )
+    var first = _build_synth_initial(dcid, scid, UInt64(0))
     _ = client.send_to(Span[UInt8, _](first), server_addr)
     _ = listener.tick(500)
     var first_timer = listener.connections[0].idle_timer_id
-    var retransmit = _build_synth_initial(
-        dcid, scid, UInt64(1), UInt64(0), _bytes(0x42)
-    )
+    var retransmit = _build_synth_initial(dcid, scid, UInt64(1))
     _ = client.send_to(Span[UInt8, _](retransmit), server_addr)
     _ = listener.tick(500)
     assert_equal(
@@ -246,20 +239,21 @@ def test_loopback_idle_close_retires_cid() raises:
     var client = UdpSocket.bind(SocketAddr(IpAddr.localhost(), UInt16(0)))
     var dcid = _make_cid(UInt8(0xE5), 8)
     var scid = _make_cid(UInt8(0xF6), 8)
-    var datagram = _build_synth_initial(
-        dcid, scid, UInt64(0), UInt64(0), _bytes(0x43)
-    )
+    var datagram = _build_synth_initial(dcid, scid, UInt64(0))
     _ = client.send_to(Span[UInt8, _](datagram), server_addr)
     _ = listener.tick(500)
     assert_equal(listener.connection_count(), 1)
     # Advance the wheel past the idle window to fire the idle
-    # timer + sweep the slot.
-    var fired = listener.advance_timers(now_ms=UInt64(200))
+    # timer + sweep the slot. The 100 ms timeout is raised to three
+    # PTOs (750 ms at the initial RTT; RFC 9000 sec 10.1).
+    var fired = listener.advance_timers(
+        now_ms=listener.timer_wheel.now_ms() + UInt64(2_000)
+    )
     assert_true(fired >= 1, "at least the idle timer must have fired")
     var qc = listener.connections[0].copy()
     assert_false(qc.alive, "idle expiry flips alive=False")
     assert_equal(
-        listener.cid_table.lookup(cid_to_hex(dcid)),
+        listener.cid_table.lookup(CidKey(dcid)),
         -1,
         "closed-slot CID must be retired from the routing table",
     )
@@ -331,9 +325,7 @@ def test_egress_build_initial_response_decrypts_at_client() raises:
     var listener = _bind_listener()
     var dcid = _make_cid(UInt8(0xAA), 8)
     var scid = _make_cid(UInt8(0xBB), 8)
-    var first = _build_synth_initial(
-        dcid, scid, UInt64(0), UInt64(0), _bytes(0x10)
-    )
+    var first = _build_synth_initial(dcid, scid, UInt64(0))
     # Run the accept path inline (no UDP socket) so the
     # listener materializes slot 0 with a peer address.
     var peer = SocketAddr(IpAddr.localhost(), UInt16(54321))
@@ -345,6 +337,9 @@ def test_egress_build_initial_response_decrypts_at_client() raises:
     for i in range(48):
         injected.append(UInt8(0xA0 + (i % 16)))
     listener.tls_egress_queues[0] = injected.copy()
+    # The synthetic Initial was ack-eliciting; its ACK would lead the
+    # payload. This test reads the CRYPTO frame alone.
+    listener.connections[0].lh_ack_pending[0] = False
     var datagram = listener._build_initial_response(0)
     assert_true(
         len(datagram) > 0,
@@ -385,9 +380,7 @@ def test_egress_drain_clears_queue_and_advances_counters() raises:
     var listener = _bind_listener()
     var dcid = _make_cid(UInt8(0xCC), 8)
     var scid = _make_cid(UInt8(0xDD), 8)
-    var first = _build_synth_initial(
-        dcid, scid, UInt64(0), UInt64(0), _bytes(0x11)
-    )
+    var first = _build_synth_initial(dcid, scid, UInt64(0))
     var peer = SocketAddr(IpAddr.localhost(), UInt16(54321))
     _ = listener.dispatch_datagram(Span[UInt8, _](first), peer)
     listener.tls_egress_queues[0] = List[UInt8]()
@@ -435,29 +428,20 @@ def test_egress_drain_clears_queue_and_advances_counters() raises:
 
 
 def test_egress_no_op_when_queue_empty() raises:
-    """``_drain_and_send`` is a clean no-op when nothing is
-    pending: returns False without raising and without
-    incrementing pn / offset."""
+    """With no CRYPTO queued, the first drain sends only the ACK owed
+    for the client's Initial (RFC 9000 sec 13.1): one packet number,
+    no CRYPTO offset. The next drain is a clean no-op."""
     var listener = _bind_listener()
     var dcid = _make_cid(UInt8(0xEE), 8)
     var scid = _make_cid(UInt8(0xFF), 8)
-    var first = _build_synth_initial(
-        dcid, scid, UInt64(0), UInt64(0), _bytes(0x12)
-    )
+    var first = _build_synth_initial(dcid, scid, UInt64(0))
     var peer = SocketAddr(IpAddr.localhost(), UInt16(54321))
     _ = listener.dispatch_datagram(Span[UInt8, _](first), peer)
-    var emitted = listener._drain_and_send(0)
-    assert_false(emitted, "no-op drain returns False")
-    assert_equal(
-        listener.connections[0].tx_initial_pn,
-        UInt64(0),
-        "no-op drain must not advance pn",
-    )
-    assert_equal(
-        listener.connections[0].tx_initial_offset,
-        UInt64(0),
-        "no-op drain must not advance offset",
-    )
+    assert_true(listener._drain_and_send(0), "the owed ACK goes out")
+    assert_equal(listener.connections[0].tx_initial_pn, UInt64(1))
+    assert_equal(listener.connections[0].tx_initial_offset, UInt64(0))
+    assert_false(listener._drain_and_send(0), "then nothing is pending")
+    assert_equal(listener.connections[0].tx_initial_pn, UInt64(1))
     listener.shutdown()
     listener.close()
 
@@ -476,9 +460,7 @@ def test_io_loop_tick_drives_recv_dispatch_drain() raises:
     var client = UdpSocket.bind(SocketAddr(IpAddr.localhost(), UInt16(0)))
     var dcid = _make_cid(UInt8(0x33), 8)
     var scid = _make_cid(UInt8(0x44), 8)
-    var datagram = _build_synth_initial(
-        dcid, scid, UInt64(0), UInt64(0), _bytes(0x55)
-    )
+    var datagram = _build_synth_initial(dcid, scid, UInt64(0))
     _ = client.send_to(Span[UInt8, _](datagram), server_addr)
     var got = listener.tick(500)
     assert_true(got, "first tick observes the inbound Initial")
@@ -488,9 +470,7 @@ def test_io_loop_tick_drives_recv_dispatch_drain() raises:
     for i in range(16):
         listener.tls_egress_queues[0].append(UInt8(0xC0 + (i % 16)))
     listener.peer_addrs[0] = client.local_addr()
-    var retransmit = _build_synth_initial(
-        dcid, scid, UInt64(1), UInt64(0), _bytes(0x56)
-    )
+    var retransmit = _build_synth_initial(dcid, scid, UInt64(1))
     _ = client.send_to(Span[UInt8, _](retransmit), server_addr)
     _ = listener.tick(500)
     assert_equal(
@@ -512,6 +492,77 @@ def test_io_loop_tick_drives_recv_dispatch_drain() raises:
     listener.close()
 
 
+def test_server_chooses_its_own_connection_id() raises:
+    """The server adopted the client's DCID as its own CID but parsed
+    short headers with its configured 8-byte length. A client that
+    picked a 16-byte DCID then had every 1-RTT packet misparsed, and
+    the server answered its own connection with a stateless reset."""
+    var listener = _bind_listener()
+    var dcid = _make_cid(UInt8(0x70), 16)
+    var scid = _make_cid(UInt8(0x90), 8)
+    var dg = _build_synth_initial(dcid, scid, UInt64(0))
+    var peer = SocketAddr(IpAddr.localhost(), UInt16(40404))
+    var slot = listener.dispatch_datagram(Span[UInt8, _](dg), peer)
+    assert_equal(slot, 0)
+    var ours = listener.connections[slot].local_cid.copy()
+    assert_equal(ours.length(), 8)
+    assert_true(
+        cid_to_hex(ours) != cid_to_hex(dcid), "server kept the client DCID"
+    )
+    # The client's Initial DCID still routes (Initial retransmits) ...
+    assert_equal(listener.cid_table.lookup(CidKey(dcid)), slot)
+    # ... and a short header addressed to our CID reaches the slot.
+    var sh = List[UInt8]()
+    sh.append(UInt8(0x40))
+    for b in ours.bytes:
+        sh.append(b)
+    for _ in range(24):
+        sh.append(UInt8(0))
+    assert_equal(listener._dispatch_short(Span[UInt8, _](sh), peer), slot)
+    listener.close()
+
+
+def test_handshake_flight_is_chunked_and_held_to_3x() raises:
+    """The whole queued handshake flight went out as one packet, however
+    large, and to an unvalidated address with no limit: a 1200-byte
+    spoofed Initial could have the server send a certificate chain's
+    worth of bytes at a victim. Now each packet carries at most 1100
+    CRYPTO bytes, and the total stays within 3x what the address sent
+    (RFC 9000 sec 8.1). The rest waits in the queue."""
+    var listener = _bind_listener()
+    var dcid = _make_cid(UInt8(0xCE), 8)
+    var scid = _make_cid(UInt8(0xDE), 8)
+    var first = _build_synth_initial(dcid, scid, UInt64(0))
+    var peer = SocketAddr(IpAddr.localhost(), UInt16(54321))
+    _ = listener.dispatch_datagram(Span[UInt8, _](first), peer)
+    listener.tls_egress_queues[0] = List[UInt8](length=10_000, fill=UInt8(7))
+    var sink = UdpSocket.bind(SocketAddr(IpAddr.localhost(), UInt16(0)))
+    listener.peer_addrs[0] = sink.local_addr()
+    _ = listener._drain_and_send(0)
+    sink.set_recv_timeout(300)
+    var buf = List[UInt8](length=65536, fill=UInt8(0))
+    var total = 0
+    var count = 0
+    while True:
+        var got: Int
+        try:
+            got = sink.recv_from(Span[UInt8, _](buf))[0]
+        except:
+            break
+        assert_true(got <= 1200, "a datagram of " + String(got) + " bytes")
+        total += got
+        count += 1
+    var received = len(first)
+    assert_true(count >= 2, "the flight was not split")
+    assert_true(total <= 3 * received, "sent past the 3x budget")
+    assert_true(
+        len(listener.tls_egress_queues[0]) > 0,
+        "the over-budget remainder was not held back",
+    )
+    listener.shutdown()
+    listener.close()
+
+
 def main() raises:
     test_loopback_initial_handshake_round_trip()
     test_loopback_retransmit_routes_to_existing_slot()
@@ -521,4 +572,6 @@ def main() raises:
     test_egress_drain_clears_queue_and_advances_counters()
     test_egress_no_op_when_queue_empty()
     test_io_loop_tick_drives_recv_dispatch_drain()
-    print("test_quic_loopback_integration: 8 passed")
+    test_server_chooses_its_own_connection_id()
+    test_handshake_flight_is_chunked_and_held_to_3x()
+    print("test_quic_loopback_integration: 10 passed")

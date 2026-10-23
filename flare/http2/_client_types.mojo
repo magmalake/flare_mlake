@@ -61,9 +61,15 @@ struct Http2Response(Movable):
 # ── Http2ClientConfig ─────────────────────────────────────────────────────
 
 
-comptime _DEFAULT_CLIENT_INITIAL_WINDOW_SIZE: Int = 65535
-"""RFC 9113 §6.5.2 default. The client's per-stream receive
-window size; used to flow-control inbound response DATA frames."""
+comptime _DEFAULT_CLIENT_INITIAL_WINDOW_SIZE: Int = 4 << 20
+"""The stream and connection receive window a client connection starts
+with; both grow with the measured bandwidth-delay product up to
+:data:`BDP_WINDOW_MAX`. The RFC 9113 §6.5.2 default of 64 KiB held a
+download to 64 KiB per round trip."""
+
+comptime BDP_WINDOW_MAX: Int = 16 << 20
+"""Largest stream and connection receive window the BDP estimator
+grows to."""
 
 comptime _DEFAULT_CLIENT_MAX_FRAME_SIZE: Int = 16384
 """RFC 9113 §6.5.2 default + minimum. Largest frame payload
@@ -101,16 +107,20 @@ struct Http2ClientConfig(Copyable, Defaultable):
             accept. Must be in ``[16384, 16777215]``.
         header_table_size: SETTINGS_HEADER_TABLE_SIZE (RFC 7541
             §4.2). HPACK dynamic-table size budget for the
-            decoder we run on inbound HEADERS.
+            decoder we run on inbound HEADERS. It is advertised and
+            caps the server's size update; the decoder stays at the
+            4096 default until that update arrives (RFC 7541 §4.2).
         max_header_list_size: SETTINGS_MAX_HEADER_LIST_SIZE
             (RFC 9113 §6.5.2). Header-list size cap (uncompressed,
             including 32-byte per-entry overhead).
-        allow_huffman_decode: When ``True``, the HPACK decoder
-            accepts H=1 literals (Huffman-encoded) in inbound
-            HEADERS via the RFC 7541 Appendix B codec. Defaults
-            to ``False`` -- reject-by-default until a soak proves
-            the scalar Huffman path is CRIME-class-side-channel-
-            safe under client load.
+        allow_huffman_decode: When ``True`` (the default), the HPACK
+            decoder accepts H=1 literals (Huffman-encoded) in inbound
+            HEADERS via the RFC 7541 Appendix B codec. It defaulted to
+            ``False``, so the client met any real server's first
+            response, whose headers are Huffman-coded, with
+            COMPRESSION_ERROR: every HTTPS request that negotiated h2
+            failed. Decoding carries no CRIME-class risk; that concern
+            is about what an encoder compresses.
         allow_huffman_encode: When ``True``, the HPACK encoder
             picks the shorter of raw vs Huffman per emitted
             literal on outbound HEADERS. Defaults to ``False`` --
@@ -138,7 +148,7 @@ struct Http2ClientConfig(Copyable, Defaultable):
         self.max_frame_size = _DEFAULT_CLIENT_MAX_FRAME_SIZE
         self.header_table_size = _DEFAULT_CLIENT_HEADER_TABLE_SIZE
         self.max_header_list_size = _DEFAULT_CLIENT_MAX_HEADER_LIST_SIZE
-        self.allow_huffman_decode = False
+        self.allow_huffman_decode = True
         self.allow_huffman_encode = False
         self.enable_connect_protocol = False
 
@@ -243,9 +253,11 @@ def _h2_response_to_http(var h2: Http2Response) raises -> Response:
     # body bytes once -- one-time per response, in the noise.
     var body_copy = h2.body.copy()
     var resp = Response(status=h2.status, body=body_copy^)
+    # Appended: a response carries one set-cookie field per cookie, and
+    # ``set`` kept only the last.
     for i in range(len(h2.headers)):
         try:
-            resp.headers.set(h2.headers[i].name, h2.headers[i].value)
+            resp.headers.append(h2.headers[i].name, h2.headers[i].value)
         except:
             pass
     return resp^

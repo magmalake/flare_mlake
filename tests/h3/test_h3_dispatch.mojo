@@ -46,6 +46,13 @@ from flare.http3 import (
     Http3Config,
     encode_http3_frame,
 )
+from flare.http3.server import (
+    H3_FRAME_UNEXPECTED,
+    H3_GENERAL_PROTOCOL_ERROR,
+    QPACK_DECOMPRESSION_FAILED,
+    QPACK_ENCODER_STREAM_ERROR,
+    h3_error_code,
+)
 from flare.http.response import Response
 from flare.http.server import ok
 from flare.qpack import QpackHeader, encode_field_section
@@ -259,6 +266,230 @@ def test_partial_chunk_needs_more_then_completes() raises:
     assert_equal(req.url, String("/split"))
 
 
+def test_take_request_keeps_repeats_and_joins_cookies() raises:
+    """``take_request`` used ``set`` (last value wins) and dropped
+    :authority entirely, so an h3 handler had no Host and one cookie."""
+    var headers = List[QpackHeader]()
+    headers.append(QpackHeader(":method", "GET"))
+    headers.append(QpackHeader(":scheme", "https"))
+    headers.append(QpackHeader(":authority", "example.com"))
+    headers.append(QpackHeader(":path", "/"))
+    headers.append(QpackHeader("cookie", "a=1"))
+    headers.append(QpackHeader("accept", "x"))
+    headers.append(QpackHeader("cookie", "b=2"))
+    headers.append(QpackHeader("accept", "y"))
+    var c = Http3Connection()
+    c.feed_stream_chunk(0, _encode_headers_frame(headers))
+    c.signal_end_of_stream(0)
+    var req = c.take_request(0)
+    assert_equal(req.headers.get("host"), String("example.com"))
+    assert_equal(req.headers.get("cookie"), String("a=1; b=2"))
+    assert_equal(len(req.headers.get_all("accept")), 2)
+
+
+def test_request_without_pseudo_headers_is_refused() raises:
+    """``take_request`` defaulted a missing :method and :path to GET /, so a
+    HEADERS frame of regular fields alone was served (RFC 9114 sec
+    4.3.1 makes it malformed)."""
+    var headers = List[QpackHeader]()
+    headers.append(QpackHeader("user-agent", "x"))
+    var c = Http3Connection()
+    c.feed_stream_chunk(0, _encode_headers_frame(headers))
+    c.signal_end_of_stream(0)
+    var raised = False
+    try:
+        _ = c.take_request(0)
+    except:
+        raised = True
+    assert_true(raised, "a request with no pseudo-headers was served")
+
+
+def test_response_drops_connection_specific_fields() raises:
+    """Connection / Transfer-Encoding from an h1-minded handler went out
+    on h3, where a client must treat the response as malformed."""
+    from flare.http3.frame import decode_http3_frame
+    from flare.qpack import decode_field_section
+
+    var c = Http3Connection()
+    c.feed_stream_chunk(0, _build_get_request_bytes("/"))
+    c.signal_end_of_stream(0)
+    _ = c.take_request(0)
+    var resp = ok("hi")
+    resp.headers.set("Connection", "close")
+    resp.headers.set("Transfer-Encoding", "chunked")
+    resp.headers.set("X-Keep", "yes")
+    c.emit_response(0, resp^)
+    var out = c.take_response_frames(0)
+    var f = decode_http3_frame(Span[UInt8, _](out))
+    var fields = decode_field_section(Span[UInt8, _](f.payload))
+    assert_equal(fields[0].name, ":status")
+    assert_equal(fields[0].value, "200")
+    var names = List[String]()
+    for h in fields:
+        names.append(String(h.name))  # on the wire, already lowercase
+    assert_false("connection" in names)
+    assert_false("transfer-encoding" in names)
+    assert_true("x-keep" in names)
+
+
+def test_buffered_response_carries_its_trailers() raises:
+    """A buffered response's trailers follow the body as a final HEADERS
+    frame (RFC 9114 sec 4.1); they used to be dropped."""
+    from flare.qpack import decode_field_section
+    from flare.quic.varint import decode_varint
+
+    var c = Http3Connection()
+    c.feed_stream_chunk(0, _build_get_request_bytes("/"))
+    c.signal_end_of_stream(0)
+    _ = c.take_request(0)
+    var resp = ok("hi")
+    resp.trailers.set("grpc-status", "0")
+    c.emit_response(0, resp^)
+    var out = c.take_response_frames(0)
+    var types = List[UInt64]()
+    var last = List[UInt8]()
+    var pos = 0
+    while pos < len(out):
+        var t = decode_varint(Span[UInt8, _](out)[pos:])
+        var n = decode_varint(Span[UInt8, _](out)[pos + t.consumed :])
+        var start = pos + t.consumed + n.consumed
+        types.append(t.value)
+        last = List[UInt8](Span[UInt8, _](out)[start : start + Int(n.value)])
+        pos = start + Int(n.value)
+    assert_equal(len(types), 3)
+    assert_equal(types[2], UInt64(H3_FRAME_TYPE_HEADERS))
+    var tr = decode_field_section(Span[UInt8, _](last))
+    assert_equal(tr[0].name, "grpc-status")
+    assert_equal(tr[0].value, "0")
+
+
+def test_extended_connect_follows_the_config() raises:
+    """``:protocol`` is refused unless extended CONNECT is enabled, the
+    same setting that advertises it (RFC 9220 sec 3)."""
+    var hs = List[QpackHeader]()
+    hs.append(QpackHeader(":method", "CONNECT"))
+    hs.append(QpackHeader(":protocol", "websocket"))
+    hs.append(QpackHeader(":scheme", "https"))
+    hs.append(QpackHeader(":authority", "example.com"))
+    hs.append(QpackHeader(":path", "/chat"))
+    for enabled in range(2):
+        var cfg = Http3Config()
+        cfg.enable_connect_protocol = enabled == 1
+        var c = Http3Connection.with_config(cfg)
+        c.feed_stream_chunk(0, _encode_headers_frame(hs))
+        c.signal_end_of_stream(0)
+        var accepted = True
+        try:
+            _ = c.take_request(0)
+        except:
+            accepted = False
+        assert_equal(accepted, enabled == 1)
+
+
+def test_stream_frames_are_reassembled_by_offset() raises:
+    """STREAM data was fed to the reader in arrival order, whatever its
+    offset, so a reordered request was parsed from scrambled bytes and
+    FIN could land before the bytes it ends."""
+    var c = Http3Connection()
+    var req = _build_get_request_bytes("/reordered")
+    var cut = len(req) // 2
+    var tail = List[UInt8](Span[UInt8, _](req)[cut:])
+    var head = List[UInt8](Span[UInt8, _](req)[:cut])
+    c.feed_stream_frame(0, UInt64(cut), Span[UInt8, _](tail), True)
+    assert_equal(len(c.take_completed_streams()), 0, "completed early")
+    c.feed_stream_frame(0, UInt64(0), Span[UInt8, _](head), False)
+    c.feed_stream_frame(0, UInt64(0), Span[UInt8, _](head), False)  # dup
+    var ready = c.take_completed_streams()
+    assert_equal(len(ready), 1)
+    assert_equal(c.take_request(0).url, String("/reordered"))
+
+
+def test_retransmit_after_the_response_does_not_rerun_the_request() raises:
+    """Closing a stream forgot it, so a retransmitted STREAM frame that
+    crossed our ACK opened it again and the handler ran twice."""
+    var c = Http3Connection()
+    var req = _build_get_request_bytes("/once")
+    c.feed_stream_frame(0, UInt64(0), Span[UInt8, _](req), True)
+    assert_equal(len(c.take_completed_streams()), 1)
+    _ = c.take_request(0)
+    c.emit_response(0, ok("done"))
+    _ = c.take_response_frames(0)
+    c.close_request_stream(0)
+    c.feed_stream_frame(0, UInt64(0), Span[UInt8, _](req), True)
+    assert_false(c.has_stream(0), "a closed stream was reopened")
+    assert_equal(len(c.take_completed_streams()), 0)
+
+
+def _headers_frame_with_section(section: List[UInt8]) raises -> List[UInt8]:
+    var out = List[UInt8]()
+    encode_http3_frame(H3_FRAME_TYPE_HEADERS, Span[UInt8, _](section), out)
+    return out^
+
+
+def test_undecodable_field_section_is_a_connection_error() raises:
+    """QPACK-05: the section ``01 00 80`` (encoded Required Insert Count
+    1, one indexed dynamic line) cannot be decoded by a server that
+    advertises table capacity 0 and 0 blocked streams. It only set a
+    flag on the stream, which nothing read, so the connection stayed up
+    and the request was never answered. It is a connection error of type
+    QPACK_DECOMPRESSION_FAILED (RFC 9204 sec 2.1.2, 2.2.3, 4.5.1.1)."""
+    var c = Http3Connection()
+    assert_equal(Int(c.connection_error_code), 0)
+    var section: List[UInt8] = [0x01, 0x00, 0x80]
+    c.feed_stream_chunk(0, _headers_frame_with_section(section))
+    assert_true(c.stream_protocol_error(0).byte_length() > 0)
+    assert_equal(Int(c.connection_error_code), Int(QPACK_DECOMPRESSION_FAILED))
+    assert_true(c.connection_error_reason.byte_length() > 0)
+
+
+def test_h2_reserved_request_frame_is_a_connection_error() raises:
+    """H3-02: an HTTP/2-reserved frame type (here PING, 0x06) on a request
+    stream is a connection error of type H3_FRAME_UNEXPECTED (RFC 9114
+    sec 7.2.8, 11.2.1), not an ignored unknown frame."""
+    var c = Http3Connection()
+    var wire = _build_get_request_bytes("/")
+    wire.append(UInt8(0x06))  # PING's frame type
+    wire.append(UInt8(0x00))  # length 0
+    c.feed_stream_chunk(0, wire^)
+    assert_equal(Int(c.connection_error_code), Int(H3_FRAME_UNEXPECTED))
+    assert_true("H3_FRAME_UNEXPECTED" in c.connection_error_reason)
+
+
+def test_blocked_field_section_without_a_budget_is_a_connection_error() raises:
+    """QPACK-05: with a dynamic table but 0 blocked streams promised, a
+    section whose Required Insert Count is ahead of the inserts received
+    is a connection error too (RFC 9204 sec 2.1.2)."""
+    var cfg = Http3Config()
+    cfg.qpack_max_table_capacity = UInt64(4096)
+    cfg.qpack_blocked_streams = UInt64(0)
+    var c = Http3Connection.with_config(cfg)
+    # RIC 1 (MaxEntries 128 -> encoded 2), Base 1, relative index 0.
+    var section: List[UInt8] = [0x02, 0x00, 0x80]
+    c.feed_stream_chunk(0, _headers_frame_with_section(section))
+    assert_equal(Int(c.connection_error_code), Int(QPACK_DECOMPRESSION_FAILED))
+
+
+def test_a_decodable_request_is_not_a_connection_error() raises:
+    var c = Http3Connection()
+    c.feed_stream_chunk(0, _build_get_request_bytes("/ok"))
+    assert_equal(Int(c.connection_error_code), 0)
+    assert_equal(c.stream_protocol_error(0).byte_length(), 0)
+
+
+def test_h3_error_codes_are_named_in_error_messages() raises:
+    assert_equal(
+        Int(h3_error_code("x QPACK_ENCODER_STREAM_ERROR: y")),
+        Int(QPACK_ENCODER_STREAM_ERROR),
+    )
+    assert_equal(
+        Int(h3_error_code("h3 server: (RFC 9114 7.2.4 H3_FRAME_UNEXPECTED)")),
+        Int(H3_FRAME_UNEXPECTED),
+    )
+    assert_equal(
+        Int(h3_error_code("something else")), Int(H3_GENERAL_PROTOCOL_ERROR)
+    )
+
+
 def main() raises:
     test_feed_stream_chunk_implicit_open()
     test_get_request_surfaces_after_fin()
@@ -270,4 +501,16 @@ def main() raises:
     test_emit_response_is_idempotent_guarded()
     test_garbled_chunk_sets_protocol_error()
     test_partial_chunk_needs_more_then_completes()
-    print("test_h3_dispatch: 10 passed")
+    test_take_request_keeps_repeats_and_joins_cookies()
+    test_request_without_pseudo_headers_is_refused()
+    test_response_drops_connection_specific_fields()
+    test_buffered_response_carries_its_trailers()
+    test_extended_connect_follows_the_config()
+    test_stream_frames_are_reassembled_by_offset()
+    test_retransmit_after_the_response_does_not_rerun_the_request()
+    test_undecodable_field_section_is_a_connection_error()
+    test_blocked_field_section_without_a_budget_is_a_connection_error()
+    test_h2_reserved_request_frame_is_a_connection_error()
+    test_a_decodable_request_is_not_a_connection_error()
+    test_h3_error_codes_are_named_in_error_messages()
+    print("test_h3_dispatch: 22 passed")

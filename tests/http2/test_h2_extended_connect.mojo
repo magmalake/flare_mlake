@@ -37,7 +37,13 @@ from flare.http2 import (
 
 
 def _preface_bytes() -> List[UInt8]:
-    return List[UInt8](String(H2_PREFACE).as_bytes())
+    """The client magic followed by the empty SETTINGS frame RFC 9113 sec 3.4
+    requires as its first frame."""
+    var out = List[UInt8](String(H2_PREFACE).as_bytes())
+    var st = Frame()
+    st.header.type = FrameType.SETTINGS()
+    out.extend(Span[UInt8, _](encode_frame(st)))
+    return out^
 
 
 def _settings_payload(bytes: List[UInt8]) raises -> List[UInt8]:
@@ -96,8 +102,13 @@ def test_extended_connect_headers_landed_on_stream() raises:
     """Feeding a HEADERS frame with ``:method=CONNECT`` +
     ``:protocol=websocket`` (RFC 8441 §4) leaves the stream in
     a state where ``stream.extended_connect_protocol == "websocket"``.
+
+    The server must have advertised SETTINGS_ENABLE_CONNECT_PROTOCOL:
+    RFC 8441 sec 3 forbids ``:protocol`` otherwise, and it is refused.
     """
-    var c = Http2Connection()
+    var cfg = Http2Config()
+    cfg.enable_connect_protocol = True
+    var c = Http2Connection.with_config(cfg^)
     c.feed(Span[UInt8, _](_preface_bytes()))
     _ = c.drain()  # discard server SETTINGS
 
