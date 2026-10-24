@@ -139,7 +139,7 @@ requirements:
     # pthread binding, so `threads` has to be importable wherever flare is.
     # Having exactly one library bind a given libc symbol is what lets flare
     # be linked alongside the rest of the magmalake stack at all.
-    - threads-mojo >=0.6.0,<0.7
+    - threads-mojo >=0.6.1,<0.7
 
 tests:
   # The package had no test, which is how the missing zlib, brotli and fs
