@@ -38,6 +38,11 @@ commits past `c3dc933`, including upstream's own move to Mojo 1.2.0.
   [ _eventfd_write ]`. That includes the HTTP client, the WebSocket server and
   the gRPC client. The call is now under `comptime if
   CompilationTarget.is_linux()`. Pure upstream v0.13.0 fails the same way.
+- **The recipe's test can run.** Upstream's `script` test installs the package
+  with its run requirements, and json_mlake and threads-mojo are on no
+  channel, so the test environment could not be solved and the build failed.
+  It is now a `package_contents` check of flare's own files. The simdjson and
+  `json` checks were json_mlake's files and are dropped.
 
 ### Removed — deltas upstream has absorbed
 - **The four carried pull requests** (#11, #14, #15, #16), all merged upstream.

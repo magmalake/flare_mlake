@@ -145,14 +145,19 @@ tests:
   # The package had no test, which is how the missing zlib, brotli and fs
   # wrappers shipped: each is loaded only at first use, so nothing failed
   # until a user hit it.
-  - script:
-      - test -f $PREFIX/lib/libflare_tls.so
-      - test -f $PREFIX/lib/libflare_zlib.so
-      - test -f $PREFIX/lib/libflare_brotli.so
-      - test -f $PREFIX/lib/libflare_fs.so
-      - test -f $PREFIX/lib/libsimdjson_wrapper.so
-      - test -f $PREFIX/lib/mojo/flare/__init__.mojo
-      - test -f $PREFIX/lib/mojo/json/__init__.mojo
+  #
+  # `package_contents` rather than upstream's `script`: a script test installs
+  # the package with its run requirements, and json_mlake and threads-mojo are
+  # pixi source tins on no channel, so that environment cannot be solved here.
+  # It is also why the simdjson and `json` checks are gone: those files are
+  # json_mlake's, not this package's.
+  - package_contents:
+      files:
+        - lib/libflare_tls.so
+        - lib/libflare_zlib.so
+        - lib/libflare_brotli.so
+        - lib/libflare_fs.so
+        - lib/mojo/flare/__init__.mojo
 
 about:
   homepage: https://github.com/ehsanmok/flare
