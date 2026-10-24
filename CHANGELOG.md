@@ -8,19 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
-- **TLS on macOS no longer crashes when the shim is unloaded.** Upstream's
-  `03aac93c` replaced `libflare_tls`'s `thread_local` error buffer with a
-  pthread key. dyld never unloads an image with thread-local variables, so
-  that had kept the shim mapped by accident. Without them, the last
-  `dlclose` unmaps it, and the next call into it crashes. Every fork-based
-  test in `tests/tls/test_tls.mojo` hit this on macOS. Linux builds already
-  link with `-z nodelete`; the shim now takes a `RTLD_NODELETE` reference to
-  itself at load time, which works on both platforms and also covers the
-  recipe build, which never passed `-z nodelete`. Links `-ldl` for older
-  glibc sysroots.
-
-## [0.13.0] - 2026-10-23
+## [0.13.0] - 2026-10-24
 
 Tracks upstream **flare v0.13.0** (`00f5636d`, main at `8fe83c5e`), 434
 commits past `c3dc933`, including upstream's own move to Mojo 1.2.0.
@@ -40,9 +28,19 @@ commits past `c3dc933`, including upstream's own move to Mojo 1.2.0.
   `libbrotli* >=1.2.1` pins. The simdjson wrapper stays json_mlake's, as before;
   upstream's recipe inlines json's source and this one depends on the package.
 - `json_mlake >=0.4.2,<0.5`, the Mojo 1.2.0 sync of json. threads-mojo is
-  pinned at threads.mojo#17, its Mojo 1.2.0 port (still versioned 0.6.0).
+  `>=0.6.1,<0.7`, its Mojo 1.2.0 release.
 
 ### Fixed
+- **TLS on macOS no longer crashes when the shim is unloaded.** Upstream's
+  `03aac93c` replaced `libflare_tls`'s `thread_local` error buffer with a
+  pthread key. dyld never unloads an image with thread-local variables, so
+  that had kept the shim mapped by accident. Without them, the last
+  `dlclose` unmaps it, and the next call into it crashes. Every fork-based
+  test in `tests/tls/test_tls.mojo` hit this on macOS. Linux builds already
+  link with `-z nodelete`; the shim now takes a `RTLD_NODELETE` reference to
+  itself at load time, which works on both platforms and also covers the
+  recipe build, which never passed `-z nodelete`. Links `-ldl` for older
+  glibc sysroots.
 - **macOS links again.** Upstream's `flare/runtime/_balance.mojo` calls
   `eventfd_write` unguarded. The balancer group is Linux-only and never
   enabled on macOS, but the call is still compiled in, so anything that
