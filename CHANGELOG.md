@@ -27,7 +27,17 @@ commits past `c3dc933`, including upstream's own move to Mojo 1.2.0.
 - Takes upstream's brotli and fs wrapper builds and its `libdeflate` and
   `libbrotli* >=1.2.1` pins. The simdjson wrapper stays json_mlake's, as before;
   upstream's recipe inlines json's source and this one depends on the package.
-- `json_mlake >=0.4.2,<0.5`, the Mojo 1.2.0 sync of json.
+- `json_mlake >=0.4.2,<0.5`, the Mojo 1.2.0 sync of json. threads-mojo is
+  pinned at threads.mojo#17, its Mojo 1.2.0 port (still versioned 0.6.0).
+
+### Fixed
+- **macOS links again.** Upstream's `flare/runtime/_balance.mojo` calls
+  `eventfd_write` unguarded. The balancer group is Linux-only and never
+  enabled on macOS, but the call is still compiled in, so anything that
+  reaches the unified reactor fails on macOS with `Symbols not found:
+  [ _eventfd_write ]`. That includes the HTTP client, the WebSocket server and
+  the gRPC client. The call is now under `comptime if
+  CompilationTarget.is_linux()`. Pure upstream v0.13.0 fails the same way.
 
 ### Removed — deltas upstream has absorbed
 - **The four carried pull requests** (#11, #14, #15, #16), all merged upstream.

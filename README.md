@@ -34,7 +34,7 @@ interesting than that.
 As little as possible. The intent is that this stays a thin layer that could be
 deleted at any time.
 
-**Three source deltas**, each small and each worth sending upstream:
+**Four source deltas**, each small and each worth sending upstream:
 
 - **`flare/runtime/_thread.mojo` starts and joins OS threads through
   threads.mojo.** Mojo declares an extern per signature, and flare's
@@ -46,6 +46,9 @@ deleted at any time.
   BSD's `SO_REUSEPORT` does not spread connections across listeners, so the
   per-worker shape runs a multi-worker server on one core.
   `FLARE_REUSEPORT_WORKERS=1` restores it.
+- **`eventfd_write` is Linux-only** in `flare/runtime/_balance.mojo`. Upstream
+  calls it unguarded, so on macOS anything that reaches the unified reactor
+  fails to link, even though the balancer is never enabled there.
 - **`tests/tools/proto_gen.py` decodes `repeated string`/`bytes` one element
   per field.** They are never packed; decoding them as a packed block fails on
   any real message.

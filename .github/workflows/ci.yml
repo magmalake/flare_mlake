@@ -116,7 +116,7 @@ jobs:
           repository: magmalake/threads.mojo
           path: threads.mojo
 
-      # threads.mojo 0.6.0 has a single compat/ directory: Mojo 1.1.0 and the
+      # threads.mojo 0.6.0 has a single compat/ directory: Mojo 1.2.0 and the
       # nightly agree on `Atomic[Int64]`, which is all it papers over.
       - name: Threads include path
         run: |

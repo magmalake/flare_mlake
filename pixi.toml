@@ -55,8 +55,9 @@ libdeflate       = ">=1.22,<2"     # HTTP: gzip encoder for Content-Encoding res
 json_mlake       = { git = "https://github.com/magmalake/json_mlake.git", branch = "main" }
 # flare's threading is an adapter over threads.mojo (flare/runtime/_thread.mojo)
 # rather than its own pthread binding, so `threads` has to be importable to
-# compile flare at all. Pinned at threads-mojo 0.6.0, the Mojo 1.1.0 release.
-threads-mojo     = { git = "https://github.com/magmalake/threads.mojo.git", rev = "e8790abf928c96073a5457462558cad9cb52656d" }
+# compile flare at all. Pinned at threads.mojo#17, its Mojo 1.2.0 port (still
+# versioned 0.6.0 until the next threads release).
+threads-mojo     = { git = "https://github.com/magmalake/threads.mojo.git", rev = "32a7ef8746bc728f00677ed45641cc4de796a09d" }
 
 # g++ is a BUILD-time dep on Linux: the activation scripts
 # (flare/tls/ffi/build.sh, flare/http/ffi/build.sh) invoke g++ to compile
