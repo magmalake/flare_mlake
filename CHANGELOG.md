@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **TLS on macOS no longer crashes when the shim is unloaded.** Upstream's
+  `03aac93c` replaced `libflare_tls`'s `thread_local` error buffer with a
+  pthread key. dyld never unloads an image with thread-local variables, so
+  that had kept the shim mapped by accident. Without them, the last
+  `dlclose` unmaps it, and the next call into it crashes. Every fork-based
+  test in `tests/tls/test_tls.mojo` hit this on macOS. Linux builds already
+  link with `-z nodelete`; the shim now takes a `RTLD_NODELETE` reference to
+  itself at load time, which works on both platforms and also covers the
+  recipe build, which never passed `-z nodelete`. Links `-ldl` for older
+  glibc sysroots.
+
 ## [0.13.0] - 2026-10-23
 
 Tracks upstream **flare v0.13.0** (`00f5636d`, main at `8fe83c5e`), 434

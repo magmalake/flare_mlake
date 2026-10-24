@@ -72,7 +72,7 @@ build:
         flare/tls/ffi/openssl_wrapper.cpp
         -I$PREFIX/include
         -L$PREFIX/lib
-        -lssl -lcrypto
+        -lssl -lcrypto -ldl
         -Wl,-rpath,$PREFIX/lib
     # ── flare: zlib FFI wrapper (Content-Encoding gzip / deflate) ────────
     # Upstream's, taken here: loaded at runtime by flare.http.encoding, the
