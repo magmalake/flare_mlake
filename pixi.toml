@@ -51,8 +51,10 @@ libdeflate       = ">=1.22,<2"     # HTTP: gzip encoder for Content-Encoding res
 # magmalake tins so a consumer resolves one org's packages. json_mlake tracks
 # upstream json with only packaging deltas; the module is still imported as
 # `json`. (The old reason — upstream's unsolvable `==0.3.13` backend pin — is
-# fixed upstream now; the org-consistency one is what remains.)
-json_mlake       = { git = "https://github.com/magmalake/json_mlake.git", branch = "main" }
+# fixed upstream now; the org-consistency one is what remains.) Pinned at
+# json_mlake 0.4.3, the release whose simdjson wrapper is found without
+# CONDA_PREFIX, which flare's own shim search now matches.
+json_mlake       = { git = "https://github.com/magmalake/json_mlake.git", rev = "bcaa7161e757748a1310a213e123bf8810ff7e96" }
 # flare's threading is an adapter over threads.mojo (flare/runtime/_thread.mojo)
 # rather than its own pthread binding, so `threads` has to be importable to
 # compile flare at all. Pinned at threads 0.6.1, its Mojo 1.2.0 release.

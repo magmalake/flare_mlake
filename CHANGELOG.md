@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [0.13.1] - 2026-11-03
 
 ### Changed
+- **json_mlake 0.4.3 or newer.** The dev environment pins json_mlake at its
+  0.4.3 release (it was tracking `main`) and the recipe requires
+  `json_mlake >=0.4.3`, the release whose simdjson wrapper is found without
+  `CONDA_PREFIX` too.
 - **The FFI shims are found next to the executable too, and a missing one
   says to set `CONDA_PREFIX`.** `find_flare_lib` takes `$CONDA_PREFIX/lib`
   only when the file is there, then tries the executable's directory and
