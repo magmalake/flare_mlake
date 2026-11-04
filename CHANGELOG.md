@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-03
+
 ### Changed
 - **The FFI shims are found next to the executable too, and a missing one
   says to set `CONDA_PREFIX`.** `find_flare_lib` takes `$CONDA_PREFIX/lib`
