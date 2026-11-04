@@ -30,6 +30,8 @@ def _set_cloexec(fd: c_int) -> None:
     if fd < c_int(0):
         return
     comptime if CompilationTarget.is_linux():
-        _ = external_call["fcntl", c_int](fd, F_SETFD, FD_CLOEXEC)
+        _ = external_call["fcntl", c_int, num_fixed_args=2](
+            fd, F_SETFD, FD_CLOEXEC
+        )
     else:
         _ = external_call["ioctl", c_int](fd, _FIOCLEX_MACOS)
