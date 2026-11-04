@@ -12,6 +12,9 @@ from std.testing import TestSuite
 from test_dylib import (
     test_never_resolves_against_the_working_directory as test_dylib__test_never_resolves_against_the_working_directory,
 )
+from test_dylib import (
+    test_missing_library_says_to_set_conda_prefix as test_dylib__test_missing_library_says_to_set_conda_prefix,
+)
 from test_errors import (
     test_validation_error_construct_and_field_access as test_errors__test_validation_error_construct_and_field_access,
 )
@@ -90,6 +93,7 @@ def main() raises:
     var suite = TestSuite()
     # tests/test_dylib.mojo
     suite.test[test_dylib__test_never_resolves_against_the_working_directory]()
+    suite.test[test_dylib__test_missing_library_says_to_set_conda_prefix]()
     # tests/test_errors.mojo
     suite.test[test_errors__test_validation_error_construct_and_field_access]()
     suite.test[

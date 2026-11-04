@@ -34,7 +34,7 @@ interesting than that.
 As little as possible. The intent is that this stays a thin layer that could be
 deleted at any time.
 
-**Five source deltas**, each small and each worth sending upstream:
+**Six source deltas**, each small and each worth sending upstream:
 
 - **`flare/runtime/_thread.mojo` starts and joins OS threads through
   threads.mojo.** Mojo declares an extern per signature, and flare's
@@ -53,6 +53,12 @@ deleted at any time.
   `flare/tls/ffi/openssl_wrapper.cpp`). Upstream relies on `-z nodelete`,
   which macOS's linker does not have, so on macOS the last `dlclose` unmaps
   the shim while OpenSSL and a pthread key still hold pointers into it.
+- **The FFI shims are also found next to the executable**
+  (`flare/utils/_dlopen.mojo`, called from `find_flare_lib` in
+  `flare/utils/dylib.mojo`): after `$CONDA_PREFIX/lib`, the executable's
+  directory and its `../lib`, then the binary's rpath. The module is the one
+  every magmalake tin that loads a library shares, and a missing shim's
+  Error says to set `CONDA_PREFIX`.
 - **`tests/tools/proto_gen.py` decodes `repeated string`/`bytes` one element
   per field.** They are never packed; decoding them as a packed block fails on
   any real message.

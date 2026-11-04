@@ -130,6 +130,15 @@ jobs:
       # The four carried pull requests (upstream #11, #14, #15, #16). If one
       # of these breaks, the carried patch is what broke — that is the whole
       # reason to run tests in a distribution repo at all.
+      # This distribution's library search (flare/utils/_dlopen.mojo), also
+      # built and run with CONDA_PREFIX unset, as from a plain shell.
+      - name: Library search
+        run: |
+          pixi run mojo -I . $THREADS_I tests/test_dylib.mojo
+          mkdir -p build
+          pixi run mojo build -I . $THREADS_I tests/test_dylib.mojo -o build/test_dylib
+          env -u CONDA_PREFIX ./build/test_dylib
+
       - name: Carried upstream PRs
         run: |
           pixi run mojo -I . $THREADS_I tests/http/test_client_read_timeout.mojo
