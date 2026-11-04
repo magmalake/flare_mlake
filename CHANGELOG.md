@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-11-03
+
 ### Fixed
 
 - `fcntl` is declared variadic (two fixed arguments) in `_fcntl2` and
