@@ -49,11 +49,17 @@ cat > smoke.mojo <<'MOJO'
 from flare.net import SocketAddr
 from flare.http import HttpClient
 from flare.grpc import *
+from flare.utils.dylib import pinned_flare_lib
 
-def main():
+def main() raises:
     print("flare_mlake: module 'flare' resolved from the package with no -I")
+    _ = pinned_flare_lib["tls"]()
+    print("flare_mlake: libflare_tls.so loaded")
 MOJO
 
 pixi install
 pixi run mojo build smoke.mojo -o ./smoke
 ./smoke
+# From a plain shell, as a deployed binary runs: with no CONDA_PREFIX the
+# shim is found through the binary's rpath (the environment it built in).
+env -u CONDA_PREFIX ./smoke

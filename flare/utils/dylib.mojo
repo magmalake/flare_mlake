@@ -38,8 +38,17 @@ Search order (used by every call site):
 2. ``$CONDA_PREFIX/lib/libflare_<name>.so`` -- the canonical
    install location, populated by ``flare/<sub>/ffi/build.sh``
    on pixi activation.
-3. The bare ``libflare_<name>.so``, which ``dlopen`` resolves on the
-   system library path. Never the working directory.
+3. ``<exe dir>/libflare_<name>.so`` and ``<exe dir>/../lib/...``,
+   the running executable's directory (symlinks resolved) -- for a
+   binary shipped next to its libraries.
+4. The bare ``libflare_<name>.so``, which ``dlopen`` resolves on the
+   binary's rpath (``mojo build`` records the lib directory of the
+   environment it built in) and then the system library path. Never
+   the working directory.
+
+Steps 2-4 are :func:`flare.utils._dlopen.find_library`, the search
+every magmalake tin that loads a library shares; each of 2 and 3 is
+taken only when the file is there.
 The path is built via ``String("") += prefix += literal``
 rather than the ``prefix + literal`` concat operator. See the
 :mod:`flare.tls.config` module docstring for the full rationale
@@ -64,6 +73,8 @@ Public API
 
 from std.os import getenv
 from std.ffi import OwnedDLHandle, _get_global
+
+from ._dlopen import find_library, open_library
 from std.memory import Layout, OptionalPointer, Pointer, alloc
 
 
@@ -101,12 +112,15 @@ def find_flare_lib(name: String) -> String:
        is an absolute path. For running outside pixi, e.g. a bare
        checkout with ``FLARE_LIB_DIR=$PWD/build``.
     2. ``$CONDA_PREFIX/lib/libflare_<name>.so``, when ``CONDA_PREFIX``
-       is absolute: the install that ``flare/<sub>/ffi/build.sh``
-       populates on pixi activation.
-    3. The bare file name, which ``dlopen`` looks up on the system
-       library path (``LD_LIBRARY_PATH`` / ``DYLD_LIBRARY_PATH``,
-       rpath, the system directories). It never looks in the working
-       directory.
+       is absolute and the file is there: the install that
+       ``flare/<sub>/ffi/build.sh`` populates on pixi activation.
+    3. ``<exe dir>/libflare_<name>.so``, then
+       ``<exe dir>/../lib/libflare_<name>.so``, when there.
+    4. The bare file name, which ``dlopen`` looks up on the binary's
+       rpath (the environment ``mojo build`` ran in, so a binary built
+       under pixi runs from a plain shell), ``LD_LIBRARY_PATH`` /
+       ``DYLD_LIBRARY_PATH`` and the system directories. It never looks
+       in the working directory.
 
     The last step used to be ``build/libflare_<name>.so``, relative to
     the working directory. A flare program started with no
@@ -125,17 +139,11 @@ def find_flare_lib(name: String) -> String:
     var dir = getenv("FLARE_LIB_DIR", "")
     if dir.startswith("/"):
         return _lib_in(dir, name)
-    var prefix = getenv("CONDA_PREFIX", "")
-    if prefix.startswith("/"):
-        var lib_dir = String("")
-        lib_dir += prefix
-        lib_dir += "/lib"
-        return _lib_in(lib_dir, name)
-    var bare = String("")
-    bare += "libflare_"
-    bare += name
-    bare += ".so"
-    return bare^
+    var file = String("")
+    file += "libflare_"
+    file += name
+    file += ".so"
+    return find_library(file)
 
 
 def _pinned_init[
@@ -173,7 +181,14 @@ def pinned_flare_lib[
         "flare_dylib_" + name, _pinned_init[name], _pinned_keep
     ]()
     if not p:
-        raise Error("flare: cannot load libflare_" + String(name) + ".so")
+        # Open it once more for the reason: `open_library` names every
+        # place it looked and says to set CONDA_PREFIX.
+        var file = String("libflare_") + String(name) + ".so"
+        var dir = getenv("FLARE_LIB_DIR", "")
+        if dir.startswith("/"):
+            _ = OwnedDLHandle(_lib_in(dir, name))
+        _ = open_library("flare", file)
+        raise Error("flare: cannot load " + file)
     return Pointer[OwnedDLHandle, MutUntrackedOrigin](
         unsafe_from_address=Int(p.value())
     )

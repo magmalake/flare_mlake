@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **The FFI shims are found next to the executable too, and a missing one
+  says to set `CONDA_PREFIX`.** `find_flare_lib` takes `$CONDA_PREFIX/lib`
+  only when the file is there, then tries the executable's directory and
+  its `../lib`, then the bare name on the binary's rpath (the environment
+  `mojo build` ran in, so a binary built under pixi already ran from a
+  plain shell). That search is `flare/utils/_dlopen.mojo`, the module every
+  magmalake tin that loads a library shares; it's a delta from upstream.
+  `pinned_flare_lib` raising for a missing shim now names every place it
+  looked and says to set `CONDA_PREFIX`. CI runs `tests/test_dylib.mojo`
+  and the consume smoke's binary with `CONDA_PREFIX` unset.
+
 ## [0.13.0] - 2026-10-24
 
 Tracks upstream **flare v0.13.0** (`00f5636d`, main at `8fe83c5e`), 434
