@@ -43,7 +43,7 @@ context:
   # Renaming only the package keeps every import unchanged, so switching to an
   # official flare package later is a one-line dependency change.
   name: flare_mlake
-  version: "0.13.0"
+  version: "0.13.1"
 
 package:
   name: ${{ name }}
@@ -134,7 +134,7 @@ requirements:
     # package, so an environment can hold both flare and json without a
     # file conflict — and json security fixes arrive by upgrading json_mlake
     # rather than by rebuilding flare.
-    - json_mlake >=0.4.2,<0.5
+    - json_mlake >=0.4.3,<0.5
     # flare's threading is an adapter over threads.mojo rather than its own
     # pthread binding, so `threads` has to be importable wherever flare is.
     # Having exactly one library bind a given libc symbol is what lets flare
