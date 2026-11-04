@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `fcntl` is declared variadic (two fixed arguments) in `_fcntl2` and
+  `_set_cloexec`, as dista and orca declare it. A Linux program that linked
+  flare's HTTP client beside dista failed to compile ("failed to legalize
+  operation 'pop.external_call'"), because the two declarations differed.
+  `tests/net/test_fcntl_decl.mojo` links both.
+
 ## [0.13.1] - 2026-11-03
 
 ### Changed

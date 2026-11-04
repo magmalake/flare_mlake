@@ -780,8 +780,13 @@ def _setsockopt(
 
 @always_inline
 def _fcntl2(fd: c_int, cmd: c_int, arg: c_int) -> c_int:
-    """Wrapper around ``fcntl(fd, cmd, arg)``."""
-    return external_call["fcntl", c_int](fd, cmd, arg)
+    """Wrapper around ``fcntl(fd, cmd, arg)``.
+
+    Declared variadic (two fixed arguments), as dista and orca declare it:
+    a program that links two different declarations of ``fcntl`` doesn't
+    compile on Linux.
+    """
+    return external_call["fcntl", c_int, num_fixed_args=2](fd, cmd, arg)
 
 
 @always_inline
