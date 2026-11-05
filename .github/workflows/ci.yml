@@ -116,13 +116,13 @@ jobs:
   # upstream's suite to keep green.
   tests:
     needs: release
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.release.outputs.release_only != 'true' }}
     name: tests / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.release.outputs.release_only == 'true' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest"]') }}
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
