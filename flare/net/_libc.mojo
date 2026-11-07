@@ -530,9 +530,9 @@ def _accept(
             fd, addr.unsafe_bitcast[NoneType](), addrlen, _SOCK_CLOEXEC_LINUX
         )
     else:
-        var cfd = external_call["accept", c_int](
-            fd, addr.unsafe_bitcast[NoneType](), addrlen
-        )
+        # By address, as dista declares accept: one program may link
+        # both, and two `external_call`s of one symbol must agree.
+        var cfd = external_call["accept", c_int](fd, Int(addr), Int(addrlen))
         _set_cloexec(cfd)
         return cfd
 
