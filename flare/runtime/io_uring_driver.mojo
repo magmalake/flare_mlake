@@ -177,27 +177,20 @@ def libc_mmap(
     debug_assert[assert_mode="safe"](
         fd >= -1, "libc_mmap: fd must be >= -1; got ", fd
     )
-    # Pointer is non-nullable; build C NULL from a runtime 0.
-    var null_addr_int = 0
-    var null_addr = Pointer[UInt8, MutUntrackedOrigin](
-        unsafe_from_address=null_addr_int
+    # The signature memory-region (and so every pipeline) declares for
+    # mmap: one program may link both, and two `external_call`s of one
+    # symbol must agree.
+    var rc = external_call["mmap", Int](
+        0, Int(length), Int(prot), Int(flags), Int(fd), Int64(Int(offset))
     )
-    var rc = external_call["mmap", Pointer[UInt8, MutUntrackedOrigin]](
-        null_addr,
-        c_size_t(length),
-        c_int(prot),
-        c_int(flags),
-        c_int(fd),
-        c_long(Int(offset)),
-    )
-    return rc
+    return Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=rc)
 
 
 @always_inline
 def libc_munmap(addr: Pointer[UInt8, MutUntrackedOrigin], length: Int) -> Int:
     """Wrap ``munmap(2)``. Returns 0 on success, ``-errno`` on
     failure."""
-    var rc = external_call["munmap", c_int](addr, c_size_t(length))
+    var rc = external_call["munmap", Int32](Int(addr), Int(length))
     if Int(rc) < 0:
         return -Int(get_errno().value)
     return Int(rc)

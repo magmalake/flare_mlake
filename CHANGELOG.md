@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `mmap` and `munmap` are declared in `flare.runtime.io_uring_driver` as
+  memory-region declares them (`Int` arguments, an `Int64` offset; `Int` and
+  `Int32` results). A Linux program that linked flare beside memory-region
+  or an Iceberg pipeline, such as one binary for all of a project's
+  programs, failed to compile, because the two declarations differed.
+  `tests/net/test_mmap_decl.mojo` links both.
+
 ## [0.13.2] - 2026-11-03
 
 ### Fixed

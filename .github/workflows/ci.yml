@@ -189,6 +189,7 @@ jobs:
           pixi run mojo -I . $THREADS_I tests/tls/test_tls.mojo
           pixi run mojo -I . $THREADS_I tests/net/test_net.mojo
           pixi run mojo -I . $THREADS_I tests/net/test_fcntl_decl.mojo
+          pixi run mojo -I . $THREADS_I tests/net/test_mmap_decl.mojo
           pixi run mojo -I . $THREADS_I tests/crypto/test_base64.mojo
           pixi run mojo -I . $THREADS_I tests/crypto/test_hmac.mojo
 
