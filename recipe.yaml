@@ -1,32 +1,18 @@
 # rattler-build recipe for flare
-# Distributes flare and its inlined json dependency as their *source* trees
-# under $PREFIX/lib/mojo/ rather than as pre-compiled .mojopkg artifacts —
-# same shape as ehsanmok/sqlite. Consumers' Mojo resolves
-# ``from flare.http import ...`` and the transitive ``from json import ...``
-# directly from these source files at their own compile time.
+# Ships flare as a precompiled `flare.mojoc` under $PREFIX/lib/mojo/, plus
+# its C/C++ FFI shared objects. Consumers' Mojo loads the .mojoc instead of
+# parsing the source tree on every build (census #153: flare and json from
+# source were 43% of a no-change census rebuild's frontend).
 #
-# Why source-level distribution rather than ``mojo package``:
-#   1. A ``.mojopkg`` produced by ``mojo package`` embeds the compiler
-#      version it was built with and refuses to load against any other
-#      version (``Mojo package is incompatible: package version X is
-#      newer/older than compiler version Y``). That tightly couples the
-#      published .conda artifact to a specific Mojo version, so even a
-#      benign Mojo bump on the consumer side invalidates flare overnight.
-#   2. ``mojo package`` also adds an extra Mojo run during the recipe
-#      build, which a stale build cache or an unrelated Mojo toolchain
-#      issue can break in ways unrelated to flare's own source.
-# Source distribution sidesteps both: the .conda has zero ABI-locked
-# binary content from Mojo, only the source files plus the C++ FFI .so's.
-# The ``run: mojo == ...`` pin in the requirements still tells solvers
-# which compiler to use — the difference is the lock now lives where
-# it's easy to update (a one-line bump in this recipe), not embedded in
-# a binary blob.
+# A .mojoc only loads in the compiler version that built it, so the build
+# pins `mojo-compiler` exactly. Every other magmalake tin already does this
+# and moves in lockstep with Mojo releases; flare now moves with them.
 #
-# json source is inlined from the git commit named in the ``source:``
-# block below (whose own recipe pins the same Mojo version) until json
-# publishes to a public conda channel; at that point the inline ``json``
-# source step + the ``cp -r json-src/json`` can be replaced with a
-# ``host: [json]`` requirement.
+# Precompiling resolves flare's imports, so json and threads have to be
+# importable at build time. They are pixi source tins on no channel, so they
+# come in as extra git sources at the revisions pinned in pixi.toml and are
+# put on the include path only; they are not installed. Consumers get them
+# from their own json_mlake and threads-mojo packages, as before.
 #
 # What this package does NOT ship: ``libflare_rustls_quic.so``, the
 # rustls cdylib that backs QUIC and therefore HTTP/3 TLS. Building it
@@ -57,15 +43,24 @@ source:
   # a file conflict the moment an environment wants both, which any consumer
   # using JSON directly alongside flare would hit.
   - path: .
+  # Build-time only: on the include path for `mojo precompile`, not installed.
+  # Keep these at the revisions pixi.toml pins.
+  - git: https://github.com/magmalake/json_mlake.git
+    rev: bcaa7161e757748a1310a213e123bf8810ff7e96
+    target_directory: _deps/json_mlake
+  - git: https://github.com/magmalake/threads.mojo.git
+    rev: f45e780a8de77278c140cee36904e46e93e0ca1c
+    target_directory: _deps/threads
 
 build:
   script:
     - mkdir -p $PREFIX/lib/mojo
-    # ── flare source staged under $PREFIX/lib/mojo/ ──────────────────────
-    # Mojo discovers this the same way it discovers .mojopkg files in that
-    # directory; no ``mojo package`` step required. json arrives the same way
-    # from the json_mlake package.
-    - cp -r flare $PREFIX/lib/mojo/
+    # ── flare.mojoc (json and threads from _deps/, see the header) ───────
+    - mojo precompile flare
+        -I _deps/json_mlake
+        -I _deps/threads/src
+        -I _deps/threads/compat
+        -o $PREFIX/lib/mojo/flare.mojoc
     # ── flare: OpenSSL TLS FFI wrapper ───────────────────────────────────
     - $CXX -O2 -std=c++17 -fPIC -DNDEBUG -shared
         -o $PREFIX/lib/libflare_tls.so
@@ -110,6 +105,7 @@ requirements:
   build:
     - ${{ compiler('c') }}     # zlib wrapper
     - ${{ compiler('cxx') }}   # OpenSSL wrapper
+    - mojo-compiler ==1.2.0
   host:
     # Matches the pin in pixi.toml. This read `>=3.0,<4`, which would
     # solve to an OpenSSL the library has never been built against.
@@ -121,7 +117,7 @@ requirements:
     - libbrotlidec >=1.2.1,<2
     - libbrotlienc >=1.2.1,<2
   run:
-    - mojo >=1.2.0,<2.0.0
+    - mojo-compiler >=1.2.0,<2
     - openssl >=3.6.1,<4
     - ca-certificates
     - zlib >=1.3.1,<2        # libflare_zlib.so is loaded at runtime
@@ -157,7 +153,7 @@ tests:
         - lib/libflare_zlib.so
         - lib/libflare_brotli.so
         - lib/libflare_fs.so
-        - lib/mojo/flare/__init__.mojo
+        - lib/mojo/flare.mojoc
 
 about:
   homepage: https://github.com/ehsanmok/flare
