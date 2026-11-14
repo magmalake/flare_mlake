@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- Pins json_mlake 0.5.1 in the recipe as well as pixi.toml, and requires
+  `json_mlake >=0.5.1,<0.6`: 0.14.0 built `flare.mojoc` against json_mlake
+  0.4.2 and recorded itself as 0.13.2. CI now fails when recipe.yaml,
+  pixi.toml and shelf.toml disagree on the version or on a git source's rev.
+
 ## [0.14.0] - 2026-11-13
 
 - The package installs a precompiled `flare.mojoc` instead of the source tree. (#20)

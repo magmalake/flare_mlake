@@ -42,7 +42,7 @@ threads-mojo = { git = "https://github.com/magmalake/threads.mojo.git", branch =
 # consumer needs it too. Declared here as a git source dependency, which is
 # exactly how mojoshelf tins are consumed ('pixi shelf add' writes the same
 # shape, pinned at the published revision).
-json_mlake = { git = "https://github.com/magmalake/json_mlake.git", rev = "bcaa7161e757748a1310a213e123bf8810ff7e96" }
+json_mlake = { git = "https://github.com/magmalake/json_mlake.git", rev = "27c05c1c0c2881abfb33ce8eefae4d44d8b602a9" }
 TOML
 
 cat > smoke.mojo <<'MOJO'

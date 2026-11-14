@@ -29,7 +29,9 @@ context:
   # Renaming only the package keeps every import unchanged, so switching to an
   # official flare package later is a one-line dependency change.
   name: flare_mlake
-  version: "0.13.2"
+  # Must equal shelf.toml and pixi.toml; .github/check-versions.py fails CI
+  # otherwise (`shelf release` bumps only those two).
+  version: "0.14.1"
 
 package:
   name: ${{ name }}
@@ -44,9 +46,10 @@ source:
   # using JSON directly alongside flare would hit.
   - path: .
   # Build-time only: on the include path for `mojo precompile`, not installed.
-  # Keep these at the revisions pixi.toml pins.
+  # Keep these at the revisions pixi.toml pins (.github/check-versions.py
+  # checks it; `shelf release` repins pixi.toml only).
   - git: https://github.com/magmalake/json_mlake.git
-    rev: bcaa7161e757748a1310a213e123bf8810ff7e96
+    rev: 27c05c1c0c2881abfb33ce8eefae4d44d8b602a9
     target_directory: _deps/json_mlake
   - git: https://github.com/magmalake/threads.mojo.git
     rev: f45e780a8de77278c140cee36904e46e93e0ca1c
@@ -130,7 +133,7 @@ requirements:
     # package, so an environment can hold both flare and json without a
     # file conflict — and json security fixes arrive by upgrading json_mlake
     # rather than by rebuilding flare.
-    - json_mlake >=0.4.3,<0.5
+    - json_mlake >=0.5.1,<0.6
     # flare's threading is an adapter over threads.mojo rather than its own
     # pthread binding, so `threads` has to be importable wherever flare is.
     # Having exactly one library bind a given libc symbol is what lets flare
