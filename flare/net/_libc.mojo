@@ -530,9 +530,8 @@ def _accept(
             fd, addr.unsafe_bitcast[NoneType](), addrlen, _SOCK_CLOEXEC_LINUX
         )
     else:
-        var cfd = external_call["accept", c_int](
-            fd, addr.unsafe_bitcast[NoneType](), addrlen
-        )
+        # `Int` addresses, as dista declares accept(2): see _send.
+        var cfd = external_call["accept", c_int](fd, Int(addr), Int(addrlen))
         _set_cloexec(cfd)
         return cfd
 
@@ -544,9 +543,8 @@ def _connect(fd: c_int, addr: Pointer[UInt8, _], addrlen: c_uint) -> c_int:
         Int(addr) != 0 and Int(addrlen) > 0,
         "_connect: null addr or zero addrlen",
     )
-    return external_call["connect", c_int](
-        fd, addr.unsafe_bitcast[NoneType](), addrlen
-    )
+    # Declared as dista and Mosaad-M/tcp declare it: see _send.
+    return external_call["connect", Int32](fd, Int(addr), Int32(addrlen))
 
 
 @always_inline
@@ -589,9 +587,13 @@ def _send(
     debug_assert[assert_mode="safe"](
         Int(n) == 0 or Int(buf) != 0, "_send: null buffer with non-zero length"
     )
-    return external_call["send", c_ssize_t](
-        fd, buf.unsafe_bitcast[NoneType](), n, flags
-    )
+    # Mojo allows one signature per C symbol in a program, so send, recv,
+    # connect, accept, setsockopt, getsockopt, poll and getaddrinfo are
+    # declared exactly as dista and Mosaad-M/tcp declare them (`Int32` ints,
+    # `Int` addresses and sizes); a binary can then import flare and dista
+    # together. `buf` is borrowed from the caller, so the memory it points at
+    # outlives the call.
+    return external_call["send", Int](fd, Int(buf), Int(n), flags)
 
 
 @always_inline
@@ -627,9 +629,8 @@ def _recv(
     debug_assert[assert_mode="safe"](
         Int(n) == 0 or Int(buf) != 0, "_recv: null buffer with non-zero length"
     )
-    return external_call["recv", c_ssize_t](
-        fd, buf.unsafe_bitcast[NoneType](), n, flags
-    )
+    # Declared as dista and Mosaad-M/tcp declare it: see _send.
+    return external_call["recv", Int](fd, Int(buf), Int(n), flags)
 
 
 @always_inline
@@ -773,8 +774,9 @@ def _setsockopt(
     optlen: c_uint,
 ) -> c_int:
     """Wrapper around ``setsockopt(2)``."""
-    return external_call["setsockopt", c_int](
-        fd, level, optname, optval.unsafe_bitcast[NoneType](), optlen
+    # Declared as dista and Mosaad-M/tcp declare it: see _send.
+    return external_call["setsockopt", Int32](
+        fd, level, optname, Int(optval), Int32(optlen)
     )
 
 
@@ -804,8 +806,9 @@ def _getsockopt(
     optlen: Pointer[c_uint, _],
 ) -> c_int:
     """Wrapper around ``getsockopt(2)``."""
-    return external_call["getsockopt", c_int](
-        fd, level, optname, optval.unsafe_bitcast[NoneType](), optlen
+    # Declared as dista and Mosaad-M/tcp declare it: see _send.
+    return external_call["getsockopt", Int32](
+        fd, level, optname, Int(optval), Int(optlen)
     )
 
 
@@ -821,9 +824,8 @@ def _poll(fds: Pointer[UInt8, _], nfds: c_uint, timeout_ms: c_int) -> c_int:
     Returns:
         Number of fds with events, 0 on timeout, -1 on error.
     """
-    return external_call["poll", c_int](
-        fds.unsafe_bitcast[NoneType](), nfds, timeout_ms
-    )
+    # Declared as dista and Mosaad-M/tcp declare it: see _send.
+    return external_call["poll", Int32](Int(fds), Int(nfds), timeout_ms)
 
 
 @always_inline
@@ -849,12 +851,16 @@ def _getaddrinfo(
         0 on success, non-zero ``EAI_*`` error code on failure.
     """
     var host_copy = host
-    return external_call["getaddrinfo", c_int](
-        host_copy.as_c_string_span(),
-        Optional[Pointer[UInt8, MutUntrackedOrigin]](None),
-        hints.unsafe_bitcast[NoneType](),
-        res_slot.unsafe_bitcast[NoneType](),
+    # Declared as dista declares it, with `Int` addresses: see _send.
+    var rc = external_call["getaddrinfo", Int32](
+        Int(host_copy.as_c_string_span().ptr()),
+        Int(0),
+        Int(hints),
+        Int(res_slot),
     )
+    # The call only saw the string's address: keep the string alive past it.
+    _ = host_copy^
+    return rc
 
 
 @always_inline
