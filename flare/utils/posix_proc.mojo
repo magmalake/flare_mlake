@@ -41,6 +41,7 @@ waitpid(pid)
 """
 
 from std.ffi import c_int, external_call
+from std.memory import stack_allocation
 
 
 # ── Signal numbers ──────────────────────────────────────────────────────────
@@ -89,7 +90,11 @@ def waitpid(pid: Int):
     Args:
         pid: The child PID returned by :func:`fork`.
     """
-    _ = external_call["waitpid", c_int](c_int(pid), 0, c_int(0))
+    # A status pointer rather than NULL, as dista declares waitpid: Mojo
+    # allows one signature per C symbol in a program.
+    var status = stack_allocation[1, c_int]()
+    status[] = 0
+    _ = external_call["waitpid", c_int](c_int(pid), status, c_int(0))
 
 
 @always_inline
@@ -127,7 +132,8 @@ def exit(code: Int = 0):
     Args:
         code: Process exit status (usually ``0``).
     """
-    _ = external_call["_exit", c_int](c_int(code))
+    # Returns nothing, as dista declares it: one signature per C symbol.
+    external_call["_exit", NoneType](c_int(code))
 
 
 @always_inline

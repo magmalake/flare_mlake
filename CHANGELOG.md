@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- Declares libc's `send`, `recv`, `connect`, `accept`, `setsockopt`,
+  `getsockopt`, `poll`, `getaddrinfo`, `waitpid` and `_exit` as dista does,
+  so a binary that imports flare and dista (morca) compiles again.
+  `tests/net/test_libc_abi.mojo` links both.
+
 ## [0.14.1] - 2026-11-14
 
 - Pins json_mlake 0.5.1 in the recipe as well as pixi.toml, and requires

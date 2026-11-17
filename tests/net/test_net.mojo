@@ -477,16 +477,17 @@ def test_socketaddr_parse_rejects_ports_out_of_range() raises:
 
 def test_sockets_are_close_on_exec() raises:
     """Listeners and accepted connections were inherited across exec."""
-    from std.ffi import c_int, external_call
+    from std.ffi import c_int
+    from flare.net._libc import _fcntl2
     from flare.tcp import TcpListener, TcpStream
 
     var lis = TcpListener.bind(SocketAddr.localhost(0))
     var c = TcpStream.connect(SocketAddr.localhost(lis.local_addr().port))
     var a = lis.accept()
     for fd in [lis._socket.fd, c._socket.fd, a._socket.fd]:
-        var flags = external_call["fcntl", c_int](
-            fd, c_int(1), c_int(0)
-        )  # F_GETFD
+        # flare's own fcntl: a second, non-variadic declaration of it
+        # conflicts with flare's in one binary (tests/_agg/agg_net.mojo).
+        var flags = _fcntl2(fd, c_int(1), c_int(0))  # F_GETFD
         assert_true(flags >= c_int(0))
         assert_true((flags & c_int(1)) != c_int(0), "fd not close-on-exec")
     _ = a^
