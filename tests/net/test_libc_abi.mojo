@@ -93,6 +93,10 @@ def _sol_socket() -> c_int:
     return 0xFFFF if CompilationTarget.is_macos() else 1
 
 
+def _so_reuseaddr() -> c_int:
+    return 0x0004 if CompilationTarget.is_macos() else 2
+
+
 def _so_error() -> c_int:
     return 0x1007 if CompilationTarget.is_macos() else 4
 
@@ -137,7 +141,7 @@ def test_flare_and_dista_declarations_link_together() raises:
             _setsockopt(
                 cfd,
                 _sol_socket(),
-                0x0004,  # SO_REUSEADDR, the same value on both targets
+                _so_reuseaddr(),
                 v.unsafe_ptr().unsafe_bitcast[UInt8](),
                 c_uint(4),
             )
@@ -145,7 +149,9 @@ def test_flare_and_dista_declarations_link_together() raises:
         0,
     )
     assert_equal(
-        _dista_setsockopt(cfd, _sol_socket(), 0x0004, Int(v.unsafe_ptr()), 4),
+        _dista_setsockopt(
+            cfd, _sol_socket(), _so_reuseaddr(), Int(v.unsafe_ptr()), 4
+        ),
         0,
     )
     v[0] = 99
