@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-11-17
+
 - Declares libc's `send`, `recv`, `connect`, `accept`, `setsockopt`,
   `getsockopt`, `poll`, `getaddrinfo`, `waitpid` and `_exit` as dista does,
   so a binary that imports flare and dista (morca) compiles again.
