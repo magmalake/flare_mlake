@@ -76,7 +76,7 @@ def test_validation_error_typed_round_trip_preserves_fields() raises:
         got_field = e.field.copy()
         got_reason = e.reason.copy()
     assert_equal(got_field, String("chunk_size"))
-    assert_true(got_reason.find("got -3") >= 0)
+    assert_true("got -3" in got_reason)
 
 
 def _wrap_chunk_size_in_bare_raises(n: Int) raises -> Int:
@@ -98,8 +98,8 @@ def test_validation_error_survives_bare_raises_propagation() raises:
         var _n = _wrap_chunk_size_in_bare_raises(0)
     except e:
         msg = String(e)
-    assert_true(msg.find("ValidationError(chunk_size)") >= 0)
-    assert_true(msg.find("must be > 0") >= 0)
+    assert_true("ValidationError(chunk_size)" in msg)
+    assert_true("must be > 0" in msg)
 
 
 # ── IoError ─────────────────────────────────────────────────────────────────

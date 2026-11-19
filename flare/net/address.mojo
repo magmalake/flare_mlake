@@ -110,7 +110,7 @@ struct IpAddr(Copyable, Equatable, ImplicitlyCopyable, Writable):
                 raise AddressParseError(s)
             return IpAddr(
                 String(
-                    StringSlice(
+                    StringSpan(
                         unsafe_from_utf8=CStringSpan(
                             unsafe_from_ptr=ntop.unsafe_bitcast[c_char]()
                         )
@@ -137,7 +137,7 @@ struct IpAddr(Copyable, Equatable, ImplicitlyCopyable, Writable):
                 raise AddressParseError(s)
             return IpAddr(
                 String(
-                    StringSlice(
+                    StringSpan(
                         unsafe_from_utf8=CStringSpan(
                             unsafe_from_ptr=ntop.unsafe_bitcast[c_char]()
                         )

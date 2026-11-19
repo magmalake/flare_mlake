@@ -763,7 +763,7 @@ def _detect_extends(src: String, mut pos: Int) raises TemplateError -> String:
     var n = src.byte_length()
     var scan = 0
     while scan < n:
-        var b = ord(_slice(src, scan, scan + 1))
+        var b = Int(src.as_bytes()[scan])
         if b != 0x20 and b != 0x09 and b != 0x0A and b != 0x0D:
             break
         scan += 1

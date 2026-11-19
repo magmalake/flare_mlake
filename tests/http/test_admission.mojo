@@ -84,11 +84,11 @@ def test_admission() raises:
     assert_equal(g1, "HELLO")
     assert_equal(g2, "HELLO")
     assert_true(
-        shed.find("503") != -1,
+        "503" in shed,
         "expected 503 status in shed response, got: " + shed,
     )
     assert_true(
-        shed.find("Retry-After: 3") != -1,
+        "Retry-After: 3" in shed,
         "expected Retry-After header in shed response, got: " + shed,
     )
     assert_equal(g4, "HELLO")

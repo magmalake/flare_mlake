@@ -105,7 +105,7 @@ struct Pool[T: Deinitable & Movable]:
         """
 
         comptime if size_of[Self.T]() > 0:
-            var p = alloc(Layout[Self.T](count=1)).unsafe_leak()
+            var p = alloc(Layout[Self.T](length=1)).unsafe_leak()
             p.unsafe_write(value^)
             return Int(p)
         else:
@@ -113,7 +113,7 @@ struct Pool[T: Deinitable & Movable]:
             # bitcast. ``init_pointee_move`` writes 0 bytes
             # through the bitcast pointer; reads / dereferences
             # also touch 0 bytes.
-            var raw = alloc(Layout[UInt8](count=1)).unsafe_leak()
+            var raw = alloc(Layout[UInt8](length=1)).unsafe_leak()
             raw.unsafe_bitcast[Self.T]().unsafe_write(value^)
             return Int(raw)
 

@@ -55,7 +55,7 @@ def monotonic_now_s() -> UInt64:
     required and it is immune to wall-clock jumps. Falls back to 0
     on FFI failure (every entry then reads as fresh, which is
     conservative)."""
-    var ts_buf = alloc(Layout[Int](count=2)).unsafe_leak()
+    var ts_buf = alloc(Layout[Int](length=2)).unsafe_leak()
     ts_buf[unsafe_offset=0] = 0
     ts_buf[unsafe_offset=1] = 0
     var rc = external_call["clock_gettime", c_int](_CLOCK_MONOTONIC, ts_buf)
@@ -128,7 +128,7 @@ def _parse_alt_value(alt: String) raises -> AltSvcEntry:
     """
     var parts = alt.split(";")
     var head = String(parts[0].strip())
-    var eq = head.find("=")
+    var eq = head.find("=").or_else(-1)
     if eq < 0:
         raise Error("alt-svc: missing '=' in alt-value")
     var protocol = String(String(head[byte=:eq]).strip())
@@ -137,7 +137,7 @@ def _parse_alt_value(alt: String) raises -> AltSvcEntry:
         raise Error("alt-svc: empty protocol-id")
     # alt-authority is ``[host]:port``; the host half may be empty
     # (same host as the origin). Split on the final colon.
-    var colon = authority.rfind(":")
+    var colon = authority.rfind(":").or_else(-1)
     if colon < 0:
         raise Error("alt-svc: alt-authority without ':'")
     var host = String(String(authority[byte=:colon]).strip())
@@ -149,7 +149,7 @@ def _parse_alt_value(alt: String) raises -> AltSvcEntry:
     var persist = False
     for j in range(1, len(parts)):
         var param = String(parts[j].strip())
-        var peq = param.find("=")
+        var peq = param.find("=").or_else(-1)
         if peq < 0:
             continue
         var name = ascii_lower(String(String(param[byte=:peq]).strip()))
@@ -304,7 +304,7 @@ struct AltSvcStore(Copyable):
     @staticmethod
     def new() -> AltSvcStore:
         """Allocate a fresh, empty store."""
-        var p = alloc(Layout[_AltSvcState](count=1)).unsafe_leak()
+        var p = alloc(Layout[_AltSvcState](length=1)).unsafe_leak()
         p.unsafe_write(_AltSvcState(AltSvcCache()))
         return AltSvcStore(Int(p))
 
@@ -361,7 +361,7 @@ struct AltSvcStore(Copyable):
 
 def _origin_host(origin: String) -> String:
     """The host half of an ``host:port`` origin key."""
-    var colon = origin.rfind(":")
+    var colon = origin.rfind(":").or_else(-1)
     if colon < 0:
         return origin
     return String(origin[byte=:colon])

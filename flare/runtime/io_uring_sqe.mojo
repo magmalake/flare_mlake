@@ -211,7 +211,7 @@ struct IoUringSqe(Movable):
 
     def __init__(out self) raises:
         """Allocate a 64-byte SQE buffer, zero-initialised."""
-        var raw = alloc(Layout[UInt8](count=IO_URING_SQE_BYTES)).unsafe_leak()
+        var raw = alloc(Layout[UInt8](length=IO_URING_SQE_BYTES)).unsafe_leak()
         for i in range(IO_URING_SQE_BYTES):
             raw.unsafe_offset(i).unsafe_write(UInt8(0))
         self._buf = Pointer[UInt8, MutUntrackedOrigin](

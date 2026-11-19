@@ -331,7 +331,7 @@ struct BatchReceiver(Movable):
 
 
 def _alloc_zeroed(n: Int) -> Pointer[UInt8, MutUntrackedOrigin]:
-    var raw = alloc(Layout[UInt8](count=n)).unsafe_leak()
+    var raw = alloc(Layout[UInt8](length=n)).unsafe_leak()
     for i in range(n):
         raw.unsafe_offset(i).unsafe_write(UInt8(0))
     return Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(raw))

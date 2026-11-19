@@ -101,7 +101,7 @@ def _ascii_lower(s: String) -> String:
     return out^
 
 
-def _strip(s: StringSlice[_]) raises -> String:
+def _strip(s: StringSpan[_]) raises -> String:
     """Strip ASCII whitespace from both ends."""
     var bytes = s.as_bytes()
     var n = len(bytes)
@@ -137,7 +137,7 @@ def _parse_one_offer(piece: String) raises -> ExtensionOffer:
         var p = _strip(parts[i])
         if p.byte_length() == 0:
             continue
-        var eq = p.find("=")
+        var eq = p.find("=").or_else(-1)
         var pname: String
         var pvalue: String
         if eq < 0:

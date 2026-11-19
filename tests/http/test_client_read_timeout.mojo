@@ -92,7 +92,7 @@ def test_read_timeout_fires_on_silent_peer() raises:
 
     listener.close()
     assert_true(
-        err.find("Timeout") >= 0,
+        "Timeout" in err,
         String("expected a read timeout, got: ") + err,
     )
 
@@ -195,7 +195,7 @@ def test_tls_handshake_timeout_fires_on_silent_peer() raises:
 
     listener.close()
     assert_true(
-        err.find("Timeout") >= 0,
+        "Timeout" in err,
         String("expected a handshake timeout, got: ") + err,
     )
 
@@ -235,7 +235,7 @@ def test_read_timeout_fires_on_stalled_tls_response() raises:
 
     kill_forked_server(pid)
     assert_true(
-        err.find("Timeout") >= 0,
+        "Timeout" in err,
         String("expected a TLS read timeout, got: ") + err,
     )
 

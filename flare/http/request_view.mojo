@@ -178,9 +178,9 @@ struct RequestView[origin: Origin](Movable):
         self.header_offsets = header_offsets^
 
     @always_inline
-    def url(self) -> StringSlice[Self.origin]:
+    def url(self) -> StringSpan[Self.origin]:
         """Borrowed URL slice."""
-        return StringSlice[Self.origin](
+        return StringSpan[Self.origin](
             unsafe_from_utf8=self.buf[
                 self.url_start : self.url_start + self.url_len
             ]

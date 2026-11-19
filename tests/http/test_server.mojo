@@ -648,7 +648,7 @@ def test_server_response_with_keepalive() raises:
     var raw_req = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
     client.write_all(Span[UInt8, _](raw_req.as_bytes()))
 
-    var req = _parse_http_request(server_stream, 8192, 1024 * 1024)
+    _ = _parse_http_request(server_stream, 8192, 1024 * 1024)
 
     var body_bytes = List[UInt8]()
     for b in "ok".as_bytes():
@@ -681,7 +681,7 @@ def test_server_response_with_close() raises:
     var raw_req = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
     client.write_all(Span[UInt8, _](raw_req.as_bytes()))
 
-    var req = _parse_http_request(server_stream, 8192, 1024 * 1024)
+    _ = _parse_http_request(server_stream, 8192, 1024 * 1024)
 
     var body_bytes = List[UInt8]()
     for b in "ok".as_bytes():
@@ -752,7 +752,7 @@ def test_server_response_content_length() raises:
     var raw_req = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
     client.write_all(Span[UInt8, _](raw_req.as_bytes()))
 
-    var req = _parse_http_request(server_stream, 8192, 1024 * 1024)
+    _ = _parse_http_request(server_stream, 8192, 1024 * 1024)
 
     var body_str = "exactly 13 b"
     var body_bytes = List[UInt8]()
@@ -785,7 +785,7 @@ def test_server_empty_body_response() raises:
     var raw_req = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
     client.write_all(Span[UInt8, _](raw_req.as_bytes()))
 
-    var req = _parse_http_request(server_stream, 8192, 1024 * 1024)
+    _ = _parse_http_request(server_stream, 8192, 1024 * 1024)
 
     var resp = Response(status=Status.NO_CONTENT)
     _write_response_buffered(server_stream, resp, keep_alive=False)

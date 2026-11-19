@@ -60,7 +60,7 @@ def _tls_err(lib: OwnedDLHandle) raises -> String:
     ](lib, "flare_ssl_last_error")
     var p = fn_e()
     return String(
-        StringSlice(
+        StringSpan(
             unsafe_from_utf8=CStringSpan(
                 unsafe_from_ptr=p.unsafe_bitcast[c_char]()
             )

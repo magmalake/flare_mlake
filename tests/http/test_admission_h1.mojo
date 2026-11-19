@@ -110,14 +110,14 @@ def test_admission_h1() raises:
     _ = kill(pid, SIGKILL)
     waitpid(pid)
 
-    assert_true(r1.find("200") != -1, "c1 expected 200, got: " + r1)
-    assert_true(r2.find("200") != -1, "c2 expected 200, got: " + r2)
+    assert_true("200" in r1, "c1 expected 200, got: " + r1)
+    assert_true("200" in r2, "c2 expected 200, got: " + r2)
     assert_true(
         capped.byte_length() == 0,
         "c3 should be backpressured while at cap, got: " + capped,
     )
     assert_true(
-        recovered.find("200") != -1,
+        "200" in recovered,
         "c3 expected 200 after a slot freed, got: " + recovered,
     )
     print("test_admission_h1: passed (cap=2, backpressure + recovery)")

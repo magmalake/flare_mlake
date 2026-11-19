@@ -81,9 +81,9 @@ def bench_spawn_join[os: Bool](n: Int) raises -> Int:
 
 
 def bench_fanout[os: Bool](m: Int) raises -> Int:
-    var sink = alloc(Layout[Int64](count=1)).unsafe_leak()
+    var sink = alloc(Layout[Int64](length=1)).unsafe_leak()
     sink.unsafe_write(0)
-    var handles = alloc(Layout[ThreadHandle](count=m)).unsafe_leak()
+    var handles = alloc(Layout[ThreadHandle](length=m)).unsafe_leak()
     var t0 = perf_counter_ns()
     for i in range(m):
         handles.unsafe_offset(i).unsafe_write(

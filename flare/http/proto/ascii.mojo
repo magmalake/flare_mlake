@@ -82,7 +82,7 @@ def ascii_unchecked_string(span: Span[UInt8, _]) -> String:
 
 
 @always_inline
-def ascii_eq_ignore_case(s: String, lowercase_literal: StringSlice) -> Bool:
+def ascii_eq_ignore_case(s: String, lowercase_literal: StringSpan) -> Bool:
     """Case-insensitive ASCII equality against an already-lowercase literal.
 
     Folds each byte of ``s`` to lower case inline and compares it to

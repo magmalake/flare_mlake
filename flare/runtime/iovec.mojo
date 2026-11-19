@@ -134,7 +134,7 @@ struct IoVecBuf(Movable):
             n > 0, "IoVecBuf: n must be positive; got ", n
         )
         var bytes = n * _IOVEC_BYTES
-        var raw = alloc(Layout[UInt8](count=bytes)).unsafe_leak()
+        var raw = alloc(Layout[UInt8](length=bytes)).unsafe_leak()
         # Zero-init so an unset cell behaves as { NULL, 0 } —
         # writev(2) treats { ptr, 0 } as "skip this cell".
         for i in range(bytes):

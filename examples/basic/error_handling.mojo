@@ -87,14 +87,14 @@ def main() raises:
 
     # Valid address
     try:
-        var result = try_connect("127.0.0.1")
+        _ = try_connect("127.0.0.1")
         print(" Valid IP: connect succeeded (address parsed OK)")
     except e:
         print(" Unexpected error:", e)
 
     # Invalid address
     try:
-        var result = try_connect("not.an.ip.address")
+        _ = try_connect("not.an.ip.address")
         print(" ERROR: should have raised!")
     except e:
         # In production you might match on error type and retry,

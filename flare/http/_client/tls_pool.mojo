@@ -211,7 +211,7 @@ struct TlsConnectionPool(Copyable):
 def _monotonic_ms() -> Int:
     """``CLOCK_MONOTONIC`` in milliseconds; ``0`` on FFI failure
     (which makes idle-timeout eviction a conservative no-op)."""
-    var ts_buf = alloc(Layout[Int](count=2)).unsafe_leak()
+    var ts_buf = alloc(Layout[Int](length=2)).unsafe_leak()
     ts_buf[unsafe_offset=0] = 0
     ts_buf[unsafe_offset=1] = 0
     var rc = external_call["clock_gettime", c_int](_CLOCK_MONOTONIC, ts_buf)

@@ -15,7 +15,7 @@ The upgrade handshake (§4.2):
 from std.builtin.debug_assert import debug_assert
 from std.atomic import Atomic
 from std.ffi import OwnedDLHandle, _get_global, c_int
-from std.memory import Layout, OptionalPointer, Pointer, alloc
+from std.memory import Layout, Pointer, alloc
 
 from .frame import (
     DEFAULT_MAX_FRAME_BYTES,
@@ -1143,16 +1143,18 @@ comptime DEFAULT_MAX_OFFLOADED_WS: Int = 4096
 
 
 def _offload_cell_init() -> (
-    OptionalPointer[NoneType, UntrackedOrigin[mut=True]]
+    Optional[Pointer[NoneType, UntrackedOrigin[mut=True]]]
 ):
-    var raw = alloc(Layout[Int64](count=1)).unsafe_leak()
+    var raw = alloc(Layout[Int64](length=1)).unsafe_leak()
     raw.unsafe_write(Int64(0))
     return Pointer[NoneType, UntrackedOrigin[mut=True]](
         unsafe_from_address=Int(raw)
     )
 
 
-def _offload_cell_keep(p: OptionalPointer[NoneType, UntrackedOrigin[mut=True]]):
+def _offload_cell_keep(
+    p: Optional[Pointer[NoneType, UntrackedOrigin[mut=True]]]
+):
     pass
 
 

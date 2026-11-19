@@ -760,7 +760,7 @@ def _do_last_error(imm lib: OwnedDLHandle) raises -> String:
     )
     var p = f()
     return String(
-        StringSlice(
+        StringSpan(
             unsafe_from_utf8=CStringSpan(
                 unsafe_from_ptr=p.unsafe_bitcast[c_char]()
             )

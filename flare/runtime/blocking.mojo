@@ -443,17 +443,17 @@ def block_in_pool[
     # allocations. Splitting them across allocs (rather than one big
     # block) keeps the per-T parametric step (the result slot) cleanly
     # separate from the type-erased flag bytes.
-    var result_ptr = alloc(Layout[T](count=1)).unsafe_leak()
-    var err_buf = alloc(Layout[UInt8](count=_ERR_BUF_CAP)).unsafe_leak()
-    var err_len_ptr = alloc(Layout[Int](count=1)).unsafe_leak()
-    var success_ptr = alloc(Layout[UInt8](count=1)).unsafe_leak()
+    var result_ptr = alloc(Layout[T](length=1)).unsafe_leak()
+    var err_buf = alloc(Layout[UInt8](length=_ERR_BUF_CAP)).unsafe_leak()
+    var err_len_ptr = alloc(Layout[Int](length=1)).unsafe_leak()
+    var success_ptr = alloc(Layout[UInt8](length=1)).unsafe_leak()
 
     # Initialise flags to 0. (T's slot is uninitialised; the worker
     # unsafe_write's into it on success.)
     err_len_ptr[unsafe_offset=0] = 0
     success_ptr[unsafe_offset=0] = UInt8(0)
 
-    var task_ptr = alloc(Layout[_Task[T]](count=1)).unsafe_leak()
+    var task_ptr = alloc(Layout[_Task[T]](length=1)).unsafe_leak()
     task_ptr.unsafe_write(
         _Task[T](
             work=work,

@@ -82,7 +82,7 @@ Both types are ``Copyable`` (which implies ``Movable``) and
 
 from std.collections import Optional
 from std.format import Writable, Writer
-from std.io.file_descriptor import RawFileDescriptor
+from std.sys import stderr
 
 
 comptime HTTP_STATUS_ERROR_PREFIX: String = "HttpStatusError("
@@ -258,14 +258,14 @@ def parse_status_error(error_str: String) -> Optional[MappedHandlerError]:
     if not error_str.startswith(HTTP_STATUS_ERROR_PREFIX):
         return Optional[MappedHandlerError]()
     var lp = HTTP_STATUS_ERROR_PREFIX.byte_length() - 1  # index of the '('
-    var rp = error_str.find(")", lp)
+    var rp = error_str.find(")", lp).or_else(-1)
     if rp <= lp + 1:
         return Optional[MappedHandlerError]()
     try:
         var status = Int(String(error_str[byte = lp + 1 : rp]))
         if status < 100 or status > 599:
             return Optional[MappedHandlerError]()
-        var marker = error_str.find("): ", lp)
+        var marker = error_str.find("): ", lp).or_else(-1)
         var message = http_reason_phrase(status)
         if marker != -1:
             message = String(error_str[byte = marker + 3 :])
@@ -344,9 +344,7 @@ def log_error_response(kind: String, request_id: String, message: String):
     gets a fixed status reason, the operator gets the message and the
     request id that ties it to a request.
     """
-    print(
-        format_error_log(kind, request_id, message), file=RawFileDescriptor(2)
-    )
+    print(format_error_log(kind, request_id, message), file=stderr)
 
 
 def log_handler_error(request_id: String, error_str: String):

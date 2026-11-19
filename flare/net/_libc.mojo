@@ -354,7 +354,7 @@ def _read_ip_from_sockaddr(buf: Pointer[UInt8, _]) raises -> String:
     if ntop_buf[unsafe_offset=0] == 0:
         raise Error("inet_ntop failed: errno " + String(get_errno()))
     return String(
-        StringSlice(
+        StringSpan(
             unsafe_from_utf8=CStringSpan(
                 unsafe_from_ptr=ntop_buf.unsafe_bitcast[c_char]()
             )
@@ -392,7 +392,7 @@ def _read_ipv6_from_sockaddr(buf: Pointer[UInt8, _]) raises -> String:
     if ntop_buf[unsafe_offset=0] == 0:
         raise Error("inet_ntop (IPv6) failed: errno " + String(get_errno()))
     return String(
-        StringSlice(
+        StringSpan(
             unsafe_from_utf8=CStringSpan(
                 unsafe_from_ptr=ntop_buf.unsafe_bitcast[c_char]()
             )
@@ -439,7 +439,7 @@ def _strerror(code: c_int) -> String:
     if ptr[unsafe_offset=0] == 0:
         return "unknown error " + String(code)
     return String(
-        StringSlice(
+        StringSpan(
             unsafe_from_utf8=CStringSpan(
                 unsafe_from_ptr=ptr.unsafe_bitcast[c_char]()
             )
@@ -894,7 +894,7 @@ def _gai_strerror(code: c_int) -> String:
     if ptr[unsafe_offset=0] == 0:
         return "unknown getaddrinfo error " + String(code)
     return String(
-        StringSlice(
+        StringSpan(
             unsafe_from_utf8=CStringSpan(
                 unsafe_from_ptr=ptr.unsafe_bitcast[c_char]()
             )

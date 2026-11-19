@@ -87,7 +87,7 @@ def _slot_addr_idx(slot: Int) -> Int:
 @always_inline
 def _atomic_load(block: Int, idx: Int) -> Int64:
     var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=block)
-    return Atomic[Int64].load[ordering=Ordering.ACQUIRE](
+    return Atomic[Int64].load[ordering=Ordering.acquire](
         (p.unsafe_offset(idx)).unsafe_bitcast[Scalar[DType.int64]]()
     )
 
@@ -115,7 +115,7 @@ def _settle(block: Int, slot: Int) -> Int64:
 @always_inline
 def _atomic_store(block: Int, idx: Int, v: Int64):
     var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=block)
-    Atomic[Int64].store[ordering=Ordering.RELEASE](
+    Atomic[Int64].store[ordering=Ordering.release](
         (p.unsafe_offset(idx)).unsafe_bitcast[Scalar[DType.int64]](), v
     )
 
@@ -207,7 +207,7 @@ def _watchdog_main(arg: _OpaquePtr) -> _OpaquePtr:
                     var cp = Pointer[Int64, MutUntrackedOrigin](
                         unsafe_from_address=Int(addr)
                     )
-                    Atomic[Int64].store[ordering=Ordering.RELEASE](
+                    Atomic[Int64].store[ordering=Ordering.release](
                         cp.unsafe_bitcast[Scalar[DType.int64]](),
                         _TIMEOUT_REASON,
                     )
@@ -236,7 +236,7 @@ struct DeadlineWatchdog(Movable):
 
     def __init__(out self, poll_ms: Int = 1) raises:
         """Allocate the control block and spawn the watchdog thread."""
-        var raw = alloc(Layout[Int64](count=_BLOCK_LEN)).unsafe_leak()
+        var raw = alloc(Layout[Int64](length=_BLOCK_LEN)).unsafe_leak()
         for i in range(_BLOCK_LEN):
             (raw.unsafe_offset(i)).unsafe_write(Int64(0))
         self._block = Int(raw)

@@ -56,7 +56,7 @@ def bench_header_encode(mut b: Bencher) raises:
         var s = wire_str
         var ptr = s.unsafe_ptr()
         for i in range(s.byte_length()):
-            wire.append(ptr[i])
+            wire.append(ptr[unsafe_offset=i])
         keep(wire)
 
     b.iter(call_fn)
@@ -108,16 +108,16 @@ def bench_request_encode(mut b: Bencher) raises:
         var wire = List[UInt8](capacity=512)
         var line = req.method + " " + req.url + " " + req.version + "\r\n"
         for i in range(line.byte_length()):
-            wire.append(line.unsafe_ptr()[i])
+            wire.append(line.unsafe_ptr()[unsafe_offset=i])
         for i in range(req.headers.len()):
             var k = req.headers._keys[i]
             var v = req.headers._values[i]
             for j in range(k.byte_length()):
-                wire.append(k.unsafe_ptr()[j])
+                wire.append(k.unsafe_ptr()[unsafe_offset=j])
             wire.append(58)
             wire.append(32)
             for j in range(v.byte_length()):
-                wire.append(v.unsafe_ptr()[j])
+                wire.append(v.unsafe_ptr()[unsafe_offset=j])
             wire.append(13)
             wire.append(10)
         wire.append(13)
@@ -164,21 +164,21 @@ def bench_response_encode(mut b: Bencher) raises:
             "HTTP/1.1 " + String(resp.status) + " " + reason + "\r\n"
         )
         for i in range(status_line.byte_length()):
-            wire.append(status_line.unsafe_ptr()[i])
+            wire.append(status_line.unsafe_ptr()[unsafe_offset=i])
         for i in range(resp.headers.len()):
             var k = resp.headers._keys[i]
             var v = resp.headers._values[i]
             for j in range(k.byte_length()):
-                wire.append(k.unsafe_ptr()[j])
+                wire.append(k.unsafe_ptr()[unsafe_offset=j])
             wire.append(58)
             wire.append(32)
             for j in range(v.byte_length()):
-                wire.append(v.unsafe_ptr()[j])
+                wire.append(v.unsafe_ptr()[unsafe_offset=j])
             wire.append(13)
             wire.append(10)
         var cl_header = "content-length: " + String(body_len) + "\r\n"
         for i in range(cl_header.byte_length()):
-            wire.append(cl_header.unsafe_ptr()[i])
+            wire.append(cl_header.unsafe_ptr()[unsafe_offset=i])
         wire.append(13)
         wire.append(10)
         for i in range(body_len):
@@ -235,7 +235,7 @@ def bench_response_parse(mut b: Bencher) raises:
                 break
             var colon_pos = -1
             for j in range(line.byte_length()):
-                if line.unsafe_ptr()[j] == 58:
+                if line.unsafe_ptr()[unsafe_offset=j] == 58:
                     colon_pos = j
                     break
             if colon_pos >= 0:

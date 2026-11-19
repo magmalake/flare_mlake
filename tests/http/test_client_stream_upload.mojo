@@ -202,9 +202,9 @@ def _raw_server(var conn: TcpStream) raises:
                 var head = String(
                     unsafe_from_utf8=Span[UInt8, _](raw)[0:hdr_end]
                 ).lower()
-                var k = head.find("content-length:")
+                var k = head.find("content-length:").or_else(-1)
                 if k >= 0:
-                    var e = head.find("\r\n", k)
+                    var e = head.find("\r\n", k).or_else(-1)
                     var v = String(
                         unsafe_from_utf8=head.as_bytes()[k + 15 : e]
                     ).strip()

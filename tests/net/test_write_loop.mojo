@@ -38,7 +38,7 @@ struct _ScriptedWriter(_ChunkWriter):
 
     def __init__(out self, var script: List[Int]):
         self.script = script^
-        var raw = alloc(Layout[Int](count=1 + _LOG_SLOTS)).unsafe_leak()
+        var raw = alloc(Layout[Int](length=1 + _LOG_SLOTS)).unsafe_leak()
         self.state = Pointer[Int, MutUntrackedOrigin](
             unsafe_from_address=Int(raw)
         )

@@ -51,7 +51,7 @@ from flare.utils import SIGKILL, exit, fork, kill
 
 
 def _new_cells(n: Int) -> Int:
-    var raw = alloc(Layout[Int64](count=n)).unsafe_leak()
+    var raw = alloc(Layout[Int64](length=n)).unsafe_leak()
     for i in range(n):
         raw.unsafe_offset(i).unsafe_write(Int64(0))
     return Int(raw)
@@ -74,12 +74,12 @@ def _cell(
 
 @always_inline
 def _load(addr: Int, i: Int) -> Int64:
-    return Atomic[Int64].load[ordering=Ordering.ACQUIRE](_cell(addr, i))
+    return Atomic[Int64].load[ordering=Ordering.acquire](_cell(addr, i))
 
 
 @always_inline
 def _store(addr: Int, i: Int, v: Int64):
-    Atomic[Int64].store[ordering=Ordering.RELEASE](_cell(addr, i), v)
+    Atomic[Int64].store[ordering=Ordering.release](_cell(addr, i), v)
 
 
 def _spin_until_nonzero(addr: Int, i: Int):
@@ -266,7 +266,7 @@ def test_spawn_join_round_trip() raises:
 def test_many_short_tasks() raises:
     comptime N = 1000
     var cells = _new_cells(1)
-    var handles = alloc(Layout[ThreadHandle](count=N)).unsafe_leak()
+    var handles = alloc(Layout[ThreadHandle](length=N)).unsafe_leak()
     for i in range(N):
         handles.unsafe_offset(i).unsafe_write(
             ThreadHandle.spawn[_bump](_OpaquePtr(unsafe_from_address=cells))
@@ -323,7 +323,7 @@ def test_nested_join_under_load() raises:
     # returning; the state-word join must not care.
     comptime N = 64
     var cells = _new_cells(4 * N)
-    var handles = alloc(Layout[ThreadHandle](count=N)).unsafe_leak()
+    var handles = alloc(Layout[ThreadHandle](length=N)).unsafe_leak()
     for i in range(N):
         handles.unsafe_offset(i).unsafe_write(
             ThreadHandle.spawn[_spawn_and_join_child](

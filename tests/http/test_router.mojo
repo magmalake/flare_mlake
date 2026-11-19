@@ -248,8 +248,8 @@ def test_method_not_allowed_includes_allow_header() raises:
     var resp = r.serve(Request(method=Method.POST, url="/users"))
     assert_equal(resp.status, Status.METHOD_NOT_ALLOWED)
     var allow = resp.headers.get("Allow")
-    assert_true(allow.find("GET") >= 0)
-    assert_true(allow.find("DELETE") >= 0)
+    assert_true("GET" in allow)
+    assert_true("DELETE" in allow)
 
 
 def test_method_all_six() raises:
@@ -420,7 +420,7 @@ def test_router_405_with_struct_handler_present() raises:
     var resp = r.serve(Request(method=Method.POST, url="/users"))
     assert_equal(resp.status, Status.METHOD_NOT_ALLOWED)
     var allow = resp.headers.get("Allow")
-    assert_true(allow.find("GET") >= 0)
+    assert_true("GET" in allow)
 
 
 struct _IdEcho(Copyable, Defaultable, Handler):
@@ -508,7 +508,7 @@ def test_router_options_405_lists_allow() raises:
     r.options("/thing", h_opts)
     var resp = r.serve(Request(method=Method.GET, url="/thing"))
     assert_equal(resp.status, Status.METHOD_NOT_ALLOWED)
-    assert_true(resp.headers.get("Allow").find("OPTIONS") >= 0)
+    assert_true("OPTIONS" in resp.headers.get("Allow"))
 
 
 def test_router_custom_fallback() raises:

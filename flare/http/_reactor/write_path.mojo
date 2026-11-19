@@ -53,7 +53,7 @@ def _decimal_digits(n: Int) -> Int:
 
 
 @always_inline
-def _put_str(mut buf: List[UInt8], off: Int, s: StringSlice) -> Int:
+def _put_str(mut buf: List[UInt8], off: Int, s: StringSpan) -> Int:
     """memcpy ``s`` into ``buf`` at ``off``; return the advanced offset.
 
     The caller is responsible for having sized ``buf`` to fit

@@ -87,9 +87,9 @@ def test_negotiate_picks_first_pmd_offer_and_locks_no_context_takeover() raises:
     var t = got.value().copy()
     var hdr = t[0]
     var negotiated = t[1].copy()
-    assert_true(hdr.find("permessage-deflate") >= 0)
-    assert_true(hdr.find("client_no_context_takeover") >= 0)
-    assert_true(hdr.find("server_no_context_takeover") >= 0)
+    assert_true("permessage-deflate" in hdr)
+    assert_true("client_no_context_takeover" in hdr)
+    assert_true("server_no_context_takeover" in hdr)
     assert_true(negotiated.client_no_context_takeover)
     assert_true(negotiated.server_no_context_takeover)
 
@@ -163,10 +163,10 @@ def test_offer_emit_reflects_config_flags() raises:
     cfg.server_no_context_takeover = False
     cfg.client_max_window_bits = 12
     var hdr = build_permessage_deflate_offer(cfg)
-    assert_true(hdr.find("permessage-deflate") >= 0)
-    assert_true(hdr.find("client_no_context_takeover") >= 0)
-    assert_false(hdr.find("server_no_context_takeover") >= 0)
-    assert_true(hdr.find("client_max_window_bits=12") >= 0)
+    assert_true("permessage-deflate" in hdr)
+    assert_true("client_no_context_takeover" in hdr)
+    assert_false("server_no_context_takeover" in hdr)
+    assert_true("client_max_window_bits=12" in hdr)
     # Disabled cfg -> empty header (we offer nothing).
     var off = PermessageDeflateConfig()
     assert_equal(build_permessage_deflate_offer(off), "")

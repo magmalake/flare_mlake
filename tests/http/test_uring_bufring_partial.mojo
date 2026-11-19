@@ -127,10 +127,10 @@ def _send_all(fd: c_int, data: String) raises:
 
 def _count(hay: String, needle: String) -> Int:
     var n = 0
-    var at = hay.find(needle)
+    var at = hay.find(needle).or_else(-1)
     while at >= 0:
         n += 1
-        at = hay.find(needle, at + 1)
+        at = hay.find(needle, at + 1).or_else(-1)
     return n
 
 

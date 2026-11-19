@@ -9,7 +9,7 @@ from flare.runtime.watchdog import DeadlineWatchdog
 
 
 def _new_cell() -> Int:
-    var p = alloc(Layout[Int64](count=1)).unsafe_leak()
+    var p = alloc(Layout[Int64](length=1)).unsafe_leak()
     p.unsafe_write(Int64(0))
     return Int(p)
 
@@ -17,7 +17,7 @@ def _new_cell() -> Int:
 def _read_cell(addr: Int) -> Int:
     var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=addr)
     return Int(
-        Atomic[Int64].load[ordering=Ordering.ACQUIRE](
+        Atomic[Int64].load[ordering=Ordering.acquire](
             p.unsafe_bitcast[Scalar[DType.int64]]()
         )
     )
@@ -25,7 +25,7 @@ def _read_cell(addr: Int) -> Int:
 
 def _set_cell(addr: Int, v: Int64):
     var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=addr)
-    Atomic[Int64].store[ordering=Ordering.RELEASE](
+    Atomic[Int64].store[ordering=Ordering.release](
         p.unsafe_bitcast[Scalar[DType.int64]](), v
     )
 
@@ -71,7 +71,7 @@ def test_rearm_right_after_a_fire_keeps_its_deadline() raises:
     var cell = _new_cell()
     for _ in range(200):
         var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=cell)
-        Atomic[Int64].store[ordering=Ordering.RELEASE](
+        Atomic[Int64].store[ordering=Ordering.release](
             p.unsafe_bitcast[Scalar[DType.int64]](), Int64(0)
         )
         wd.arm(0, 0, cell)

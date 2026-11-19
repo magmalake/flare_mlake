@@ -58,7 +58,7 @@ def _default_path(path: String) -> String:
     including, its last ``/``; ``/`` when that is empty."""
     if path.byte_length() == 0 or not path.startswith("/"):
         return "/"
-    var last = path.rfind("/")
+    var last = path.rfind("/").or_else(-1)
     if last <= 0:
         return "/"
     return String(String(unsafe_from_utf8=path.as_bytes()[:last]))

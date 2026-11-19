@@ -103,7 +103,7 @@ def _request(fd: c_int, req: String) raises -> Int:
     var attempts = 0
     while attempts < 32:
         attempts += 1
-        var head_end = got.find("\r\n\r\n")
+        var head_end = got.find("\r\n\r\n").or_else(-1)
         if head_end >= 0 and got.byte_length() - (head_end + 4) >= _TID_WIDTH:
             return Int(got[byte = head_end + 4 : head_end + 4 + _TID_WIDTH])
         var rc_recv = _recv(fd, buf, c_size_t(4096), c_int(0))

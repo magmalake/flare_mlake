@@ -387,44 +387,44 @@ def test_network_error_str_no_code() raises:
 def test_network_error_str_with_code() raises:
     """NetworkError with errno must include the code."""
     var e = NetworkError("connection refused", 111)
-    assert_true(String(e).find("111") != -1)
+    assert_true("111" in String(e))
 
 
 def test_network_error_message_preserved() raises:
     """NetworkError must preserve the exact message passed in."""
     var e = NetworkError("read timeout after 5000ms")
-    assert_true(String(e).find("read timeout after 5000ms") != -1)
+    assert_true("read timeout after 5000ms" in String(e))
 
 
 def test_connection_refused_str() raises:
     """ConnectionRefused must include the address."""
     var e = ConnectionRefused("127.0.0.1:8080")
-    assert_true(String(e).find("127.0.0.1:8080") != -1)
+    assert_true("127.0.0.1:8080" in String(e))
 
 
 def test_connection_timeout_str() raises:
     """ConnectionTimeout must include address and code."""
     var e = ConnectionTimeout("10.0.0.1:443", 110)
-    assert_true(String(e).find("10.0.0.1:443") != -1)
+    assert_true("10.0.0.1:443" in String(e))
 
 
 def test_address_in_use_str() raises:
     """AddressInUse must include the address."""
     var e = AddressInUse("0.0.0.0:8080")
-    assert_true(String(e).find("0.0.0.0:8080") != -1)
+    assert_true("0.0.0.0:8080" in String(e))
 
 
 def test_address_parse_error_str() raises:
     """AddressParseError must include the bad input."""
     var e = AddressParseError("not_an_ip")
-    assert_true(String(e).find("not_an_ip") != -1)
+    assert_true("not_an_ip" in String(e))
 
 
 def test_address_parse_error_preserves_injection_attempt() raises:
     """AddressParseError with injection chars in input must preserve them safely.
     """
     var e = AddressParseError("127.0.0.1\r\nX-Evil: 1")
-    assert_true(String(e).find("127.0.0.1") != -1)
+    assert_true("127.0.0.1" in String(e))
 
 
 def test_broken_pipe_no_addr() raises:
@@ -436,21 +436,21 @@ def test_broken_pipe_no_addr() raises:
 def test_broken_pipe_with_addr() raises:
     """BrokenPipe with address must include it."""
     var e = BrokenPipe("1.2.3.4:80")
-    assert_true(String(e).find("1.2.3.4:80") != -1)
+    assert_true("1.2.3.4:80" in String(e))
 
 
 def test_dns_error_str() raises:
     """DnsError must include host and reason."""
     var e = DnsError("example.com", 8, "Name or service not known")
-    assert_true(String(e).find("example.com") != -1)
-    assert_true(String(e).find("Name or service not known") != -1)
+    assert_true("example.com" in String(e))
+    assert_true("Name or service not known" in String(e))
 
 
 def test_dns_error_zero_code() raises:
     """DnsError with code=0 must still include host and reason."""
     var e = DnsError("bad.host", 0, "no addresses returned")
-    assert_true(String(e).find("bad.host") != -1)
-    assert_true(String(e).find("no addresses returned") != -1)
+    assert_true("bad.host" in String(e))
+    assert_true("no addresses returned" in String(e))
 
 
 def test_socketaddr_parse_rejects_ports_out_of_range() raises:

@@ -357,7 +357,7 @@ struct Scheduler[F: Frontend](Movable):
         # writes through it. The heap cell is allocated here and
         # freed in ``shutdown()`` after every worker joins. Uses the
         # native Mojo allocator (see ``_scheduler_free_raw``).
-        var stop_ptr = alloc(Layout[Bool](count=1)).unsafe_leak()
+        var stop_ptr = alloc(Layout[Bool](length=1)).unsafe_leak()
         stop_ptr.unsafe_write(False)
         var stop_raw = stop_ptr.unsafe_bitcast[UInt8]()
         var stopping_addr = Int(stop_ptr)
@@ -483,7 +483,7 @@ struct Scheduler[F: Frontend](Movable):
             # when the local ``bound`` goes out of scope at the end
             # of this function. ``shutdown()`` destroys+frees this
             # allocation *after* joining every worker.
-            var lp = alloc(Layout[TcpListener](count=1)).unsafe_leak()
+            var lp = alloc(Layout[TcpListener](length=1)).unsafe_leak()
             lp.unsafe_write(bound^)
             listener_ptr = lp
             s._shared_listener_addr = Int(lp)
@@ -492,7 +492,7 @@ struct Scheduler[F: Frontend](Movable):
         # Preallocate the worker slot array once; grow is not needed
         # because ``num_workers`` is bounded above (<= 256) and fixed.
         s._workers_ptr = alloc(
-            Layout[ThreadHandle](count=num_workers)
+            Layout[ThreadHandle](length=num_workers)
         ).unsafe_leak()
         s._workers_len = 0
 
@@ -505,7 +505,9 @@ struct Scheduler[F: Frontend](Movable):
         if num_workers >= 2 and getenv("FLARE_BALANCE_ACCEPT") != "0":
             s._balance_addr = balance_group_alloc(num_workers)
         for w in range(num_workers):
-            var sp = alloc(Layout[Int64](count=WORKER_STAT_SLOTS)).unsafe_leak()
+            var sp = alloc(
+                Layout[Int64](length=WORKER_STAT_SLOTS)
+            ).unsafe_leak()
             sp[unsafe_offset=WORKER_STAT_INFLIGHT] = Int64(0)
             sp[unsafe_offset=WORKER_STAT_STATUS] = Int64(WORKER_STATUS_RUNNING)
             sp[unsafe_offset=WORKER_STAT_DONE] = Int64(0)
@@ -535,7 +537,7 @@ struct Scheduler[F: Frontend](Movable):
                 try:
                     var pwl = bind_reuseport(addr)
                     pwl._socket.set_nonblocking(True)
-                    var ptr = alloc(Layout[TcpListener](count=1)).unsafe_leak()
+                    var ptr = alloc(Layout[TcpListener](length=1)).unsafe_leak()
                     ptr.unsafe_write(pwl^)
                     s._per_worker_listener_addrs.append(Int(ptr))
                 except e:
@@ -555,7 +557,9 @@ struct Scheduler[F: Frontend](Movable):
                     var xl = bind_reuseport(extra_addrs[j])
                     xl._socket.set_nonblocking(True)
                     var xfd = Int(xl.as_raw_fd())
-                    var xptr = alloc(Layout[TcpListener](count=1)).unsafe_leak()
+                    var xptr = alloc(
+                        Layout[TcpListener](length=1)
+                    ).unsafe_leak()
                     xptr.unsafe_write(xl^)
                     s._per_worker_listener_addrs.append(Int(xptr))
                     per_worker.append(xfd)
@@ -593,7 +597,7 @@ struct Scheduler[F: Frontend](Movable):
             )
             # Native Mojo allocator (see _scheduler_free_raw for why).
             var ctx_ptr = alloc(
-                Layout[_WorkerCtx[Self.F]](count=1)
+                Layout[_WorkerCtx[Self.F]](length=1)
             ).unsafe_leak()
             ctx_ptr.unsafe_write(ctx^)
             var arg = ctx_ptr.unsafe_bitcast[UInt8]()

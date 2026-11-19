@@ -83,7 +83,7 @@ struct WsOverH3Stream(Movable):
             )
         except e:
             var msg = String(e)
-            if msg.find("decode_one: need") >= 0 or msg.find("truncated") >= 0:
+            if "decode_one: need" in msg or "truncated" in msg:
                 return None
             raise e^
         var consumed = dr.consumed

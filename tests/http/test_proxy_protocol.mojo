@@ -436,7 +436,7 @@ def test_proxy_parse_error_v1_carries_version_and_phrase() raises:
         got_version = e.version
         got_what = e.what.copy()
     assert_equal(got_version, 1)
-    assert_true(got_what.find("unknown protocol") >= 0)
+    assert_true("unknown protocol" in got_what)
 
 
 def test_proxy_parse_error_v2_carries_position() raises:

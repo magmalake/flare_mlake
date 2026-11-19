@@ -195,7 +195,7 @@ def test_full_round_trip_writes_response() raises:
     assert_true(n > 0)
     # Body "Hello, World!" should be present.
     var s = String(unsafe_from_utf8=Span[UInt8](rbuf)[:n])
-    assert_true(s.find("Hello, World!") >= 0)
+    assert_true("Hello, World!" in s)
     client.close()
 
 
@@ -285,7 +285,7 @@ def test_malformed_request_produces_400() raises:
     var n = client.read(rbuf.unsafe_ptr(), 2048)
     assert_true(n > 0)
     var s = String(unsafe_from_utf8=Span[UInt8](rbuf)[:n])
-    assert_true(s.find("400") >= 0)
+    assert_true("400" in s)
     client.close()
 
 
@@ -311,7 +311,7 @@ def test_handler_exception_becomes_500() raises:
     var n = client.read(rbuf.unsafe_ptr(), 2048)
     assert_true(n > 0)
     var s = String(unsafe_from_utf8=Span[UInt8](rbuf)[:n])
-    assert_true(s.find("500") >= 0)
+    assert_true("500" in s)
     client.close()
 
 
@@ -345,7 +345,7 @@ def test_oversized_body_returns_413() raises:
     var n = client.read(rbuf.unsafe_ptr(), 2048)
     assert_true(n > 0)
     var s = String(unsafe_from_utf8=Span[UInt8](rbuf)[:n])
-    assert_true(s.find("413") >= 0)
+    assert_true("413" in s)
     client.close()
 
 
@@ -542,7 +542,7 @@ def test_static_head_queues_head_only() raises:
     _ = ch.on_readable_static(resp, cfg)
     assert_equal(ch.state, STATE_WRITING)
     var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
-    var hdr_end = wire.find("\r\n\r\n")
+    var hdr_end = wire.find("\r\n\r\n").or_else(-1)
     assert_true(hdr_end >= 0)
     assert_equal(len(ch.write_buf), hdr_end + 4)
     assert_true("Connection: keep-alive" in wire)
@@ -629,9 +629,9 @@ def test_pipelined_requests_flush_together_in_order() raises:
     assert_equal(ch.state, STATE_WRITING)
     var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
     assert_equal(wire.count("HTTP/1.1 200"), 3)
-    var a = wire.find("\r\n\r\n/a")
-    var b = wire.find("\r\n\r\n/b")
-    var c = wire.find("\r\n\r\n/c")
+    var a = wire.find("\r\n\r\n/a").or_else(-1)
+    var b = wire.find("\r\n\r\n/b").or_else(-1)
+    var c = wire.find("\r\n\r\n/c").or_else(-1)
     assert_true(a >= 0 and a < b and b < c)
     assert_false("/d" in wire)
     client.close()
@@ -664,7 +664,7 @@ def _queued_error(
 
 def _assert_head_only(wire: String, status: String) raises:
     assert_true(status in wire)
-    var hdr_end = wire.find("\r\n\r\n")
+    var hdr_end = wire.find("\r\n\r\n").or_else(-1)
     assert_true(hdr_end >= 0)
     assert_equal(len(wire.as_bytes()), hdr_end + 4)
 
@@ -682,7 +682,7 @@ def test_handler_error_for_head_has_no_body() raises:
     var get_wire = _queued_error(
         "GET / HTTP/1.1\r\nHost: x\r\n\r\n", _raising_handler, cfg
     )
-    var hdr_end = get_wire.find("\r\n\r\n")
+    var hdr_end = get_wire.find("\r\n\r\n").or_else(-1)
     assert_true(len(get_wire.as_bytes()) > hdr_end + 4)
 
 
@@ -722,7 +722,7 @@ def test_parse_errors_for_head_have_no_body() raises:
         _echo_handler,
         cfg413,
     )
-    assert_true(len(post.as_bytes()) > post.find("\r\n\r\n") + 4)
+    assert_true(len(post.as_bytes()) > post.find("\r\n\r\n").or_else(-1) + 4)
 
 
 def test_error_after_head_on_keepalive_conn_keeps_body() raises:
@@ -749,7 +749,7 @@ def test_error_after_head_on_keepalive_conn_keeps_body() raises:
     _ = _drive_readable(ch, r, _raising_handler, cfg)
     assert_true(ch.should_close)
     var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
-    assert_true(len(wire.as_bytes()) > wire.find("\r\n\r\n") + 4)
+    assert_true(len(wire.as_bytes()) > wire.find("\r\n\r\n").or_else(-1) + 4)
     client.close()
 
 
@@ -843,10 +843,10 @@ def test_response_includes_date_header_from_cache() raises:
     var n = client.read(rbuf.unsafe_ptr(), 2048)
     assert_true(n > 0)
     var wire = String(unsafe_from_utf8=Span[UInt8](rbuf)[:n])
-    var date_pos = wire.find("\r\nDate: ")
+    var date_pos = wire.find("\r\nDate: ").or_else(-1)
     assert_true(date_pos >= 0)
     # IMF-fixdate is exactly 29 bytes; the line ends ``GMT\r\n``.
-    var gmt_pos = wire.find(" GMT\r\n", date_pos)
+    var gmt_pos = wire.find(" GMT\r\n", date_pos).or_else(-1)
     assert_true(gmt_pos >= 0)
     assert_equal(gmt_pos - (date_pos + "\r\nDate: ".byte_length()), 25)
     client.close()

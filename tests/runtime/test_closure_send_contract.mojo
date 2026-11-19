@@ -64,7 +64,7 @@ def test_shape_thin_top_level_via_fnhandler() raises:
     var req = Request(method=Method.GET, url="/x")
     var resp = h.serve(req)
     assert_equal(resp.status, Status.OK)
-    assert_true(resp.text().find("thin top-level") >= 0)
+    assert_true("thin top-level" in resp.text())
 
 
 def test_shape_thin_top_level_via_fnhandler_ct() raises:
@@ -103,7 +103,7 @@ def test_shape_handler_struct_state_capture() raises:
     var req = Request(method=Method.GET, url="/p")
     var resp = h.serve(req)
     assert_equal(resp.status, Status.OK)
-    assert_true(resp.text().find("hi /p") >= 0)
+    assert_true("hi /p" in resp.text())
 
 
 def test_shape_handler_struct_composes_with_with_cancel() raises:
@@ -113,7 +113,7 @@ def test_shape_handler_struct_composes_with_with_cancel() raises:
     var req = Request(method=Method.GET, url="/q")
     var resp = h.serve(req, Cancel.never())
     assert_equal(resp.status, Status.OK)
-    assert_true(resp.text().find("ciao /q") >= 0)
+    assert_true("ciao /q" in resp.text())
 
 
 # ── Shape 4: block_in_pool — only thin closures cross pthreads ──────────────
@@ -149,7 +149,7 @@ def test_shape_block_in_pool_propagates_raise() raises:
         var _unused = block_in_pool[Int](_shape_block_boom, Cancel.never())
     except e:
         raised = True
-        assert_true(String(e).find("explode") >= 0)
+        assert_true("explode" in String(e))
     assert_true(raised)
 
 

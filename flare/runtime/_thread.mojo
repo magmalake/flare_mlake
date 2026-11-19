@@ -357,7 +357,7 @@ struct ThreadHandle(Movable):
             # this module is pulled into a fuzz-environment compile
             # (mozz harness).
             var cpuset_ptr = alloc(
-                Layout[UInt8](count=_CPUSET_SIZE)
+                Layout[UInt8](length=_CPUSET_SIZE)
             ).unsafe_leak()
             unsafe_memset_zero(cpuset_ptr, _CPUSET_SIZE)
             var byte_idx = cpu // 8
@@ -399,7 +399,7 @@ def save_thread_affinity() -> Int:
     is nothing to restore (macOS, or ``pthread_getaffinity_np`` failed).
     """
     comptime if CompilationTarget.is_linux():
-        var buf = alloc(Layout[UInt8](count=_CPUSET_BYTES)).unsafe_leak()
+        var buf = alloc(Layout[UInt8](length=_CPUSET_BYTES)).unsafe_leak()
         unsafe_memset_zero(buf, _CPUSET_BYTES)
         var rc = external_call[
             "pthread_getaffinity_np", c_int, UInt64, c_size_t, _OpaquePtr
@@ -434,7 +434,7 @@ def pin_target_cpu(worker_idx: Int) -> Int:
     in a cgroup cpuset had those pins fail and run unpinned.
     """
     comptime if CompilationTarget.is_linux():
-        var buf = alloc(Layout[UInt8](count=_CPUSET_BYTES)).unsafe_leak()
+        var buf = alloc(Layout[UInt8](length=_CPUSET_BYTES)).unsafe_leak()
         unsafe_memset_zero(buf, _CPUSET_BYTES)
         var rc = external_call[
             "sched_getaffinity", c_int, c_int, c_size_t, _OpaquePtr
