@@ -451,7 +451,7 @@ def _alloc_recv_buffer_pool() raises -> Int:
     ``_free_recv_buffer_pool``).
     """
     var size = _URING_BR_NBUFS * _URING_BR_BUF_SIZE
-    var raw = alloc(Layout[UInt8](count=size)).unsafe_leak()
+    var raw = alloc(Layout[UInt8](length=size)).unsafe_leak()
     # Zero-init defensively; kernel will overwrite the prefix of
     # each buffer on every recv, but a stale read of an unused
     # slot (e.g. dump-on-error) shouldn't trip on uninitialised

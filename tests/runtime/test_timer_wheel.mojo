@@ -112,7 +112,7 @@ def test_cancelled_timer_does_not_fire() raises:
     """A cancelled timer does not appear in fired list."""
     var tw = TimerWheel(now_ms=UInt64(0))
     var id1 = tw.schedule(5, UInt64(0x01))
-    var id2 = tw.schedule(10, UInt64(0x02))
+    _ = tw.schedule(10, UInt64(0x02))
     _ = tw.cancel(id1)
     var fired = List[UInt64]()
     tw.advance(UInt64(100), fired)

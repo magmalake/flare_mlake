@@ -63,6 +63,26 @@ deleted at any time.
   per field.** They are never packed; decoding them as a packed block fails on
   any real message.
 
+**Built for the Mojo 1.3 nightly, `1.3.0.dev2026111805`**, the one toolchain
+every magmalake tin uses, not upstream's `mojo >=1.2.0`: the workspace pins
+`mojo` exactly on the `max-nightly` channel, the recipe pins `mojo-compiler`
+exactly (a `.mojoc` loads only in the compiler that built it), and json_mlake,
+threads.mojo and mozz_mlake are at their ports to the same nightly. The source
+changes the nightly needs, all mechanical and worth sending upstream when it
+moves to 1.3: `String.find()` returns an `Optional`, so index uses take
+`.or_else(-1)` and substring checks use `in` (a comparison with `-1` still
+compiles but is constant: the `HttpStatusError` parser in `flare/errors.mojo`
+and `RequestBuilder`'s query join had one); `Response.iter_bytes()`
+raises `StopIteration` at the end, since a `for` loop no longer asks
+`__has_next__`; `ord()` raises, so the template `extends` scan reads the byte;
+`print()` takes `stderr` rather than a `RawFileDescriptor`; hpack's Huffman
+path spans the string with `as_bytes()`; `FileHandle.close()` consumes the
+handle; the deprecated `Ordering.ACQUIRE`/`RELEASE`/`RELAXED`, `Layout(count=)`,
+`OptionalPointer` and `StringSlice` spellings become `Ordering.acquire`/...,
+`Layout(length=)`, `Optional[Pointer]` and `StringSpan`; a `@__parameter` on a
+top-level test function goes; and unused assignments and two lower-case
+doc-string summaries in the tests are fixed.
+
 The four upstream pull requests this distribution used to carry (#11, #14,
 #15, #16) have all merged upstream.
 

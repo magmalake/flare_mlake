@@ -133,10 +133,10 @@ def _exchange_with(raw: String, var config: ServerConfig) raises -> String:
 
 def _count(hay: String, needle: String) -> Int:
     var n = 0
-    var i = hay.find(needle)
+    var i = hay.find(needle).or_else(-1)
     while i >= 0:
         n += 1
-        i = hay.find(needle, i + needle.byte_length())
+        i = hay.find(needle, i + needle.byte_length()).or_else(-1)
     return n
 
 

@@ -49,7 +49,7 @@ struct DatagramInbox(Movable):
     var peers: List[SocketAddr]
 
     def __init__(out self):
-        self.mu = alloc(Layout[UInt8](count=_MUTEX_BYTES)).unsafe_leak()
+        self.mu = alloc(Layout[UInt8](length=_MUTEX_BYTES)).unsafe_leak()
         for i in range(_MUTEX_BYTES):
             self.mu[unsafe_offset=i] = UInt8(0)
         _ = _mutex_init(self.mu)
@@ -89,9 +89,9 @@ def new_inbox_table(workers: Int) -> Int:
     """Heap-allocate one :class:`DatagramInbox` per worker; returns the
     address of the table of their addresses. Freed by
     :func:`free_inbox_table` once every worker has stopped."""
-    var table = alloc(Layout[Int](count=workers)).unsafe_leak()
+    var table = alloc(Layout[Int](length=workers)).unsafe_leak()
     for w in range(workers):
-        var box = alloc(Layout[DatagramInbox](count=1)).unsafe_leak()
+        var box = alloc(Layout[DatagramInbox](length=1)).unsafe_leak()
         box.unsafe_write(DatagramInbox())
         table[unsafe_offset=w] = Int(box)
     return Int(table)

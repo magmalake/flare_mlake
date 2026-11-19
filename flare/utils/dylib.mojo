@@ -75,7 +75,7 @@ from std.os import getenv
 from std.ffi import OwnedDLHandle, _get_global
 
 from ._dlopen import find_library, open_library
-from std.memory import Layout, OptionalPointer, Pointer, alloc
+from std.memory import Layout, Pointer, alloc
 
 
 def dl_sym[
@@ -148,19 +148,19 @@ def find_flare_lib(name: String) -> String:
 
 def _pinned_init[
     name: StaticString
-]() -> OptionalPointer[NoneType, UntrackedOrigin[mut=True]]:
+]() -> Optional[Pointer[NoneType, UntrackedOrigin[mut=True]]]:
     try:
         var lib = OwnedDLHandle(find_flare_lib(name))
-        var cell = alloc(Layout[OwnedDLHandle](count=1)).unsafe_leak()
+        var cell = alloc(Layout[OwnedDLHandle](length=1)).unsafe_leak()
         cell.unsafe_write(lib^)
         return Pointer[NoneType, UntrackedOrigin[mut=True]](
             unsafe_from_address=Int(cell)
         )
     except:
-        return OptionalPointer[NoneType, UntrackedOrigin[mut=True]]()
+        return Optional[Pointer[NoneType, UntrackedOrigin[mut=True]]]()
 
 
-def _pinned_keep(p: OptionalPointer[NoneType, UntrackedOrigin[mut=True]]):
+def _pinned_keep(p: Optional[Pointer[NoneType, UntrackedOrigin[mut=True]]]):
     pass
 
 

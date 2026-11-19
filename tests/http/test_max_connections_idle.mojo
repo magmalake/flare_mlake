@@ -112,7 +112,7 @@ def _get(fd: c_int) raises:
     var attempts = 0
     while attempts < 32:
         attempts += 1
-        if got.find("\r\n\r\n") >= 0:
+        if "\r\n\r\n" in got:
             if not got.startswith("HTTP/1.1 200"):
                 raise Error("unexpected response: " + got)
             return
@@ -128,10 +128,10 @@ def _cpu_seconds(pid: Int) raises -> Float64:
     """User + system CPU time of process ``pid``, from ``/proc``."""
     var f = open("/proc/" + String(pid) + "/stat", "r")
     var text = f.read()
-    f.close()
+    f^.close()
     # Fields after the parenthesised command name; utime and stime are the
     # 12th and 13th of them.
-    var rest = String(text[byte = text.rfind(")") + 2 :])
+    var rest = String(text[byte = text.rfind(")").or_else(-1) + 2 :])
     var parts = rest.split(" ")
     var ticks = Int(parts[11]) + Int(parts[12])
     var hz = Int(external_call["sysconf", Int](c_int(_SC_CLK_TCK)))

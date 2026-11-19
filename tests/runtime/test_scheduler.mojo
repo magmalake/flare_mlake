@@ -311,14 +311,14 @@ def test_start_raises_when_a_worker_listener_cannot_bind() raises:
 
 def _ld(addr: Int) -> Int64:
     var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=addr)
-    return Atomic[Int64].load[ordering=Ordering.ACQUIRE](
+    return Atomic[Int64].load[ordering=Ordering.acquire](
         p.unsafe_bitcast[Scalar[DType.int64]]()
     )
 
 
 def _st(addr: Int, v: Int64):
     var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=addr)
-    Atomic[Int64].store[ordering=Ordering.RELEASE](
+    Atomic[Int64].store[ordering=Ordering.release](
         p.unsafe_bitcast[Scalar[DType.int64]](), v
     )
 
@@ -362,9 +362,9 @@ def _reissued_within(addr: Int, n: Int) -> Bool:
     otherwise fold "a fresh allocation equals an older address" to False.
     """
     # 64 bytes: not the stop flag's size class, so it cannot take the cell.
-    var scratch = Int(alloc(Layout[Int64](count=8)).unsafe_leak())
+    var scratch = Int(alloc(Layout[Int64](length=8)).unsafe_leak())
     for _ in range(n):
-        var q = alloc(Layout[Bool](count=1)).unsafe_leak()
+        var q = alloc(Layout[Bool](length=1)).unsafe_leak()
         q.unsafe_write(False)
         _st(scratch, Int64(Int(q)))
         if Int(_ld(scratch)) == addr:
@@ -382,9 +382,9 @@ def test_drain_keeps_the_stop_flag_allocated_for_a_detached_worker() raises:
     leaked cell can never come back); the calibration below raises instead
     of passing if the allocator would not reissue a freed cell.
     """
-    var c0 = alloc(Layout[Bool](count=1)).unsafe_leak()
-    var c1 = alloc(Layout[Bool](count=1)).unsafe_leak()
-    var c2 = alloc(Layout[Bool](count=1)).unsafe_leak()
+    var c0 = alloc(Layout[Bool](length=1)).unsafe_leak()
+    var c1 = alloc(Layout[Bool](length=1)).unsafe_leak()
+    var c2 = alloc(Layout[Bool](length=1)).unsafe_leak()
     var cal = Int(c0)
     c0.unsafe_free()
     c1.unsafe_free()
@@ -393,7 +393,7 @@ def test_drain_keeps_the_stop_flag_allocated_for_a_detached_worker() raises:
         _reissued_within(cal, 64),
         "setup: the allocator does not reissue a freed cell",
     )
-    var cp = alloc(Layout[Int64](count=3)).unsafe_leak()
+    var cp = alloc(Layout[Int64](length=3)).unsafe_leak()
     var cells = Int(cp)
     _st(cells, 0)
     _st(cells + 8, 0)
@@ -460,7 +460,7 @@ struct _OneStuckFrontend(Copyable, Frontend):
 
 
 def _drain_with_one_stuck(extras: List[SocketAddr]) raises:
-    var cells = Int(alloc(Layout[Int64](count=4)).unsafe_leak())
+    var cells = Int(alloc(Layout[Int64](length=4)).unsafe_leak())
     _st(cells, 0)
     _st(cells + 8, 0)
     _st(cells + 16, -1)
@@ -487,7 +487,7 @@ def _drain_with_one_stuck(extras: List[SocketAddr]) raises:
     var reports = s.drain(timeout_ms=300)
     # glibc hands a just-freed block back to the next same-size alloc.
     var probe = alloc(
-        Layout[Int64](count=_HEADER_SLOTS + 2 * _W_STRIDE)
+        Layout[Int64](length=_HEADER_SLOTS + 2 * _W_STRIDE)
     ).unsafe_leak()
     var group_freed = group != 0 and Int(probe) == group
     probe.unsafe_free()
@@ -563,7 +563,7 @@ def test_drain_keeps_the_shared_listener_open_for_a_detached_worker() raises:
     from std.os import setenv, unsetenv
 
     _ = setenv("FLARE_REUSEPORT_WORKERS", "0")
-    var cells = Int(alloc(Layout[Int64](count=3)).unsafe_leak())
+    var cells = Int(alloc(Layout[Int64](length=3)).unsafe_leak())
     _st(cells, 0)
     _st(cells + 8, 0)
     _st(cells + 16, 0)

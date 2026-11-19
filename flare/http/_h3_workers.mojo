@@ -37,7 +37,7 @@ from .response import Response
 
 
 def new_h3_control() -> Int:
-    var p = alloc(Layout[Int64](count=2)).unsafe_leak()
+    var p = alloc(Layout[Int64](length=2)).unsafe_leak()
     p[unsafe_offset=0] = 0
     p[unsafe_offset=1] = -1
     return Int(p)
@@ -61,14 +61,14 @@ def _cell(addr: Int, i: Int) -> Pointer[Int64, MutUntrackedOrigin]:
 def h3_control_set(addr: Int, i: Int, value: Int):
     """Release-store slot ``i`` of the control cell (no-op at 0)."""
     if addr != 0:
-        Atomic[Int64].store[ordering=Ordering.RELEASE](
+        Atomic[Int64].store[ordering=Ordering.release](
             _cell(addr, i), Int64(value)
         )
 
 
 def h3_control_get(addr: Int, i: Int) -> Int:
     """Acquire-load slot ``i`` of the control cell."""
-    return Int(Atomic[Int64].load[ordering=Ordering.ACQUIRE](_cell(addr, i)))
+    return Int(Atomic[Int64].load[ordering=Ordering.acquire](_cell(addr, i)))
 
 
 # ── One request ─────────────────────────────────────────────────────────
@@ -210,7 +210,7 @@ def serve_h3[
         _serve_loop[H](first, handler, ctl, ws)
         return
     first.config.inbox_table = new_inbox_table(n)
-    var threads = alloc(Layout[ThreadHandle](count=n)).unsafe_leak()
+    var threads = alloc(Layout[ThreadHandle](length=n)).unsafe_leak()
     var ctxs = List[Int]()
     var started = 0
     var err = String("")
@@ -219,7 +219,7 @@ def serve_h3[
             var cfg = first.config.copy()
             cfg.worker_id = w
             cfg.port = first.local_addr().port
-            var ctx = alloc(Layout[_WorkerCtx[H]](count=1)).unsafe_leak()
+            var ctx = alloc(Layout[_WorkerCtx[H]](length=1)).unsafe_leak()
             var mine = Optional[WsH3Hooks](None)
             if ws:
                 mine = ws.value().clone()

@@ -329,7 +329,7 @@ def _monotonic_ms() -> Int:
     a no-op (every entry's age computes to 0), which is
     conservative.
     """
-    var ts_buf = alloc(Layout[Int](count=2)).unsafe_leak()
+    var ts_buf = alloc(Layout[Int](length=2)).unsafe_leak()
     ts_buf[unsafe_offset=0] = 0
     ts_buf[unsafe_offset=1] = 0
     var rc = external_call["clock_gettime", c_int](_CLOCK_MONOTONIC, ts_buf)

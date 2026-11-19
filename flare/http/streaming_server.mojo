@@ -510,7 +510,7 @@ struct StreamConn(Movable):
         self.send(Span[UInt8, _](data))
 
     @always_inline
-    def send(mut self, text: StringSlice):
+    def send(mut self, text: StringSpan):
         """Queue a UTF-8 string for the client (no byte juggling).
 
         Convenience for text protocols (SSE, NDJSON, a status line):

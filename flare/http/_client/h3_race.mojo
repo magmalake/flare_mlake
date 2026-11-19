@@ -135,14 +135,14 @@ def race_http3_h2_connect(
     supplied by the caller (so this module needs no ``HttpClient``
     import). Never raises for a failed connect -- the caller decides how
     to handle :data:`RACE_NONE`."""
-    var h3_res = alloc(Layout[_RaceResult](count=1)).unsafe_leak()
+    var h3_res = alloc(Layout[_RaceResult](length=1)).unsafe_leak()
     h3_res.unsafe_write(_RaceResult())
-    var h2_res = alloc(Layout[_RaceResult](count=1)).unsafe_leak()
+    var h2_res = alloc(Layout[_RaceResult](length=1)).unsafe_leak()
     h2_res.unsafe_write(_RaceResult())
 
-    var h3_arg = alloc(Layout[_RaceArg](count=1)).unsafe_leak()
+    var h3_arg = alloc(Layout[_RaceArg](length=1)).unsafe_leak()
     h3_arg.unsafe_write(_RaceArg(leg, client_addr, Int(h3_res), True, url))
-    var h2_arg = alloc(Layout[_RaceArg](count=1)).unsafe_leak()
+    var h2_arg = alloc(Layout[_RaceArg](length=1)).unsafe_leak()
     h2_arg.unsafe_write(_RaceArg(leg, client_addr, Int(h2_res), False, url))
 
     var h3_ptr = Pointer[UInt8, MutUntrackedOrigin](

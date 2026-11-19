@@ -286,7 +286,7 @@ struct UringReactor(Movable):
             # 8 bytes is the eventfd read width; we keep the buffer
             # pinned for the reactor's lifetime so the multishot recv
             # arming SQE keeps a stable pointer.
-            var raw = alloc(Layout[UInt8](count=8)).unsafe_leak()
+            var raw = alloc(Layout[UInt8](length=8)).unsafe_leak()
             for i in range(8):
                 raw.unsafe_offset(i).unsafe_write(UInt8(0))
             self._wake_buf = Pointer[UInt8, MutUntrackedOrigin](

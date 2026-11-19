@@ -357,7 +357,7 @@ struct ByteWriter(Movable):
             count=n,
         )
 
-    def write_str(mut self, s: StringSlice):
+    def write_str(mut self, s: StringSpan):
         """Append the UTF-8 bytes of ``s``."""
         self.write_bytes(s.as_bytes())
 

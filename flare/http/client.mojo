@@ -2376,7 +2376,7 @@ struct HttpClient(Movable):
         var el = String(enc.strip()).lower()
         if el == "identity" or el == "":
             return resp^
-        if el.find(",") >= 0:
+        if "," in el:
             return resp^  # stacked encodings unsupported: leave raw
         try:
             var decoded = decode_content(

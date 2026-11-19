@@ -109,7 +109,7 @@ struct IdleConnPool[T: PoolableConn](Copyable):
         """Allocate an enabled pool. Non-raising (the allocation +
         moves can't raise) so it can initialize a ``read self``
         ``HttpClient`` field eagerly, like the Alt-Svc store."""
-        var p = alloc(Layout[_PoolState](count=1)).unsafe_leak()
+        var p = alloc(Layout[_PoolState](length=1)).unsafe_leak()
         p.unsafe_write(
             _PoolState(
                 Dict[String, List[Int]](),
@@ -260,7 +260,7 @@ struct IdleConnPool[T: PoolableConn](Copyable):
 def _monotonic_ms() -> Int:
     """``CLOCK_MONOTONIC`` in milliseconds; ``0`` on FFI failure
     (which makes idle-timeout eviction a conservative no-op)."""
-    var ts_buf = alloc(Layout[Int](count=2)).unsafe_leak()
+    var ts_buf = alloc(Layout[Int](length=2)).unsafe_leak()
     ts_buf[unsafe_offset=0] = 0
     ts_buf[unsafe_offset=1] = 0
     var rc = external_call["clock_gettime", c_int](_CLOCK_MONOTONIC, ts_buf)

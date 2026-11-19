@@ -132,7 +132,7 @@ struct CancelCell(Movable):
 
     def __init__(out self) raises:
         """Allocate a fresh cell initialised to ``NONE``."""
-        var p = alloc(Layout[Int](count=1)).unsafe_leak()
+        var p = alloc(Layout[Int](length=1)).unsafe_leak()
         p.unsafe_write(CancelReason.NONE)
         self._addr = Int(p)
 
@@ -156,7 +156,7 @@ struct CancelCell(Movable):
         var p = Pointer[Int, MutUntrackedOrigin](
             unsafe_from_address=self._addr
         ).unsafe_bitcast[Scalar[DType.int64]]()
-        Atomic[Int64].store[ordering=Ordering.RELEASE](p, Int64(reason))
+        Atomic[Int64].store[ordering=Ordering.release](p, Int64(reason))
 
     def reset(mut self) -> None:
         """Reset the cell to ``NONE`` with a release store."""
@@ -165,7 +165,7 @@ struct CancelCell(Movable):
         var p = Pointer[Int, MutUntrackedOrigin](
             unsafe_from_address=self._addr
         ).unsafe_bitcast[Scalar[DType.int64]]()
-        Atomic[Int64].store[ordering=Ordering.RELEASE](
+        Atomic[Int64].store[ordering=Ordering.release](
             p, Int64(CancelReason.NONE)
         )
 
@@ -229,7 +229,7 @@ struct Cancel(Copyable, ImplicitlyCopyable):
         var p = Pointer[Int, MutUntrackedOrigin](
             unsafe_from_address=self._addr
         ).unsafe_bitcast[Scalar[DType.int64]]()
-        return Atomic[Int64].load[ordering=Ordering.ACQUIRE](p) != Int64(
+        return Atomic[Int64].load[ordering=Ordering.acquire](p) != Int64(
             CancelReason.NONE
         )
 
@@ -240,7 +240,7 @@ struct Cancel(Copyable, ImplicitlyCopyable):
         var p = Pointer[Int, MutUntrackedOrigin](
             unsafe_from_address=self._addr
         ).unsafe_bitcast[Scalar[DType.int64]]()
-        return Int(Atomic[Int64].load[ordering=Ordering.ACQUIRE](p))
+        return Int(Atomic[Int64].load[ordering=Ordering.acquire](p))
 
     def addr(imm self) -> Int:
         """Return the raw address of the backing cell (0 for the

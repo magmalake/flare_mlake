@@ -126,7 +126,7 @@ def test_sqe_construction_zeros_buffer() raises:
 
 def test_encode_sqe_zero_clears_dirty_buffer() raises:
     """``encode_sqe_zero`` rewrites every byte to 0."""
-    var raw = alloc(Layout[UInt8](count=IO_URING_SQE_BYTES)).unsafe_leak()
+    var raw = alloc(Layout[UInt8](length=IO_URING_SQE_BYTES)).unsafe_leak()
     for i in range(IO_URING_SQE_BYTES):
         raw.unsafe_offset(i).unsafe_write(UInt8(0xAB))
     var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(raw))
@@ -331,7 +331,7 @@ def test_cqe_buffer_id_decodes_high_bits_when_buffer_flag_set() raises:
 def test_decode_cqe_at_round_trips_through_byte_buffer() raises:
     """Write a 16-byte CQE slot manually + ``decode_cqe_at``
     must reproduce the same fields."""
-    var raw = alloc(Layout[UInt8](count=IO_URING_CQE_BYTES)).unsafe_leak()
+    var raw = alloc(Layout[UInt8](length=IO_URING_CQE_BYTES)).unsafe_leak()
     var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(raw))
     # user_data = 0x1122334455667788 (LE).
     var ud = UInt64(0x1122334455667788)
@@ -362,7 +362,7 @@ def test_decode_cqe_at_round_trips_through_byte_buffer() raises:
 def test_decode_cqe_at_sign_extends_negative_res() raises:
     """A CQE with res = -125 (ECANCELED) round-trips as -125,
     not 0xFFFFFF83."""
-    var raw = alloc(Layout[UInt8](count=IO_URING_CQE_BYTES)).unsafe_leak()
+    var raw = alloc(Layout[UInt8](length=IO_URING_CQE_BYTES)).unsafe_leak()
     var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(raw))
     for i in range(IO_URING_CQE_BYTES):
         p.unsafe_offset(i).unsafe_write(UInt8(0))

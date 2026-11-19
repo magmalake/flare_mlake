@@ -122,7 +122,7 @@ struct HandoffQueue(Defaultable, Movable):
         self.tail = 0
         self.count = 0
         self.capacity = 0
-        self.mu = alloc(Layout[UInt8](count=_MUTEX_BYTES)).unsafe_leak()
+        self.mu = alloc(Layout[UInt8](length=_MUTEX_BYTES)).unsafe_leak()
         self.pushes = 0
         self.pops = 0
         self.refused = 0
@@ -138,7 +138,7 @@ struct HandoffQueue(Defaultable, Movable):
         self.tail = 0
         self.count = 0
         self.capacity = capacity
-        self.mu = alloc(Layout[UInt8](count=_MUTEX_BYTES)).unsafe_leak()
+        self.mu = alloc(Layout[UInt8](length=_MUTEX_BYTES)).unsafe_leak()
         self.pushes = 0
         self.pops = 0
         self.refused = 0
@@ -279,7 +279,7 @@ struct WorkerHandoffPool(Movable):
     def __init__(out self, var policy: HandoffPolicy, num_workers: Int):
         self.num = num_workers
         self.queues = alloc(
-            Layout[HandoffQueue](count=num_workers)
+            Layout[HandoffQueue](length=num_workers)
         ).unsafe_leak()
         for i in range(num_workers):
             self.queues.unsafe_offset(i).unsafe_write(

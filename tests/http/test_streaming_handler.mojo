@@ -61,7 +61,7 @@ def _read_until_terminator(mut s: TcpStream, max_ms: Int) raises -> String:
         var n = s.read(buf.unsafe_ptr(), 2048)
         if n > 0:
             acc += String(unsafe_from_utf8=Span[UInt8, _](buf)[0:n])
-            if acc.find("0\r\n\r\n") != -1:
+            if "0\r\n\r\n" in acc:
                 return acc^
         else:
             break
@@ -130,15 +130,15 @@ def test_streaming_handler() raises:
 
     # Chunked framing present, no Content-Length.
     assert_true(
-        resp.find("Transfer-Encoding: chunked") != -1,
+        "Transfer-Encoding: chunked" in resp,
         "expected chunked framing, got: " + resp,
     )
     assert_true(
-        resp.find("Content-Length") == -1,
+        "Content-Length" not in resp,
         "streamed response must not carry Content-Length",
     )
     # Split headers from body and de-chunk.
-    var sep = resp.find("\r\n\r\n")
+    var sep = resp.find("\r\n\r\n").or_else(-1)
     assert_true(sep != -1, "no header terminator in response")
     var body = String(
         unsafe_from_utf8=resp.as_bytes()[sep + 4 : resp.byte_length()]

@@ -220,7 +220,7 @@ def test_bearer_extractor_missing_header_raises_typed() raises:
         var _e = BearerExtract.extract(req)
     except e:
         msg = String(e)
-    assert_true(msg.find("AuthError(MISSING_HEADER)") >= 0)
+    assert_true("AuthError(MISSING_HEADER)" in msg)
 
 
 def test_basic_extractor_apply_succeeds() raises:
@@ -238,7 +238,7 @@ def test_basic_extractor_missing_header_raises_typed() raises:
         var _e = BasicExtract.extract(req)
     except e:
         msg = String(e)
-    assert_true(msg.find("AuthError(MISSING_HEADER)") >= 0)
+    assert_true("AuthError(MISSING_HEADER)" in msg)
 
 
 def test_basic_extractor_invalid_b64_propagates_typed() raises:
@@ -253,7 +253,7 @@ def test_basic_extractor_invalid_b64_propagates_typed() raises:
         var _e = BasicExtract.extract(req)
     except e:
         msg = String(e)
-    assert_true(msg.find("AuthError(B64_BAD_LENGTH)") >= 0)
+    assert_true("AuthError(B64_BAD_LENGTH)" in msg)
 
 
 # ── CSRF ─────────────────────────────────────────────────────────────────

@@ -71,7 +71,7 @@ Task cell layout (four ``Int64`` slots, native allocator):
 
 from std.atomic import Atomic, Ordering
 from std.ffi import _get_global, c_int, external_call
-from std.memory import Layout, OptionalPointer, Pointer, alloc
+from std.memory import Layout, Pointer, alloc
 from std.runtime import parallelism_level
 from std.sys import stderr
 from std.sys.info import CompilationTarget
@@ -104,7 +104,7 @@ def _slot(
 
 @always_inline
 def _load(cell: Int, i: Int) -> Int64:
-    return Atomic[Int64].load[ordering=Ordering.ACQUIRE](_slot(cell, i))
+    return Atomic[Int64].load[ordering=Ordering.acquire](_slot(cell, i))
 
 
 @always_inline
@@ -154,7 +154,7 @@ def _asyncrt_trampoline[
     chain and frees the cell itself.
     """
     var cell = Int(cell_ptr)
-    Atomic[Int64].store[ordering=Ordering.RELEASE](
+    Atomic[Int64].store[ordering=Ordering.release](
         _slot(cell, _CELL_STARTED), 1
     )
     var arg_addr = Int(_load(cell, _CELL_ARG))
@@ -183,7 +183,7 @@ def asyncrt_spawn[
     ``asyncrt_try_lease``, and the task releases it when ``start``
     returns.
     """
-    var raw = alloc(Layout[Int64](count=_CELL_SLOTS)).unsafe_leak()
+    var raw = alloc(Layout[Int64](length=_CELL_SLOTS)).unsafe_leak()
     for i in range(_CELL_SLOTS):
         raw.unsafe_offset(i).unsafe_write(Int64(0))
     raw.unsafe_offset(_CELL_ARG).unsafe_write(Int64(Int(arg)))
@@ -279,8 +279,8 @@ comptime _POOL_ALIVE: Int64 = 1
 comptime _POOL_DEAD: Int64 = 2
 
 
-def _pool_cell_init() -> OptionalPointer[NoneType, UntrackedOrigin[mut=True]]:
-    var raw = alloc(Layout[Int64](count=2)).unsafe_leak()
+def _pool_cell_init() -> Optional[Pointer[NoneType, UntrackedOrigin[mut=True]]]:
+    var raw = alloc(Layout[Int64](length=2)).unsafe_leak()
     raw.unsafe_offset(0).unsafe_write(Int64(0))
     raw.unsafe_offset(1).unsafe_write(Int64(0))
     return Pointer[NoneType, UntrackedOrigin[mut=True]](
@@ -288,7 +288,9 @@ def _pool_cell_init() -> OptionalPointer[NoneType, UntrackedOrigin[mut=True]]:
     )
 
 
-def _pool_cell_destroy(p: OptionalPointer[NoneType, UntrackedOrigin[mut=True]]):
+def _pool_cell_destroy(
+    p: Optional[Pointer[NoneType, UntrackedOrigin[mut=True]]]
+):
     if p:
         Pointer[Int64, MutUntrackedOrigin](
             unsafe_from_address=Int(p.value())
@@ -314,7 +316,7 @@ def _process_thread_count(pid: Int32) -> Int:
         comptime PROC_PIDTASKINFO: c_int = 4
         comptime TASKINFO_SIZE: Int = 96
         comptime THREADNUM_OFFSET: Int = 84
-        var buf = alloc(Layout[UInt8](count=TASKINFO_SIZE)).unsafe_leak()
+        var buf = alloc(Layout[UInt8](length=TASKINFO_SIZE)).unsafe_leak()
         var rc = external_call["proc_pidinfo", c_int](
             c_int(pid), PROC_PIDTASKINFO, UInt64(0), buf, c_int(TASKINFO_SIZE)
         )
@@ -330,7 +332,7 @@ def _process_thread_count(pid: Int32) -> Int:
             var stat: String
             with open("/proc/self/stat", "r") as f:
                 stat = f.read()
-            var close = stat.rfind(")")
+            var close = stat.rfind(")").or_else(-1)
             if close < 0:
                 return -1
             # After ")": field 3 (state) is index 0, so field 20 is 17.
@@ -364,10 +366,10 @@ def asyncrt_pool_alive() -> Bool:
     var alive = threads < 0 or threads >= parallelism_level() + 1
     # Verdict first, then pid: a reader that sees our pid (acquire)
     # sees our verdict.
-    Atomic[Int64].store[ordering=Ordering.RELEASE](
+    Atomic[Int64].store[ordering=Ordering.release](
         _slot(cell, 1), _POOL_ALIVE if alive else _POOL_DEAD
     )
-    Atomic[Int64].store[ordering=Ordering.RELEASE](_slot(cell, 0), pid)
+    Atomic[Int64].store[ordering=Ordering.release](_slot(cell, 0), pid)
     if not alive:
         print(
             "flare: AsyncRT pool has no worker threads in pid",
@@ -395,8 +397,10 @@ def asyncrt_worker_capacity() -> Int:
 # Process-wide, so two servers side by side can't exhaust the pool together.
 
 
-def _lease_cell_init() -> OptionalPointer[NoneType, UntrackedOrigin[mut=True]]:
-    var raw = alloc(Layout[Int64](count=1)).unsafe_leak()
+def _lease_cell_init() -> (
+    Optional[Pointer[NoneType, UntrackedOrigin[mut=True]]]
+):
+    var raw = alloc(Layout[Int64](length=1)).unsafe_leak()
     raw.unsafe_write(Int64(0))
     return Pointer[NoneType, UntrackedOrigin[mut=True]](
         unsafe_from_address=Int(raw)

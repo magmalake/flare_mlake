@@ -70,7 +70,7 @@ def test_of_with_chunk_size_zero_raises_validation_error() raises:
         got_field = e.field.copy()
         got_reason = e.reason.copy()
     assert_equal(got_field, String("chunk_size"))
-    assert_true(got_reason.find("must be > 0") >= 0)
+    assert_true("must be > 0" in got_reason)
 
 
 def test_of_with_chunk_size_negative_raises_validation_error() raises:
@@ -83,7 +83,7 @@ def test_of_with_chunk_size_negative_raises_validation_error() raises:
         got_field = e.field.copy()
         got_reason = e.reason.copy()
     assert_equal(got_field, String("chunk_size"))
-    assert_true(got_reason.find("got -1") >= 0)
+    assert_true("got -1" in got_reason)
 
 
 # ── Iteration ─────────────────────────────────────────────────────────────

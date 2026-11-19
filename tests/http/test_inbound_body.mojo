@@ -115,7 +115,7 @@ def test_inbound_body() raises:
     waitpid(pid)
 
     # reply == "<total>:<max_chunk>"
-    var colon = reply.find(":")
+    var colon = reply.find(":").or_else(-1)
     assert_true(colon > 0, "malformed reply: " + reply)
     var got_total = Int(reply[byte=0:colon])
     var got_max = Int(reply[byte = colon + 1 :])

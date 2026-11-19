@@ -156,7 +156,7 @@ struct HeaderMapView[origin: Origin](Movable):
         """Number of headers in the view."""
         return len(self._offsets) // 4
 
-    def get(self, name: String) -> StringSlice[Self.origin]:
+    def get(self, name: String) -> StringSpan[Self.origin]:
         """Return the value of the first header named ``name``,
         case-insensitive. Returns an empty slice if not present.
 
@@ -171,10 +171,10 @@ struct HeaderMapView[origin: Origin](Movable):
             if _eq_icase_bytes(name_bytes, nstart, nlen, self.buf):
                 var vstart = self._offsets[i * 4 + 2]
                 var vlen = self._offsets[i * 4 + 3]
-                return StringSlice[Self.origin](
+                return StringSpan[Self.origin](
                     unsafe_from_utf8=self.buf[vstart : vstart + vlen]
                 )
-        return StringSlice[Self.origin](unsafe_from_utf8=self.buf[0:0])
+        return StringSpan[Self.origin](unsafe_from_utf8=self.buf[0:0])
 
     def count(self, name: String) -> Int:
         """Number of header lines named ``name``, case-insensitive."""

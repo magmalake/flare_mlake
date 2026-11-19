@@ -92,7 +92,7 @@ def _c_err(imm lib: OwnedDLHandle) raises -> String:
     ](lib, "flare_ssl_last_error")
     var p = fn_err()
     return String(
-        StringSlice(
+        StringSpan(
             unsafe_from_utf8=CStringSpan(
                 unsafe_from_ptr=p.unsafe_bitcast[c_char]()
             )
@@ -267,7 +267,7 @@ def _do_ssl_get_version(imm lib: OwnedDLHandle, ssl: Int) raises -> String:
     ](lib, "flare_ssl_get_version")
     var p = f(ssl)
     return String(
-        StringSlice(
+        StringSpan(
             unsafe_from_utf8=CStringSpan(
                 unsafe_from_ptr=p.unsafe_bitcast[c_char]()
             )
@@ -281,7 +281,7 @@ def _do_ssl_get_cipher(imm lib: OwnedDLHandle, ssl: Int) raises -> String:
     ](lib, "flare_ssl_get_cipher")
     var p = f(ssl)
     return String(
-        StringSlice(
+        StringSpan(
             unsafe_from_utf8=CStringSpan(
                 unsafe_from_ptr=p.unsafe_bitcast[c_char]()
             )
@@ -994,7 +994,7 @@ struct TlsStream(Movable, Readable):
         if rc != 0:
             raise NetworkError("peer_cert_subject: " + _c_err(self._lib))
         return String(
-            StringSlice(
+            StringSpan(
                 unsafe_from_utf8=CStringSpan(
                     unsafe_from_ptr=buf.unsafe_bitcast[c_char]()
                 )
@@ -1027,7 +1027,7 @@ struct TlsStream(Movable, Readable):
         if rc == 0:
             return String("")
         return String(
-            StringSlice(
+            StringSpan(
                 unsafe_from_utf8=CStringSpan(
                     unsafe_from_ptr=buf.unsafe_bitcast[c_char]()
                 )

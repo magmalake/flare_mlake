@@ -468,7 +468,7 @@ def test_accept_closes_fd_when_peer_decode_fails() raises:
     """NET-05: the accepted fd was decoded before it was wrapped, so a
     failing decode left nothing owning it."""
     var fd = _fresh_socket_fd()
-    var buf = alloc(Layout[UInt8](count=128)).unsafe_leak()
+    var buf = alloc(Layout[UInt8](length=128)).unsafe_leak()
     var raised = False
     try:
         _ = _adopt_accepted(fd, buf, _FailingDecoder())
@@ -484,7 +484,7 @@ def test_accept_closes_fd_when_peer_decode_fails() raises:
 
 def test_accept_hands_fd_to_the_stream_on_success() raises:
     var fd = _fresh_socket_fd()
-    var buf = alloc(Layout[UInt8](count=128)).unsafe_leak()
+    var buf = alloc(Layout[UInt8](length=128)).unsafe_leak()
     var peer = SocketAddr.parse("192.0.2.7:4242")
     var stream = _adopt_accepted(fd, buf, _FixedDecoder(peer))
     buf.unsafe_free()

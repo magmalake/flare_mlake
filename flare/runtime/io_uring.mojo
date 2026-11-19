@@ -503,7 +503,7 @@ struct IoUringRing(Movable):
                 "io_uring is a Linux-only feature; this build is not Linux"
             )
         var raw = alloc(
-            Layout[UInt8](count=_IO_URING_PARAMS_BYTES)
+            Layout[UInt8](length=_IO_URING_PARAMS_BYTES)
         ).unsafe_leak()
         for i in range(_IO_URING_PARAMS_BYTES):
             raw.unsafe_offset(i).unsafe_write(UInt8(0))
@@ -576,7 +576,7 @@ def is_io_uring_available() -> Bool:
     """
     comptime if not CompilationTarget.is_linux():
         return False
-    var raw = alloc(Layout[UInt8](count=_IO_URING_PARAMS_BYTES)).unsafe_leak()
+    var raw = alloc(Layout[UInt8](length=_IO_URING_PARAMS_BYTES)).unsafe_leak()
     for i in range(_IO_URING_PARAMS_BYTES):
         raw.unsafe_offset(i).unsafe_write(UInt8(0))
     var rc = io_uring_setup(1, raw)

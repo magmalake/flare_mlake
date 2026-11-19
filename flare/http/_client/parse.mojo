@@ -133,7 +133,7 @@ def _parse_response_head(head: List[UInt8]) raises -> _ResponseHead:
         # RFC 9112 sec 5.2: obs-fold is not a field line.
         if raw[0] == 32 or raw[0] == 9:
             raise NetworkError("HTTP response: obs-fold line rejected")
-        var colon = ln.find(":")
+        var colon = ln.find(":").or_else(-1)
         if colon <= 0:
             raise NetworkError("HTTP response: malformed header line")
         # RFC 9112 sec 5.1: no whitespace between name and colon.
@@ -779,7 +779,7 @@ comptime _MAX_RESPONSE_HEAD_BYTES: Int = 64 * 1024
 
 def _wire_method(wire: String) -> String:
     """The method token of a serialised request line."""
-    var sp = wire.find(" ")
+    var sp = wire.find(" ").or_else(-1)
     if sp <= 0:
         return "GET"
     return String(String(unsafe_from_utf8=wire.as_bytes()[:sp]))

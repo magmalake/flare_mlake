@@ -30,6 +30,7 @@ jobs:
       pull-requests: read
     with:
       classify-only: true
+      mojo-compiler: "==1.3.0.dev2026111805"
 
   # rattler-build takes the package version from recipe.yaml, while
   # `shelf release` bumps and repins only shelf.toml and pixi.toml, so a
@@ -152,8 +153,8 @@ jobs:
           repository: magmalake/threads.mojo
           path: threads.mojo
 
-      # threads.mojo 0.6.0 has a single compat/ directory: Mojo 1.2.0 and the
-      # nightly agree on `Atomic[Int64]`, which is all it papers over.
+      # threads.mojo has a single compat/ directory, on the include path
+      # beside src/.
       - name: Threads include path
         run: |
           echo "THREADS_I=-I $GITHUB_WORKSPACE/threads.mojo/src -I $GITHUB_WORKSPACE/threads.mojo/compat" >> $GITHUB_ENV

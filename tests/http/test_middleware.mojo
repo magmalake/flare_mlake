@@ -325,7 +325,7 @@ def test_compress_content_range_header_passthrough() raises:
 def _vary_has_accept_encoding(resp: Response) -> Bool:
     var all = resp.headers.get_all("vary")
     for i in range(len(all)):
-        if all[i].lower().find("accept-encoding") >= 0:
+        if "accept-encoding" in all[i].lower():
             return True
     return False
 

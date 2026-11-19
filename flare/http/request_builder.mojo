@@ -78,7 +78,7 @@ struct RequestBuilder(Movable):
         """
         var url = self._url
         if self._query.byte_length() > 0:
-            if url.find("?") != -1:
+            if "?" in url:
                 url += "&" + self._query
             else:
                 url += "?" + self._query

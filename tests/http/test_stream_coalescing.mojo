@@ -150,17 +150,17 @@ def test_stream_coalescing() raises:
     var acc = String("")
     var buf = List[UInt8](capacity=8192)
     buf.resize(8192, 0)
-    while acc.find("0\r\n\r\n") == -1:
+    while "0\r\n\r\n" not in acc:
         var n = client.read(buf.unsafe_ptr(), 8192)
         if n <= 0:
             break
         acc += String(unsafe_from_utf8=Span[UInt8, _](buf)[0:n])
 
     assert_true(
-        acc.find("Transfer-Encoding: chunked") != -1,
+        "Transfer-Encoding: chunked" in acc,
         "expected chunked framing",
     )
-    var sep = acc.find("\r\n\r\n")
+    var sep = acc.find("\r\n\r\n").or_else(-1)
     assert_true(sep != -1, "no header terminator")
     var body = String(
         unsafe_from_utf8=acc.as_bytes()[sep + 4 : acc.byte_length()]

@@ -97,7 +97,7 @@ def balance_group_alloc(n_workers: Int) -> Int:
     comptime if not CompilationTarget.is_linux():
         return 0
     var slots = _HEADER_SLOTS + n_workers * _W_STRIDE
-    var p = alloc(Layout[Int64](count=slots)).unsafe_leak()
+    var p = alloc(Layout[Int64](length=slots)).unsafe_leak()
     for i in range(slots):
         p[unsafe_offset=i] = Int64(0)
     p[unsafe_offset=0] = Int64(n_workers)

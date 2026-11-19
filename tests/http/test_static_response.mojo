@@ -159,9 +159,9 @@ def test_header_order_is_content_type_length_connection() raises:
         body="{}",
     )
     var ka = _bytes_to_string(r.keepalive_bytes)
-    var ct_pos = ka.find("Content-Type:")
-    var cl_pos = ka.find("Content-Length:")
-    var cn_pos = ka.find("Connection:")
+    var ct_pos = ka.find("Content-Type:").or_else(-1)
+    var cl_pos = ka.find("Content-Length:").or_else(-1)
+    var cn_pos = ka.find("Connection:").or_else(-1)
     assert_true(ct_pos >= 0)
     assert_true(cl_pos > ct_pos)
     assert_true(cn_pos > cl_pos)

@@ -237,7 +237,9 @@ struct Request(Movable):
             # conflicts with the stdlib's own ``free`` declaration at
             # MLIR legalization time when this module is pulled into a
             # fuzz-environment compile (mozz harness).
-            var ptr = alloc(Layout[Dict[String, String]](count=1)).unsafe_leak()
+            var ptr = alloc(
+                Layout[Dict[String, String]](length=1)
+            ).unsafe_leak()
             ptr.unsafe_write(Dict[String, String]())
             self._params = ptr
         return self._params.value()[]

@@ -231,7 +231,7 @@ struct WsOverH2Stream(Movable):
             # Distinguish "short read" (need more bytes -- bail and
             # wait) from "protocol violation" (re-raise).
             var msg = String(e)
-            if msg.find("decode_one: need") >= 0 or msg.find("truncated") >= 0:
+            if "decode_one: need" in msg or "truncated" in msg:
                 return None
             if WS_TOO_BIG_MARKER in msg:
                 try:

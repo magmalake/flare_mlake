@@ -170,7 +170,7 @@ def _run_listener_dispatch(var data: List[UInt8]) raises:
     cfg.rustls_config = RustlsQuicConfig()
     var listener: QuicListener
     try:
-        listener = QuicListener.bind(cfg^)
+        listener = QuicListener.bind(cfg)
     except _:
         return
     var dcid_bytes = List[UInt8]()

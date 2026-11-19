@@ -28,7 +28,7 @@ def _ensure(p: String) raises:
 def _write(p: String, body: String) raises:
     var f = open(p, "w")
     f.write(body)
-    f.close()
+    f^.close()
 
 
 def main() raises:

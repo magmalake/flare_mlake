@@ -214,7 +214,7 @@ def _atomic_load_u32_acquire(
     ring region.
 
     Uses Mojo's ``Atomic[UInt32].load`` with
-    ``Ordering.ACQUIRE``, which lowers to a plain ``mov`` +
+    ``Ordering.acquire``, which lowers to a plain ``mov`` +
     compiler fence on x86-64 (TSO) and to ``ldar`` on ARM64
     (the proper acquire load).
 
@@ -225,7 +225,7 @@ def _atomic_load_u32_acquire(
         Int(ptr) != 0, "_atomic_load_u32_acquire: ptr must be non-NULL"
     )
     var typed = ptr.unsafe_bitcast[Scalar[DType.uint32]]()
-    return Atomic[UInt32].load[ordering=Ordering.ACQUIRE](typed)
+    return Atomic[UInt32].load[ordering=Ordering.acquire](typed)
 
 
 @always_inline
@@ -239,7 +239,7 @@ def _atomic_load_u32_relaxed(
         Int(ptr) != 0, "_atomic_load_u32_relaxed: ptr must be non-NULL"
     )
     var typed = ptr.unsafe_bitcast[Scalar[DType.uint32]]()
-    return Atomic[UInt32].load[ordering=Ordering.RELAXED](typed)
+    return Atomic[UInt32].load[ordering=Ordering.relaxed](typed)
 
 
 @always_inline
@@ -253,7 +253,7 @@ def _atomic_store_u32_release(
         Int(ptr) != 0, "_atomic_store_u32_release: ptr must be non-NULL"
     )
     var typed = ptr.unsafe_bitcast[Scalar[DType.uint32]]()
-    Atomic[UInt32].store[ordering=Ordering.RELEASE](typed, value)
+    Atomic[UInt32].store[ordering=Ordering.release](typed, value)
 
 
 @always_inline
@@ -268,7 +268,7 @@ def _atomic_store_u32_relaxed(
         Int(ptr) != 0, "_atomic_store_u32_relaxed: ptr must be non-NULL"
     )
     var typed = ptr.unsafe_bitcast[Scalar[DType.uint32]]()
-    Atomic[UInt32].store[ordering=Ordering.RELAXED](typed, value)
+    Atomic[UInt32].store[ordering=Ordering.relaxed](typed, value)
 
 
 # ── params-buffer field offsets (echoes io_uring.mojo IoUringParams) ────────

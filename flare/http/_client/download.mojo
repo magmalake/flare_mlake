@@ -252,7 +252,7 @@ struct HttpDownload[R: Readable](Movable):
             )
             self._pos = crlf + 2
             # Chunk extensions (";..."): size is the hex prefix.
-            var semi = line.find(";")
+            var semi = line.find(";").or_else(-1)
             var size_str = line if semi < 0 else String(
                 unsafe_from_utf8=line.as_bytes()[:semi]
             )
@@ -303,7 +303,7 @@ struct HttpDownload[R: Readable](Movable):
             self._pos = crlf + 2
             if line.byte_length() == 0:
                 return
-            var colon = line.find(":")
+            var colon = line.find(":").or_else(-1)
             if colon <= 0:
                 raise NetworkError("HTTP download: malformed trailer")
             var key = String(unsafe_from_utf8=line.as_bytes()[:colon]).lower()

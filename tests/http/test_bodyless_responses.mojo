@@ -118,7 +118,7 @@ def _first_head_then(raw_first: String) raises -> Tuple[String, String]:
     var got = _exchange(
         raw_first + "GET /next HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     )
-    var end = got.find("\r\n\r\n")
+    var end = got.find("\r\n\r\n").or_else(-1)
     assert_true(end > 0, "no response head in: " + got)
     return (String(got[byte = : end + 4]), String(got[byte = end + 4 :]))
 

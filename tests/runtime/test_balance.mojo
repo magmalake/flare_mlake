@@ -39,7 +39,7 @@ from flare.runtime.scheduler_stats import (
 
 def _stats_cell(group: Int, idx: Int) -> Int:
     """A zeroed worker stats cell that names ``group`` and worker ``idx``."""
-    var p = alloc(Layout[Int64](count=WORKER_STAT_SLOTS)).unsafe_leak()
+    var p = alloc(Layout[Int64](length=WORKER_STAT_SLOTS)).unsafe_leak()
     for i in range(WORKER_STAT_SLOTS):
         p[unsafe_offset=i] = Int64(0)
     var addr = Int(p)

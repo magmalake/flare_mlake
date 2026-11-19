@@ -27,7 +27,7 @@ def _u64(b: List[UInt8], at: Int) -> Int:
 def _program_header_types(path: String) raises -> List[Int]:
     var f = open(path, "r")
     var b = f.read_bytes()
-    f.close()
+    f^.close()
     assert_true(len(b) > 64 and b[0] == 0x7F and b[4] == 2, "not ELF64")
     var phoff = _u64(b, 0x20)
     var phentsize = _u16(b, 0x36)

@@ -420,13 +420,18 @@ struct _BytesIter(Movable):
         """
         return self^
 
-    def __next__(mut self) -> List[UInt8]:
+    def __next__(mut self) raises StopIteration -> List[UInt8]:
         """Return the next chunk of up to ``chunk_size`` bytes.
 
         Returns:
             A ``List[UInt8]`` containing the next chunk (may be smaller than
             ``chunk_size`` for the final chunk).
+
+        Raises:
+            StopIteration: When every byte has been yielded.
         """
+        if not self.__has_next__():
+            raise StopIteration()
         var end = self._pos + self._chunk_size
         var n = len(self._body)
         if end > n:

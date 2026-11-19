@@ -1,6 +1,6 @@
 [workspace]
 authors = ["ehsanmok <ehsanmok@users.noreply.github.com>"]
-channels = ["https://conda.modular.com/max", "conda-forge"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "flare"
 platforms = ["osx-arm64", "linux-aarch64", "linux-64"]
 version = "0.14.2"
@@ -39,7 +39,12 @@ scripts = ["flare/tls/ffi/build.sh", "flare/http/ffi/build.sh", "flare/tls/ffi/b
 # as a library picks up. Contributor-only tooling (docs generator, pre-commit
 # hooks) lives under [feature.dev] and is opted into via `pixi install -e dev`.
 [dependencies]
-mojo             = ">=1.2.0,<2.0.0"
+# One toolchain: the library, its tests and every consumer use the same Mojo
+# nightly. A precompiled Mojo package (.mojoc) loads only in the compiler
+# version that built it, so the pin is exact here and in recipe.yaml, and it
+# moves across all magmalake tins together. `mojo` rather than
+# `mojo-compiler`, for the `mojo format` the format tasks run.
+mojo             = "==1.3.0.dev2026111805"
 openssl          = ">=3.6.1,<4"    # TLS: libssl + libcrypto (SHA-1 for WS handshake)
 ca-certificates  = ">=2025.1.31"   # TLS default CA bundle → $CONDA_PREFIX/ssl/cacert.pem
 zlib             = ">=1.3.1,<2"    # HTTP: Content-Encoding gzip/deflate decompression
@@ -52,13 +57,13 @@ libdeflate       = ">=1.22,<2"     # HTTP: gzip encoder for Content-Encoding res
 # upstream json with only packaging deltas; the module is still imported as
 # `json`. (The old reason — upstream's unsolvable `==0.3.13` backend pin — is
 # fixed upstream now; the org-consistency one is what remains.) Pinned at
-# json_mlake 0.5.1, its precompiled-json.mojoc release; recipe.yaml builds
-# flare.mojoc against the same commit.
-json_mlake       = { git = "https://github.com/magmalake/json_mlake.git", rev = "27c05c1c0c2881abfb33ce8eefae4d44d8b602a9" }
+# json_mlake's port to the same Mojo nightly; recipe.yaml builds flare.mojoc
+# against the same commit.
+json_mlake       = { git = "https://github.com/magmalake/json_mlake.git", rev = "115129138868883ae7d0de86651f342220f802e3" }
 # flare's threading is an adapter over threads.mojo (flare/runtime/_thread.mojo)
 # rather than its own pthread binding, so `threads` has to be importable to
-# compile flare at all. Pinned at threads 0.6.1, its Mojo 1.2.0 release.
-threads-mojo     = { git = "https://github.com/magmalake/threads.mojo.git", rev = "f45e780a8de77278c140cee36904e46e93e0ca1c" }
+# compile flare at all. Pinned at threads' port to the same Mojo nightly.
+threads-mojo     = { git = "https://github.com/magmalake/threads.mojo.git", rev = "820a7c6e8619d49e13f944dfba73328236eb4903" }
 
 # g++ is a BUILD-time dep on Linux: the activation scripts
 # (flare/tls/ffi/build.sh, flare/http/ffi/build.sh) invoke g++ to compile
@@ -111,7 +116,7 @@ heaptrack  = ">=1.5"
 # magmalake/mozz_mlake rather than ehsanmok/mozz, same org-consistency reason
 # as json above. Keyed by the package name (mozz_mlake); the Mojo module it
 # installs is still imported as `mozz`.
-mozz_mlake = { git = "https://github.com/magmalake/mozz_mlake.git", branch = "main" }
+mozz_mlake = { git = "https://github.com/magmalake/mozz_mlake.git", rev = "31dc9656a1829a65597e8d0afe80c54f4c5d6e62" }
 
 # ── Code-metrics tooling (complexity + coverage proxy) ───────────────────────
 # Opt in with: pixi run -e metrics metrics

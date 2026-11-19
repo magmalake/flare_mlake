@@ -58,7 +58,7 @@ def test_struct_handler_reads_state() raises:
     var h = _Greeter("ciao")
     var req = Request(method=Method.GET, url="/x")
     var resp = h.serve(req)
-    assert_true(resp.text().find("ciao") >= 0)
+    assert_true("ciao" in resp.text())
 
 
 def test_struct_handler_reads_request_url() raises:
@@ -66,7 +66,7 @@ def test_struct_handler_reads_request_url() raises:
     var h = _Greeter("yo")
     var req = Request(method=Method.GET, url="/deep/path")
     var resp = h.serve(req)
-    assert_true(resp.text().find("/deep/path") >= 0)
+    assert_true("/deep/path" in resp.text())
 
 
 def test_struct_handler_many_calls_share_state() raises:
@@ -190,7 +190,7 @@ def test_handler_composition_preserves_inner_body() raises:
     var outer = _Tagged(inner^, "pre")
     var req = Request(method=Method.GET, url="/abc")
     var resp = outer.serve(req)
-    assert_true(resp.text().find("hello") >= 0)
+    assert_true("hello" in resp.text())
 
 
 def test_handler_composition_nested_three_deep() raises:

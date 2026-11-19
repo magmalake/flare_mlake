@@ -41,11 +41,11 @@ def _p(addr: Int) -> Pointer[Int64, MutUntrackedOrigin]:
 
 
 def _ld(addr: Int) -> Int64:
-    return Atomic[Int64].load[ordering=Ordering.ACQUIRE](_p(addr))
+    return Atomic[Int64].load[ordering=Ordering.acquire](_p(addr))
 
 
 def _st(addr: Int, v: Int64):
-    Atomic[Int64].store[ordering=Ordering.RELEASE](_p(addr), v)
+    Atomic[Int64].store[ordering=Ordering.release](_p(addr), v)
 
 
 def _blocker(arg: _OpaquePtr) -> _OpaquePtr:
@@ -84,7 +84,7 @@ struct _Idle(Copyable, Frontend):
 def test_failed_start_releases_the_per_worker_listeners() raises:
     comptime if CompilationTarget.is_linux():
         return
-    var gates = Int(alloc(Layout[Int64](count=2)).unsafe_leak())
+    var gates = Int(alloc(Layout[Int64](length=2)).unsafe_leak())
     var gate_all = gates
     var gate_one = gates + 8
     _st(gate_all, 0)

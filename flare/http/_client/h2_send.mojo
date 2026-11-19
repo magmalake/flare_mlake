@@ -400,10 +400,10 @@ def _parse_status_line(raw: List[UInt8]) raises -> Int:
     var sl = String("")
     for i in range(line_end):
         sl += chr(Int(raw[i]))
-    var sp1 = sl.find(" ")
+    var sp1 = sl.find(" ").or_else(-1)
     if sp1 < 0:
         raise NetworkError("HttpClient(h2c-upgrade): malformed status-line")
-    var sp2 = sl.find(" ", start=sp1 + 1)
+    var sp2 = sl.find(" ", start=sp1 + 1).or_else(-1)
     var code_end = sp2
     if code_end < 0:
         code_end = sl.byte_length()

@@ -1,4 +1,4 @@
-"""flare declares libc's socket calls as dista and Mosaad-M/tcp do.
+"""Flare declares libc's socket calls as dista and Mosaad-M/tcp do.
 
 Mojo allows one signature per C symbol in a program, so a binary importing
 flare and dista (morca is one) compiles only if both declare `send`, `recv`,

@@ -182,7 +182,7 @@ def _wire(resp: Response) -> String:
 
 
 def _head(wire: String) -> String:
-    var end = wire.find("\r\n\r\n")
+    var end = wire.find("\r\n\r\n").or_else(-1)
     return String(wire[byte = : end + 4])
 
 
