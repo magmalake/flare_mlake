@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-20
+
+### Changed
+
+- Pins json_mlake 0.6.0, mozz_mlake 0.2.3, threads-mojo 0.7.0.
+
 ## [0.14.2] - 2026-11-17
 
 - Declares libc's `send`, `recv`, `connect`, `accept`, `setsockopt`,
