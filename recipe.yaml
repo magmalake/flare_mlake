@@ -31,7 +31,7 @@ context:
   name: flare_mlake
   # Must equal shelf.toml and pixi.toml; .github/check-versions.py fails CI
   # otherwise (`shelf release` bumps only those two).
-  version: "0.14.2"
+  version: "0.15.0"
 
 package:
   name: ${{ name }}
@@ -49,10 +49,10 @@ source:
   # Keep these at the revisions pixi.toml pins (.github/check-versions.py
   # checks it; `shelf release` repins pixi.toml only).
   - git: https://github.com/magmalake/json_mlake.git
-    rev: 115129138868883ae7d0de86651f342220f802e3
+    rev: 7ea15048ac905386a89d03717e56cef8832b571b
     target_directory: _deps/json_mlake
   - git: https://github.com/magmalake/threads.mojo.git
-    rev: 820a7c6e8619d49e13f944dfba73328236eb4903
+    rev: c9da1a84f4f2d624043df97b90bb44f8e8b5256b
     target_directory: _deps/threads
 
 build:
@@ -133,12 +133,12 @@ requirements:
     # package, so an environment can hold both flare and json without a
     # file conflict — and json security fixes arrive by upgrading json_mlake
     # rather than by rebuilding flare.
-    - json_mlake >=0.5.1,<0.6
+    - json_mlake >=0.6.0,<0.7
     # flare's threading is an adapter over threads.mojo rather than its own
     # pthread binding, so `threads` has to be importable wherever flare is.
     # Having exactly one library bind a given libc symbol is what lets flare
     # be linked alongside the rest of the magmalake stack at all.
-    - threads-mojo >=0.6.1,<0.7
+    - threads-mojo >=0.7.0,<0.8
 
 tests:
   # The package had no test, which is how the missing zlib, brotli and fs
