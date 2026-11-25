@@ -59,7 +59,7 @@ libdeflate       = ">=1.22,<2"     # HTTP: gzip encoder for Content-Encoding res
 # fixed upstream now; the org-consistency one is what remains.) Pinned at
 # json_mlake's port to the same Mojo nightly; recipe.yaml builds flare.mojoc
 # against the same commit.
-json_mlake       = { git = "https://github.com/magmalake/json_mlake.git", rev = "9461b25d3d459a6937e19c0eeb60828ef3e7e948" }
+json_mlake       = { git = "https://github.com/magmalake/json_mlake.git", rev = "8443350d18e2ad6e4ca1d3a409e2c9cc7e7e7b09" }
 # flare's threading is an adapter over threads.mojo (flare/runtime/_thread.mojo)
 # rather than its own pthread binding, so `threads` has to be importable to
 # compile flare at all. Pinned at threads' port to the same Mojo nightly.
@@ -116,7 +116,7 @@ heaptrack  = ">=1.5"
 # magmalake/mozz_mlake rather than ehsanmok/mozz, same org-consistency reason
 # as json above. Keyed by the package name (mozz_mlake); the Mojo module it
 # installs is still imported as `mozz`.
-mozz_mlake = { git = "https://github.com/magmalake/mozz_mlake.git", rev = "fbd1ebf141417114e87b74c4b87e6d64eb771fac" }
+mozz_mlake = { git = "https://github.com/magmalake/mozz_mlake.git", rev = "fd90ab8ca0b3d9a363df879cd9355b3d8042b1a4" }
 
 # ── Code-metrics tooling (complexity + coverage proxy) ───────────────────────
 # Opt in with: pixi run -e metrics metrics
