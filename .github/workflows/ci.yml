@@ -30,7 +30,7 @@ jobs:
       pull-requests: read
     with:
       classify-only: true
-      mojo-compiler: "==1.3.0.dev2026111805"
+      mojo-compiler: "==1.3.0.dev2026112505"
 
   # rattler-build takes the package version from recipe.yaml, while
   # `shelf release` bumps and repins only shelf.toml and pixi.toml, so a

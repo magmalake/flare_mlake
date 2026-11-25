@@ -31,18 +31,18 @@ channels = ["file://$CHANNEL", "https://conda.modular.com/max-nightly", "conda-f
 platforms = ["$PLATFORM"]
 
 [dependencies]
-mojo = "==1.3.0.dev2026111805"
+mojo = "==1.3.0.dev2026112505"
 flare_mlake = "*"
 # flare imports `threads` since its threading became an adapter over
 # threads.mojo, and the recipe takes threads-mojo as a run requirement. It is
 # a pixi source tin rather than a package on any channel, so a consumer
 # declares it as a git dependency — which is also what 'pixi shelf add' writes.
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo.git", rev = "c9da1a84f4f2d624043df97b90bb44f8e8b5256b" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo.git", rev = "11f3241ff4233a15a0fd7c56b22102b26aa5cf00" }
 # flare_mlake depends on json_mlake rather than vendoring json's source, so a
 # consumer needs it too. Declared here as a git source dependency, which is
 # exactly how mojoshelf tins are consumed ('pixi shelf add' writes the same
 # shape, pinned at the published revision).
-json_mlake = { git = "https://github.com/magmalake/json_mlake.git", rev = "7ea15048ac905386a89d03717e56cef8832b571b" }
+json_mlake = { git = "https://github.com/magmalake/json_mlake.git", rev = "66836dd6e6b3cf77ebb0fbaef46bfe5ac542373e" }
 TOML
 
 cat > smoke.mojo <<'MOJO'
