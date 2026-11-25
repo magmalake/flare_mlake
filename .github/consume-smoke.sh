@@ -37,12 +37,12 @@ flare_mlake = "*"
 # threads.mojo, and the recipe takes threads-mojo as a run requirement. It is
 # a pixi source tin rather than a package on any channel, so a consumer
 # declares it as a git dependency — which is also what 'pixi shelf add' writes.
-threads-mojo = { git = "https://github.com/magmalake/threads.mojo.git", rev = "11f3241ff4233a15a0fd7c56b22102b26aa5cf00" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo.git", rev = "16efc3d2a8a0e2ea377a0cd1dc1f40131118ccb3" }
 # flare_mlake depends on json_mlake rather than vendoring json's source, so a
 # consumer needs it too. Declared here as a git source dependency, which is
 # exactly how mojoshelf tins are consumed ('pixi shelf add' writes the same
 # shape, pinned at the published revision).
-json_mlake = { git = "https://github.com/magmalake/json_mlake.git", rev = "66836dd6e6b3cf77ebb0fbaef46bfe5ac542373e" }
+json_mlake = { git = "https://github.com/magmalake/json_mlake.git", rev = "8443350d18e2ad6e4ca1d3a409e2c9cc7e7e7b09" }
 TOML
 
 cat > smoke.mojo <<'MOJO'
