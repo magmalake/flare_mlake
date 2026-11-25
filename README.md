@@ -1,5 +1,7 @@
 # flare_mlake
 
+[![Used by](https://mojourney.dev/badge/magmalake/flare_mlake/used-by.svg)](https://mojourney.dev/repos/magmalake/flare_mlake#used-by) [![Mojo version](https://mojourney.dev/badge/magmalake/flare_mlake/mojo.svg)](https://mojourney.dev/repos/magmalake/flare_mlake)
+
 **This is not a new networking library. It is a packaged build of
 [flare](https://github.com/ehsanmok/flare) by
 [Ehsan M. Kermani](https://github.com/ehsanmok), redistributed so that
