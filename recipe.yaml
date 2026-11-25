@@ -49,10 +49,10 @@ source:
   # Keep these at the revisions pixi.toml pins (.github/check-versions.py
   # checks it; `shelf release` repins pixi.toml only).
   - git: https://github.com/magmalake/json_mlake.git
-    rev: 7ea15048ac905386a89d03717e56cef8832b571b
+    rev: 66836dd6e6b3cf77ebb0fbaef46bfe5ac542373e
     target_directory: _deps/json_mlake
   - git: https://github.com/magmalake/threads.mojo.git
-    rev: c9da1a84f4f2d624043df97b90bb44f8e8b5256b
+    rev: 11f3241ff4233a15a0fd7c56b22102b26aa5cf00
     target_directory: _deps/threads
 
 build:
@@ -108,7 +108,7 @@ requirements:
   build:
     - ${{ compiler('c') }}     # zlib wrapper
     - ${{ compiler('cxx') }}   # OpenSSL wrapper
-    - mojo-compiler ==1.3.0.dev2026111805
+    - mojo-compiler ==1.3.0.dev2026112505
   host:
     # Matches the pin in pixi.toml. This read `>=3.0,<4`, which would
     # solve to an OpenSSL the library has never been built against.
@@ -120,7 +120,7 @@ requirements:
     - libbrotlidec >=1.2.1,<2
     - libbrotlienc >=1.2.1,<2
   run:
-    - mojo-compiler ==1.3.0.dev2026111805
+    - mojo-compiler ==1.3.0.dev2026112505
     - openssl >=3.6.1,<4
     - ca-certificates
     - zlib >=1.3.1,<2        # libflare_zlib.so is loaded at runtime
