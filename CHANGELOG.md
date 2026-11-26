@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-11-26
+
+### Changed
+
+- Pins json_mlake 0.6.2, mozz_mlake 0.2.5, threads-mojo 0.7.2.
+
 ## [0.15.1] - 2026-11-25
 
 ### Changed
