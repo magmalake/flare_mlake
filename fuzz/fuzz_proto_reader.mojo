@@ -38,10 +38,10 @@ def _bytes(*vals: Int) -> List[UInt8]:
 def target(data: List[UInt8]) raises:
     var r = ProtoReader(Span[UInt8, _](data))
     var last = -1
-    var guard = 0
+    var spins = 0
     while r.has_more():
-        guard += 1
-        if guard > 100_000:
+        spins += 1
+        if spins > 100_000:
             raise Error("proto reader made no progress (possible loop)")
         # pos must be monotonic and in-bounds.
         if r.pos <= last:

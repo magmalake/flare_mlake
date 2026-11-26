@@ -80,8 +80,8 @@ def target(data: List[UInt8]) raises:
     # Slice the input into chunks driven by the fuzz bytes. Start chunk
     # sizes at 1..8 bytes to exercise per-byte partial reads.
     var pos = 0
-    var guard = 0  # bounded iterations to detect stuck states
-    while pos < len(data) and guard < 128:
+    var spins = 0  # bounded iterations to detect stuck states
+    while pos < len(data) and spins < 128:
         var hint = Int(data[pos % len(data)])
         var chunk = (hint & 0x07) + 1  # 1..8
         if pos + chunk > len(data):
@@ -110,7 +110,7 @@ def target(data: List[UInt8]) raises:
                     client.close()
                     return
             inner += 1
-        guard += 1
+        spins += 1
 
     # Final drive to see if any trailing data completes a request.
     var trailing_handler = _OkHandler()

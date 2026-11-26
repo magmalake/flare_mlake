@@ -231,9 +231,9 @@ def main() raises:
 
     var got = List[String]()
     var poll_calls = 0
-    var guard = 0
-    while guard < 100000:
-        guard += 1
+    var spins = 0
+    while spins < 100000:
+        spins += 1
         poll_calls += 1
         var p = src.poll(cancel)
         if p.is_ready():
