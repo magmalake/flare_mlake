@@ -3,12 +3,12 @@ authors = ["ehsanmok <ehsanmok@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "flare"
 platforms = ["osx-arm64", "linux-aarch64", "linux-64"]
-version = "0.15.1"
+version = "0.15.2"
 preview = ["pixi-build"]
 
 [package]
 name = "flare_mlake"
-version = "0.15.1"
+version = "0.15.2"
 
 [package.build]
 # Lower bound only, deliberately.
@@ -59,11 +59,11 @@ libdeflate       = ">=1.22,<2"     # HTTP: gzip encoder for Content-Encoding res
 # fixed upstream now; the org-consistency one is what remains.) Pinned at
 # json_mlake's port to the same Mojo nightly; recipe.yaml builds flare.mojoc
 # against the same commit.
-json_mlake       = { git = "https://github.com/magmalake/json_mlake.git", rev = "e94749a3e23f6650c0609a36f66b7a3c8e55a367" }
+json_mlake       = { git = "https://github.com/magmalake/json_mlake.git", rev = "af0329b8a8475f9f997b4de687a7dbd26741afe8" }
 # flare's threading is an adapter over threads.mojo (flare/runtime/_thread.mojo)
 # rather than its own pthread binding, so `threads` has to be importable to
 # compile flare at all. Pinned at threads' port to the same Mojo nightly.
-threads-mojo     = { git = "https://github.com/magmalake/threads.mojo.git", rev = "d86b368e4aabb3c9a09b0f54d117230a404e4258" }
+threads-mojo     = { git = "https://github.com/magmalake/threads.mojo.git", rev = "215abd5c3fd47e38ef14b44fd32dceb6059c134f" }
 
 # g++ is a BUILD-time dep on Linux: the activation scripts
 # (flare/tls/ffi/build.sh, flare/http/ffi/build.sh) invoke g++ to compile
@@ -116,7 +116,7 @@ heaptrack  = ">=1.5"
 # magmalake/mozz_mlake rather than ehsanmok/mozz, same org-consistency reason
 # as json above. Keyed by the package name (mozz_mlake); the Mojo module it
 # installs is still imported as `mozz`.
-mozz_mlake = { git = "https://github.com/magmalake/mozz_mlake.git", rev = "578766e2c576b7b1fde474724417025d19562f45" }
+mozz_mlake = { git = "https://github.com/magmalake/mozz_mlake.git", rev = "1180710bcedd42a2268824ce3db02fe71ebf7569" }
 
 # ── Code-metrics tooling (complexity + coverage proxy) ───────────────────────
 # Opt in with: pixi run -e metrics metrics
