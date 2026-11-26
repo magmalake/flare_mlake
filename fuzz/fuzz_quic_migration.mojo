@@ -89,17 +89,17 @@ def target(data: List[UInt8]) raises:
 
     var events = empty_events()
     var pos = 0
-    var guard = 0
+    var spins = 0
     # Drain the buffer frame by frame; a malformed frame stops the
     # walk (the codec raised), which is a valid outcome.
-    while pos < n and guard < 4096:
-        guard += 1
+    while pos < n and spins < 4096:
+        spins += 1
         var rest = List[UInt8]()
         for i in range(pos, n):
             rest.append(data[i])
         var span = Span[UInt8, _](rest)
         try:
-            var consumed = handle_frame_buf(conn, span, UInt64(guard), events)
+            var consumed = handle_frame_buf(conn, span, UInt64(spins), events)
             _assert(
                 consumed >= 1 and consumed <= len(rest),
                 "quic migration: consumed out of bounds",

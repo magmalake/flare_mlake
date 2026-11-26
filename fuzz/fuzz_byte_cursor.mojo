@@ -48,9 +48,9 @@ def target(data: List[UInt8]) raises:
     # Use each byte as an opcode selecting a read width; every read is
     # guarded. The cursor invariants must hold no matter what.
     var r = ByteReader(span)
-    var guard = 0
-    while r.remaining() > 0 and guard < 4096:
-        guard += 1
+    var spins = 0
+    while r.remaining() > 0 and spins < 4096:
+        spins += 1
         var op = Int(data[r.position() % n]) % 6
         var before = r.position()
         try:

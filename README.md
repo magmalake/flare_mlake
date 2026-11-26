@@ -65,7 +65,7 @@ deleted at any time.
   per field.** They are never packed; decoding them as a packed block fails on
   any real message.
 
-**Built for the Mojo 1.3 nightly, `1.3.0.dev2026112505`**, the one toolchain
+**Built for the Mojo 1.3 nightly, `1.3.0.dev2026112605`**, the one toolchain
 every magmalake tin uses, not upstream's `mojo >=1.2.0`: the workspace pins
 `mojo` exactly on the `max-nightly` channel, the recipe pins `mojo-compiler`
 exactly (a `.mojoc` loads only in the compiler that built it), and json_mlake,

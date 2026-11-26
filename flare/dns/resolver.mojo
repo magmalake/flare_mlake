@@ -140,11 +140,11 @@ def resolve(host: String) raises -> List[IpAddr]:
     var results = List[IpAddr]()
 
     var cur = head
-    var guard = 0
+    var spins = 0
     while cur != 0:
-        if guard >= 64:
+        if spins >= 64:
             break
-        guard += 1
+        spins += 1
 
         var node = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=cur)
         var family = Int(

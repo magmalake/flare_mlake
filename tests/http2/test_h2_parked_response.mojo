@@ -171,14 +171,14 @@ def test_whole_body_survives_the_park() raises:
     """Parking must not drop or duplicate a byte."""
     var c = _served_connection()
     var sent = _tally(c.drain()).data_bytes
-    var guard = 0
+    var spins = 0
     while sent < _BODY:
         c.feed(Span[UInt8, _](_window_update(1, 16384)))
         c.feed(Span[UInt8, _](_window_update(0, 16384)))
         c.pump_pending()
         sent += _tally(c.drain()).data_bytes
-        guard += 1
-        if guard > 64:
+        spins += 1
+        if spins > 64:
             raise Error("pump made no progress")
     assert_equal(sent, _BODY)
 
