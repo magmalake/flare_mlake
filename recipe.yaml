@@ -31,7 +31,7 @@ context:
   name: flare_mlake
   # Must equal shelf.toml and pixi.toml; .github/check-versions.py fails CI
   # otherwise (`shelf release` bumps only those two).
-  version: "0.15.1"
+  version: "0.15.2"
 
 package:
   name: ${{ name }}
@@ -49,10 +49,10 @@ source:
   # Keep these at the revisions pixi.toml pins (.github/check-versions.py
   # checks it; `shelf release` repins pixi.toml only).
   - git: https://github.com/magmalake/json_mlake.git
-    rev: e94749a3e23f6650c0609a36f66b7a3c8e55a367
+    rev: af0329b8a8475f9f997b4de687a7dbd26741afe8
     target_directory: _deps/json_mlake
   - git: https://github.com/magmalake/threads.mojo.git
-    rev: d86b368e4aabb3c9a09b0f54d117230a404e4258
+    rev: 215abd5c3fd47e38ef14b44fd32dceb6059c134f
     target_directory: _deps/threads
 
 build:
